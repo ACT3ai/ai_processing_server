@@ -1,108 +1,146 @@
 # server.yaml: Bryan's Mac Studio as an ai_processing_server node.
-# Source: GUESSED 2026-10-27 from the laptop. Not probed. Replace every value marked "guess"
-# by running the hardware detection on the Mac Studio itself.
-# Known: this is the always-on "CLAW" server that runs OpenClaw agents and voice-memo transcription.
+# Source: DETECTED on this machine 2026-10-27 (`ai_processing_server detect`, system_profiler, sysctl,
+# diskutil, networksetup, pmset, PATH probes, Ollama API, docker, launchctl).
+# Full raw probe: ~/repos/ai_processing_server/data/git_ignore/this_server.yaml
+# Serial numbers, UUIDs and MAC addresses are left out on purpose.
+# This is the always-on "CLAW" server ("Bryan Mac Station"): render-queue node, OpenClaw agents,
+# local LLMs (Ollama) and voice-memo transcription.
 
 server:
   name: Bryan_Mac_Studio
   display_name: "Bryan's Mac Studio (CLAW)"
-  role: render_node                      # always-on server, also runs OpenClaw agents
+  role: render_node                      # always-on render-queue server, also runs OpenClaw agents
   owner: Bryan Starbuck
   location: office
-  data_source: guessed                   # detected | guessed
+  data_source: detected                  # detected | guessed
   updated: "2026-10-27"
-  hostname: "Bryan-Mac-Studio.local"     # guess
+  hostname: "BryansMacStudio.home"       # LocalHostName: Bryans-Mac-Studio(.local); ComputerName: "Bryan’s Mac Studio"
+  repo_path: "~/repos/ai_processing_server/"
   always_on: true
   enabled: true
 
   capabilities:
     machine:
-      model: "Mac Studio (M3 Ultra, 2025)"   # guess
-      model_identifier: "Mac15,14"           # guess
+      model: "Mac Studio (M3 Ultra, 2025)"
+      model_identifier: "Mac15,14"
+      model_number: "Z1CE000Y5LL/A"      # build-to-order
+      firmware: "20457.1.29"
       form_factor: desktop
+      displays:                          # three 4K displays attached
+        - "PHL 288P6L 3840x2160 @30Hz (main)"
+        - "PHL 288P6L 3840x2160 @30Hz"
+        - "SAMSUNG TV 3840x2160 @60Hz"
     os:
       family: macOS
-      version: "27.0.1"                  # guess: assumed same as laptop
+      version: "27.0.1"
+      build: "26A434"
+      kernel: "Darwin 27.0.0"
       arch: arm64
       go_target: darwin/arm64
     cpu:
-      model: "Apple M3 Ultra"            # guess
-      cores: 32                          # guess
+      model: "Apple M3 Ultra"
+      cores: 32
       performance_cores: 24
       efficiency_cores: 8
       threads: 32
     memory:
-      total_gb: 256                      # guess (configs: 96 / 256 / 512)
+      total_gb: 512
       type: LPDDR5
       unified: true
       bandwidth_gb_per_s: 819
     gpus:
       - vendor: Apple
-        model: "Apple M3 Ultra (80-core GPU)"   # guess
+        model: "Apple M3 Ultra (80-core GPU)"
         api: Metal
         metal_support: "Metal 4"
         vram_gb: 0                       # unified memory, see max_working_set_gb
-        max_working_set_gb: 192          # guess: ~75% of unified memory
+        unified_memory_gb: 512
+        max_working_set_gb: 384          # macOS default ~75% of unified memory; iogpu.wired_limit_mb = 0 (default, not raised)
         hardware_ray_tracing: true
-        fp32_tflops: 28.0
+        fp32_tflops: 28.0                # Apple spec figure, not measured
     neural_engine:
       cores: 32
-      tops_int8: 36
+      tops_int8: 36                      # Apple spec figure
     cuda: false
     rocm: false
     storage:
-      total_tb: 4.0                      # guess
-      free_tb: 2.0                       # guess
-      type: NVMe SSD
+      total_tb: 8.0                      # internal SSD, APFS container 8.0 TB
+      free_tb: 6.9                       # container free 2026-10-27 (~1.0 TB used on Data volume)
+      type: "Internal NVMe SSD (Apple Fabric)"
       scratch_dir: "~/T/_ai_processing_server/"
+      work_dir: "~/repos/ai_processing_server/data/git_ignore/work"
     network:
       primary: ethernet
-      ethernet_gbps: 10
-      thunderbolt: "Thunderbolt 5"
+      ethernet_port: en0
+      ethernet_max_gbps: 10              # 10GbE port
+      ethernet_link: "1000baseT full-duplex"   # currently linked at 1 Gb/s, not 10
+      lan_ip_ethernet: "192.168.254.108"
+      wifi: true                         # en1 also active: 192.168.68.67 (second network)
+      thunderbolt: "Thunderbolt 5"       # 6 ports, up to 120 Gb/s each
+      remote_access: [twingate, anydesk]
     power:
       source: ac
-      ups: false                         # guess
+      ups: false
+      sleep: never                       # pmset sleep 0, displaysleep 0
+      auto_restart_after_power_loss: true
+      wake_on_lan: true
     media_engines:
-      hw_encode: [h264, hevc, prores]
+      hw_encode: [h264, hevc, prores]    # detected via VideoToolbox encoders
       hw_decode: [h264, hevc, prores, av1]
-      encode_engines: 4
+      encode_engines: 4                  # M3 Ultra spec
       prores_engines: 4
-    software:                            # all guesses
-      go: "1.27.x"
-      python: "3.x"
-      node: "26.x"
-      ffmpeg: "9.x"
-      blender: "4.x"
+    software:
+      go: "1.27.3"
+      python: "3.15.1"                   # /opt/homebrew/bin/python3
+      node: "26.12.1"
+      ffmpeg: "9.0.2"                    # with h264/hevc/prores_videotoolbox
+      just: "1.59.0"
+      git: "2.54.0"
+      swift: true                        # Command Line Tools active; Xcode.app installed but not selected
+      blender: false                     # not installed
       davinci_resolve: false
       final_cut_pro: false
-      ipfs: true
+      ipfs: "0.43.1"                     # kubo, Homebrew service, running
       redis: false
-      pytorch: true                      # MPS backend, for Whisper transcription
-      mlx: true
+      postgres: true                     # listening on localhost:5432
+      pytorch: false                     # not in system Python; only inside the (broken) Whisper pipx venv
+      mlx: false
       comfyui: false
-      ollama: true
-      docker: false
-      whisper_transcription: true        # known: processes iPhone voice memos
-      openclaw_agents: true              # known: runs OpenClaw agent workspaces
+      ollama: "0.40.11"                  # API on port 19391 (OLLAMA_HOST=0.0.0.0:19391), not 11434
+      ollama_models:                     # `ollama list` 2026-10-27, size on disk
+        - "qwen3.5:122b (81 GB)"
+        - "qwen3-coder-next:latest (51 GB)"
+        - "qwen3.5:35b-a3b (23 GB)"      # designated primary model for OpenClaw agents
+        - "glm-4.7-flash:latest (19 GB)"
+        - "deepseek-r1:32b (19 GB)"
+        - "qwen3.8:27b (17 GB)"
+        - "gemma4:26b (17 GB)"
+        - "gemma4:e4b (9.6 GB)"
+      docker: "29.9.2"                   # Docker Desktop
+      apple_speech_transcription: true   # ~/tools_locked/Transcribe/AppleTranscribe (SpeechAnalyzer, Neural Engine)
+      whisper_transcription: false       # fallback broken: pipx venv points at removed python@3.14
+      openclaw_agents: true              # Docker gateway container (currently stopped, see constraints)
     job_slots:
       gpu: 1                             # one integrated GPU; heavy jobs serialized
-      cpu: 12
-      max_model_memory_gb: 200
-    job_types:
+      cpu: 12                            # leaves headroom for OpenClaw, Ollama and transcription
+      max_model_memory_gb: 200           # Ollama models also live in the same 512 GB
+    job_types:                           # what `ai_processing_server detect` offers today in brackets
       cloud_api_jobs: true
-      transcode_h264_hevc_prores: true
-      transcode_av1: true
-      blender_render: true               # Cycles Metal
-      image_generation_local: true       # MLX / MPS (FLUX, SDXL)
-      video_generation_local: partial    # no CUDA; slow on MPS
-      llm_inference_local: true          # large unified memory fits big quantized models
-      upscale: partial
-      tts_transcription: true
-      lipsync: partial
+      transcode_h264_hevc_prores: true   # [act3.transcode 3, wtc.transcode 3, act3.video_merge 3]
+      transcode_av1: decode_only         # no hardware AV1 encode
+      blender_render: false              # Blender not installed (needs >= 4.2)
+      image_generation_local: false      # no ComfyUI / MLX / PyTorch installed yet
+      video_generation_local: false      # no CUDA; comfy runner not built yet
+      llm_inference_local: true          # Ollama, 512 GB unified memory
+      upscale: false
+      tts_transcription: true            # Apple SpeechAnalyzer pipeline (wtc.transcription runner not built yet)
+      lipsync: false
       cuda_only_jobs: false
     constraints:
-      - "Shares the machine with OpenClaw agents and transcription; reserve CPU and memory for them."
-      - "Hardware values are guesses until detected on the machine."
+      - "Shares the machine with OpenClaw agents, Ollama and transcription; reserve CPU and memory for them."
+      - "10GbE port is linked at 1 Gb/s; large uploads/downloads are limited to 1 Gb/s until the switch/cable is 10G."
+      - "Install Blender >= 4.2 to enable act3.blender_render; install ComfyUI to enable act3.comfy_on_prem."
+      - "data/git_ignore/this_server.yaml still has server.key CHANGE_ME; set a key before running jobs."
 
   services:
     act3: true
