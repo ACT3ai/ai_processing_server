@@ -21,6 +21,7 @@ build:
     @echo "building {{bin}} {{version}} (git {{git_sha}}) with `go version | cut -d' ' -f3`"
     @cd code && go build -trimpath -ldflags "{{ldflags}}" -o ../{{bin}} ./cmd/ai_processing_server
     @echo "built ./{{bin}}"
+    -@git config core.hooksPath .githooks
     @just _broker-ensure
     @./{{bin}} init
     @./{{bin}} broker config >/dev/null 2>&1 && echo "broker config: `./{{bin}} broker config`" || echo "broker config: skipped until this_server.yaml loads"
