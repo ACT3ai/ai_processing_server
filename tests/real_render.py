@@ -63,7 +63,7 @@ def run_job(api, service, params, inputs=None, timeout_min=90):
     if inputs:
         fields["inputs"] = inputs
     ack = api.queue_submit(service, params, **fields)
-    job = ack["job_id"]
+    job, t_sub = ack["job_id"], time.time()
     say(f"{service}: queued {job}")
     deadline, last = time.time() + timeout_min * 60, None
     while time.time() < deadline:
@@ -72,6 +72,9 @@ def run_job(api, service, params, inputs=None, timeout_min=90):
         except APIError as e:
             if e.status in (503, 504):  # broker blip: keep polling (servers.mdx §34 step 4)
                 time.sleep(5)
+                continue
+            if e.status == 404 and time.time() - t_sub < 60:  # just accepted, not visible yet (lib queue_wait)
+                time.sleep(1)
                 continue
             raise
         st = q["job_state"]

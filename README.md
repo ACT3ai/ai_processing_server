@@ -5,11 +5,27 @@ render-queue server. It does the heavy work behind the [ACT3 AI filmmaking](http
 We The Citizens: image and video generation, upscaling, Blender renders, transcodes, video merges, TTS,
 transcription, OCR and AI descriptions.
 
-**Status (2026-10-27): v0.1.0 built.** `just build` and `just run` work. The server detects its hardware, computes
-offers, and runs jobs in parallel slots with priorities, retries, cancel, drain and crash recovery. Jobs arrive by
-**direct mode** (`POST /v1/jobs` on the local API); the platform lease transport (phase 3) is not built yet. Built
-runners: `compute`, `render` (test render to H.264 MP4) and `ffmpeg` (transcode, merge). The test suite is in
-[tests/](tests/README.md): 74 black-box tests that send real work and check the answers. See [Build plan](#build-plan).
+**Status (2026-10-27): v0.2.0.** `just build` (it also installs the nats-server broker) and `just run` work. The
+server detects its hardware, computes offers, and runs jobs in parallel slots with priorities, retries, cancel, drain
+and crash recovery. Jobs arrive through the **NATS JetStream task queue** (`POST /v1/queue/jobs`) or by direct mode
+(`POST /v1/jobs`). Built runners: `compute`, `render`, `ffmpeg`, and the model runners `oss_video` (Wan 2.2) and
+`oss_upscale` (SeedVR2), which run in detached task hosts from frozen snapshots so a git pull or a restart never stops
+a render. The test suite is in [tests/](tests/README.md): 99 black-box tests, including the continuity gate G1 to G7.
+
+### Render on the Mac Studio (BMS)
+
+Wan 2.2 and SeedVR2 are installed there (`~/act3_render/wan_2_2`, `~/act3_render/seedvr2`). In
+`~/repos/ai_processing_server/`:
+
+```
+git pull
+just render-setup     # build (+ nats-server), enable queue + both model services, restart, show what is offered
+just render-test      # one real Wan 2.2 clip, then a SeedVR2 upscale of it, through the queue (outputs in ~/T/_ai_processing_server/real_render/)
+```
+
+`just render-check` shows the broker, the config and each model service's offer. A model that is turned on but not
+installed is offered as 0, with the missing path and the install guide, so the machine never claims a job it would
+fail. Details: [pm/task_authoring.mdx §8.1](pm/task_authoring.mdx).
 
 ## What it does
 
