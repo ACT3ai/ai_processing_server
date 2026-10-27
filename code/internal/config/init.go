@@ -109,7 +109,11 @@ func InitThisServer(o InitOptions) (InitResult, error) {
 func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunFunc, keep *Identity) (string, *ThisServer, error) {
 	id := Identity{Key: "CHANGE_ME", DisplayName: facts.Hostname, Profile: "generic", Family: "office", Site: "unknown"}
 	var off map[string]bool
+	localMode := LocalShare
 	if ks := MatchKnown(cat.Known, facts); ks != nil {
+		if ks.LocalMode != "" {
+			localMode = ks.LocalMode
+		}
 		id = Identity{Key: ks.Key, DisplayName: ks.DisplayName, Profile: ks.Profile, Family: ks.Family, Site: ks.Site}
 		off = map[string]bool{}
 		for _, s := range ks.ServicesOff {
@@ -149,6 +153,7 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 		"MachineID":    id.BoundTo.MachineID,
 		"HardwareYAML": indent(string(hwYAML), "  "),
 		"ServicesYAML": strings.TrimRight(svc.String(), "\n"),
+		"LocalMode":    localMode,
 	}
 	tpl, err := template.New("this_server").Option("missingkey=error").Parse(cat.Template)
 	if err != nil {

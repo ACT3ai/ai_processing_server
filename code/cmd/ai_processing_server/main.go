@@ -8,6 +8,8 @@
 //	status | jobs        ask the running server (thin clients of the local API)
 //	cancel <job_id> | drain | resume
 //	stop [--force]       drain and stop the running server
+//	broker status        check this machine's nats-server: reachable, JetStream on, supported version
+//	broker config        write the nats-server config from this_server.yaml (outside the repo) and print its path
 //	version
 package main
 
@@ -24,19 +26,24 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/ACT3ai/ai_processing_server/internal/api"
+	"github.com/ACT3ai/ai_processing_server/internal/brokerctl"
 	"github.com/ACT3ai/ai_processing_server/internal/capability"
 	"github.com/ACT3ai/ai_processing_server/internal/config"
 	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/logging"
+	"github.com/ACT3ai/ai_processing_server/internal/queue"
+	"github.com/ACT3ai/ai_processing_server/internal/queue/natsq"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
 	"github.com/ACT3ai/ai_processing_server/internal/scheduler"
+	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 	"gopkg.in/yaml.v3"
 )
 
@@ -70,6 +77,16 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	// `taskhost --run <dir>` (hidden): one job's detached task host, started by a runner from a frozen snapshot
+	// (pm/task_queue.mdx §9.3). Dispatched before path resolution: it runs inside the snapshot, which is read-only
+	// and must not grow a data/git_ignore/, and it needs nothing but its run directory.
+	if cmd == "taskhost" {
+		os.Exit(taskhost.Main(args))
+	}
+	var sub []string // `broker status --json` and `broker --json status` both work
+	if cmd == "broker" && len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sub, args = args[:1], args[1:]
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	var p paths
 	fs.StringVar(&p.Root, "root", "", "repo root (default: the directory holding the binary)")
@@ -121,6 +138,8 @@ func main() {
 		err = cmdPost(p, "/v1/resume")
 	case "stop":
 		err = cmdStop(p)
+	case "broker":
+		err = cmdBroker(p, append(sub, fs.Args()...))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -134,7 +153,8 @@ func main() {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
-commands: init [--write-new] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force] · version
+commands: init [--write-new] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
+          broker status|config · version
 flags: --root --state-dir --config --log-dir --error-dir --listen --json
 `)
 }
@@ -384,8 +404,16 @@ func cmdRun(p paths) error {
 		f := mon.Detected()
 		return loadConfig(p, &f)
 	}
+	var openQueue func(context.Context) (queue.Queue, error)
+	if ts.Queue.Enabled { // queue settings take effect on restart, not on reload
+		qo := natsq.Options{URL: ts.Queue.BrokerURL, CredentialsFile: config.ExpandHome(ts.Queue.CredentialsFile),
+			Name: "ai_processing_server " + ts.Server.Key, AckWait: ts.Continuity.AckWait.Or(5 * time.Minute)}
+		openQueue = func(ctx context.Context) (queue.Queue, error) { return natsq.Open(ctx, qo) }
+	}
+	// Task-host runners keep runs/ and snapshots/ in the state dir and snapshot code from the repo root.
+	runners.StateDir, runners.CodeRoot = p.State, p.Root
 	srv, err := scheduler.New(scheduler.Options{Server: ts, Catalog: cat, Monitor: mon, StateDir: p.State, Loader: loader,
-		Version: version, GitSHA: gitSHA, Warnings: warns, Logger: log})
+		Version: version, GitSHA: gitSHA, Warnings: warns, Logger: log, OpenQueue: openQueue})
 	if err != nil {
 		return err
 	}
@@ -614,3 +642,62 @@ func cmdStop(p paths) error {
 	fmt.Printf("stopped after %s\n", time.Since(start).Round(100*time.Millisecond))
 	return nil
 }
+
+// cmdBroker checks or configures this machine's nats-server (pm/task_queue.mdx §8.2, §18).
+func cmdBroker(p paths, args []string) error {
+	ts, _, _, err := loadConfig(p, nil)
+	if err != nil {
+		return err
+	}
+	pin, err := brokerctl.LoadPin(p.Data)
+	if err != nil {
+		return err
+	}
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "config":
+		path, err := brokerctl.WriteConfig(ts, p.Data)
+		if err != nil {
+			return err
+		}
+		fmt.Println(path)
+		return nil
+	case "status":
+		if !ts.Queue.Enabled {
+			fmt.Println("queue.enabled is false in this_server.yaml: the server runs direct mode only")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		st, warns, err := brokerctl.Check(ctx, ts, pin)
+		if p.JSONOut {
+			b, _ := json.MarshalIndent(map[string]any{"status": st, "warnings": warns, "error": errString(err)}, "", "  ")
+			fmt.Println(string(b))
+		} else if err == nil {
+			fmt.Printf("broker ok: nats-server %s at %s, JetStream on\n", st.ServerVersion, st.URL)
+			for name, n := range st.Streams {
+				fmt.Printf("  stream %-7s %d messages\n", name, n)
+			}
+		}
+		for _, w := range warns {
+			fmt.Println("warning:", w)
+		}
+		if err != nil {
+			how := pin.Install[runtimeOS()]
+			return fmt.Errorf("broker_missing: %v\n  install once: %s\n  then: just broker-config && just broker-run", err, how)
+		}
+		return nil
+	}
+	return fmt.Errorf("usage: ai_processing_server broker status|config")
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func runtimeOS() string { return runtime.GOOS }

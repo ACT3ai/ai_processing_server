@@ -174,8 +174,25 @@ func probeURL(ctx context.Context, u string) *Engine {
 	return &Engine{URL: strings.TrimSuffix(u, "/system_stats"), Version: "unknown"}
 }
 
+// slowCmdTimeout is for probes that are slow on a loaded machine: system_profiler takes about 1 s idle and over 5 s
+// on a busy Mac (load 24 on 2026-10-27), and a GPU missed at startup stays missed, turning off every GPU service.
+var slowCmdTimeout = 30 * time.Second
+
 // run executes a probe command with a timeout and empty stdin, returning combined output.
 func run(ctx context.Context, name string, args ...string) (string, error) {
+	return runFor(ctx, cmdTimeout, name, args...)
+}
+
+// runSlow is run with slowCmdTimeout and one retry.
+func runSlow(ctx context.Context, name string, args ...string) (string, error) {
+	out, err := runFor(ctx, slowCmdTimeout, name, args...)
+	if err != nil && ctx.Err() == nil {
+		out, err = runFor(ctx, slowCmdTimeout, name, args...)
+	}
+	return out, err
+}
+
+func runFor(ctx context.Context, cmdTimeout time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, cmdTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)

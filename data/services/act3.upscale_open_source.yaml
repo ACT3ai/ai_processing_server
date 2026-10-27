@@ -1,0 +1,20 @@
+schema_version: 1
+id: act3.upscale_open_source
+platform: act3
+title: "Open-source video upscale on our own GPUs: SeedVR2 3B / 7B / 7B Sharp (model seedvr2)"
+# runner oss_upscale: numz inference_cli.py (installed at ~/act3_render/seedvr2/) in a detached task host, so a git
+# pull or a controller restart never stops an upscale (code/internal/runners/oss_upscale.go, pm/task_authoring.mdx §4).
+runner: oss_upscale
+# Off until the machine's owner turns it on in this_server.yaml (pm/task_authoring.mdx §7.1 step 6).
+default_enabled: false
+requires:
+  engines: { ffmpeg: ">=6.0" }
+  gpu: required
+  compute: [cuda, metal]
+  min_vram_gb: 16
+  min_unified_memory_gb: 64
+resources_per_job: { cpu_cores: 4, ram_gb: 64, vram_gb: 16 }
+max_parallel_default: 1
+# A 30 s clip to 4K with 7B on the Mac Studio is about 150 s of work per output second (seedvr2.mdx §3.2 estimate).
+timeouts: { stage_inputs: 20m, run: 240m, upload: 30m }
+retry: { max_attempts: 2, retry_on: [transient, infra] }

@@ -1,7 +1,20 @@
 # ai_processing_server — TO DO
 
-**As of 2026-10-27, v0.1.0.** Phase 0 (scaffold) and most of phases 1–2 of the build plan
+**As of 2026-10-27, v0.2.0.** Phase 0 (scaffold) and most of phases 1–2 of the build plan
 (`ai_processing_server.mdx` §21) are done.
+
+## Done in v0.2.0 (2026-10-27): the task queue, NATS JetStream (D-014 to D-017)
+* `queue` seam, `queue/natsq` (client of a separate nats-server), `queue/queuetest` (in-memory queue + contract suite).
+* Scheduler queue link: strict band pull order, claim by CAS on `job_state` (fencing), events, requeue with backoff,
+  `DEAD`, cancel through `job_control`, `+WPI` heartbeat, `servers` record, claims saved in the journal and settled at
+  boot (re-attach through `runners.Reattacher`, else requeue at once).
+* Config `queue` / `continuity` / `callers` (off when the section is absent); template writes it on for new files.
+* Local API: `POST /v1/queue/jobs`, `GET /v1/queue/jobs/{id}`, `POST /v1/queue/jobs/{id}/cancel`, `GET /v1/broker`;
+  `broker` object in `/v1/health` (`broker_missing` + fix).
+* `brokerctl` + `ai_processing_server broker status|config`; `just broker-install|config|run|stop|status`;
+  `data/queue/broker.yaml`, `data/queue/nats/{standalone,worker}.conf.tmpl`.
+* Tests: 14 Go test functions (12-case contract on both queues, real nats-server), 14 black-box tests in `tests/broker/`;
+  93/93 black-box and all Go packages pass.
 
 ## Done in v0.1.0
 * Go module, single binary, `justfile` (build, run, run-fg, stop, status, logs, init, reinit, detect, validate, test, cross).
@@ -20,15 +33,27 @@
   requests and responses, Content-Digest, replay cache), tested against RFC 9421 B.2.6 and RFC 8037 A.3.
 
 ## Next
-* [ ] Bryan: confirm D-001 (transport) and answer spec §23 Q2 (real hostnames for B5090, BPC, BMT, BMS).
+* [x] Bryan: D-001 and §23 answered (D-014, D-022). Real hostnames get fixed in known_servers.yaml after each machine's first `init`.
 * [x] Laptop (BLAP): generated config promoted to `data/git_ignore/this_server.yaml` on 2026-10-27; the hand-written probe is kept as `this_server.legacy_probe_2026_10_27.yaml` (nothing in it needed merging).
 * [ ] Wire `keys.InitKey` into `init` (write `servers/{Server}/keys/server_identity.jwks.json`), add `keys show`,
   and `data/platforms/{act3,wtc}.yaml` + pinned `.jwks.json` (security.mdx §4, §5.1, §8.1).
 * [ ] SSRF guard and `SafeJoin` for platform jobs (`storage/safedial.go`, `storage/paths.go`, security.mdx §12.2–12.3);
   direct mode keeps loopback inputs allowed (the test FakeStorage is on 127.0.0.1).
-* [ ] Bryan: D-001 (HTTPS lease, apis.mdx) and D-Q1 (NATS JetStream as a separate nats-server service, task_queue.mdx §3) contradict each other; pick one.
+* [x] Bryan: D-001 vs D-Q1. Decided 2026-10-27: NATS JetStream as a separate nats-server process (D-014); D-001 superseded.
+* [x] `queue/natsq`, the scheduler's queue link and `just broker-*` (v0.2.0, task_queue.mdx §22.1).
+* [ ] `nats-server` as an OS service (launchd, systemd, Windows service) in `just broker-install`; today `just broker-run`
+  starts it in the background.
+* [ ] Restart-storm and code-change tests (task_queue.mdx §21.2) once task hosts and snapshots land.
+* [ ] Q2: admission (signatures, caller policy, categories, models), DRR over bands and caller shares, aging (D-015).
+* [x] All open questions in pm/ decided 2026-10-27 (D-020 to D-023).
+* [x] Caller band ceilings, vendor refusal, local modes in the pull order, owner model fence, NPL1–3 presets (D-021).
+* [ ] Run `init` on BMS, B5090 and NPL1–3; correct their hostnames in known_servers.yaml (and add `Bryans-Mac-Pro-2024` to BMT if that is BMT).
+* [ ] FlashVSR (CUDA preview) and Real-ESRGAN (low VRAM) upscalers after SeedVR2 (D-020).
+* [ ] Caller shares and DRR (build phase Q2) using the decided shares (D-022 §23 Q3).
+* [ ] `data/services/act3.upscale_open_source.yaml` and its runner: the first ACT3 task type (task_authoring.mdx §4, §9).
+* [ ] Continuity gate G1–G7 as integration tests, run per task type before it goes live (task_authoring.mdx §8).
 * [ ] Task continuity (task_queue.mdx §9): detached task hosts, frozen code snapshots, re-adoption after restart, so `git pull` + restart never kills a running render. The v0.1 in-process runners do not survive a restart yet.
-* [ ] Phase 3: `broker/httplease` against appsrv's `/processing/*` endpoints; heartbeat and directives (§14).
+* [ ] ACT3 / WTC submit through NATS (task_queue.mdx §20); `broker/httplease` is dropped (D-001 superseded).
 * [ ] Phase 4: runners `comfy`, `python`, `whisper`, `blender`; model cache; profiles b5090, bpc, bms.
 * [ ] JSON Schemas in `data/schemas/` for params (today each runner validates its params in Go).
 * [ ] `data/sites/sites.yaml` and the customer-data rule (§16.3).

@@ -4,6 +4,8 @@ package config
 
 import (
 	"fmt"
+	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,7 +29,101 @@ type ThisServer struct {
 	Limits        Limits                     `yaml:"limits" json:"limits"`
 	Paths         Paths                      `yaml:"paths" json:"paths"`
 	LocalAPI      LocalAPI                   `yaml:"local_api" json:"local_api"`
+	Queue         Queue                      `yaml:"queue" json:"queue"`
+	Continuity    Continuity                 `yaml:"continuity" json:"continuity"`
+	Callers       map[string]CallerSetting   `yaml:"callers" json:"callers"`
+	Models        ModelRules                 `yaml:"models" json:"models"`
 	Debug         Debug                      `yaml:"debug" json:"debug"`
+}
+
+// Queue is the connection to the task system: NATS JetStream in its own nats-server process (pm/task_queue.mdx
+// §8.2, §17.1, D-014). A file without a queue section has it off, so existing machines keep running direct mode.
+type Queue struct {
+	Enabled         bool    `yaml:"enabled" json:"enabled"`
+	Role            string  `yaml:"role" json:"role"`             // standalone | worker | hub
+	BrokerURL       string  `yaml:"broker_url" json:"broker_url"` // this machine's own nats-server
+	HubURL          string  `yaml:"hub_url" json:"hub_url"`       // used by broker-config for a worker's leaf node
+	CredentialsFile string  `yaml:"credentials_file" json:"-"`
+	BrokerVersion   string  `yaml:"broker_version" json:"broker_version"` // supported nats-server line; others warn
+	StoreDir        string  `yaml:"store_dir" json:"store_dir"`           // JetStream store, outside the repo
+	StoreMaxGB      float64 `yaml:"store_max_gb" json:"store_max_gb"`
+}
+
+// Continuity holds the claim timing (pm/task_queue.mdx §9).
+type Continuity struct {
+	AckWait   Duration `yaml:"ack_wait" json:"ack_wait"`   // a claim not extended for this long goes to another worker
+	Heartbeat Duration `yaml:"heartbeat" json:"heartbeat"` // InProgress interval per held job
+}
+
+// CallerSetting says whether this machine pulls a caller's jobs at all (pm/task_queue.mdx §17.1). Mode is read only
+// for the local caller (§14.5). Shares and category accept/deny are build phase Q2.
+type CallerSetting struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	Mode    string `yaml:"mode,omitempty" json:"mode,omitempty"` // local only: first | share | idle_only
+}
+
+// Local job modes (pm/task_queue.mdx §14.5; defaults per machine decided in §24 Q3, D-021).
+const (
+	LocalFirst    = "first"     // the owner's jobs are pulled before any platform job
+	LocalShare    = "share"     // the owner's jobs take their turn inside each band
+	LocalIdleOnly = "idle_only" // the owner's jobs run only when no platform job waits
+)
+
+// LocalMode is how this machine ranks its owner's queued jobs; share when unset.
+func (t *ThisServer) LocalMode() string {
+	if m := t.Callers["local"].Mode; m != "" {
+		return m
+	}
+	return LocalShare
+}
+
+// ModelRules is the owner's model fence (pm/task_queue.mdx §11.2): deny wins; an empty allow list allows every model.
+// Patterns use path.Match syntax ("wan2.*", "seedvr2-*"). Vendor models are refused everywhere (D-021).
+type ModelRules struct {
+	Allow []string `yaml:"allow" json:"allow"`
+	Deny  []string `yaml:"deny" json:"deny"`
+}
+
+// Allowed reports whether this machine may run model, and why not. A job with no model is allowed.
+func (m ModelRules) Allowed(model string) (bool, string) {
+	if model == "" {
+		return true, ""
+	}
+	if strings.HasPrefix(model, "vendor:") {
+		return false, "vendor API models never run on processing servers"
+	}
+	for _, p := range m.Deny {
+		if ok, _ := path.Match(p, model); ok {
+			return false, "models.deny has " + p
+		}
+	}
+	if len(m.Allow) == 0 {
+		return true, ""
+	}
+	for _, p := range m.Allow {
+		if ok, _ := path.Match(p, model); ok {
+			return true, ""
+		}
+	}
+	return false, "not in models.allow"
+}
+
+// DefaultCallers are the callers pulled when the file has no callers section.
+var DefaultCallers = []string{"act3", "wtc", "local"}
+
+// EnabledCallers returns the callers this machine pulls for, sorted.
+func (t *ThisServer) EnabledCallers() []string {
+	if len(t.Callers) == 0 {
+		return append([]string(nil), DefaultCallers...)
+	}
+	var out []string
+	for id, c := range t.Callers {
+		if c.Enabled {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 type Identity struct {
@@ -97,6 +193,9 @@ func defaults() ThisServer {
 		Limits:   DefaultLimits(),
 		LocalAPI: LocalAPI{Listen: "127.0.0.1:9440", TokenFile: "~/.credentials/ai_processing_server_local.token"},
 		Paths:    Paths{CacheMaxGB: 200},
+		Queue: Queue{Role: "standalone", BrokerURL: "nats://127.0.0.1:4222", BrokerVersion: "2.15",
+			StoreDir: "~/.act3_processing/nats/jetstream", StoreMaxGB: 20},
+		Continuity: Continuity{AckWait: Duration{5 * time.Minute}, Heartbeat: Duration{20 * time.Second}},
 	}
 }
 
@@ -168,6 +267,7 @@ type KnownServer struct {
 	Site        string   `yaml:"site"`
 	Match       Match    `yaml:"match"`
 	ServicesOff []string `yaml:"services_off"`
+	LocalMode   string   `yaml:"local_mode"` // callers.local.mode init writes; share when empty
 }
 
 type Match struct {

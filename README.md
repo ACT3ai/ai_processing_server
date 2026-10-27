@@ -53,10 +53,21 @@ All connections start from the server, so machines behind a home or office NAT w
 | Service weights, pauses, drain | The platform, sent in heartbeat responses. These can never turn on a service the owner turned off. |
 | ACT3 vs WTC share of the machine when both have work | The machine owner (`platforms.*.share`) |
 
-The coordination logic is ours: matching, priority, slots, leases and retries are Go code in this repo. The proposed
-transport is an HTTPS lease API (`POST /processing/lease`, long-poll). A Temporal adapter is optional for migrating off
-today's TypeScript `job_runner`. RabbitMQ is not planned for now. That choice is still **proposed**: decision D-001 in
-the spec waits for Bryan to confirm it.
+The coordination logic is ours: matching, priority, slots, claims and retries are Go code in this repo. The task queue
+is **NATS with JetStream, running as its own `nats-server` process** on every machine (decided 2026-10-27, D-014; see
+[pm/task_queue.mdx](pm/task_queue.mdx)). Our binary is a client of it: it pulls jobs for the services it offers, claims
+them with a fencing token, reports events, and requeues or dead-letters failures. Queued jobs and claims stay in the
+broker while our binary restarts. Set it up once per machine:
+
+```bash
+just broker-install    # nats-server (Homebrew on macOS, winget on Windows)
+just broker-config     # writes ~/.act3_processing/nats/<role>.conf from this_server.yaml
+just broker-run        # starts it in the background (until it is installed as an OS service)
+just broker-status
+```
+
+Without a broker the server still runs direct mode (`POST /v1/jobs`), and `GET /v1/health` reports
+`broker: broker_missing` with the fix. Owners and local software submit to the queue with `POST /v1/queue/jobs`.
 
 ## `this_server.yaml`: what makes a machine a server
 
@@ -112,7 +123,7 @@ ai_processing_server/
 ├── .gitignore                 # binary, build output, /data/git_ignore/, private keys
 ├── pm/                        # specifications only, never code
 │   ├── ai_processing_server.mdx   # the engineering spec
-│   ├── Decisions.yaml             # D-001 … D-010
+│   ├── Decisions.yaml             # D-001 … D-017
 │   └── TO_DO.md
 ├── servers/                   # one server.yaml per known machine (checked in)
 │   ├── Bryan_5090/server.yaml
@@ -219,7 +230,7 @@ Each job also gets its own log at `data/git_ignore/logs/jobs/<job_id>.log`. That
 | 0. Specs and scaffold | `pm/Goal.md`, `pm/TO_DO.md`, `pm/Decisions.yaml`; `code/go.mod`; justfile `build`/`run` |
 | 1. Identity and hardware | config, hardware detection, capability offers, `init`, `detect`, local API read routes, logging |
 | 2. Jobs locally | job state machine, scheduler, `selftest` and `ffmpeg` runners, direct mode |
-| 3. ACT3 connected | HTTPS lease broker; appsrv lease endpoints; heartbeat feeds the admin Server page |
+| 3. ACT3 connected | ACT3 submits through the NATS task queue (task_queue.mdx §20, §22); queue v1 built in v0.2.0 |
 | 4. GPU services | `comfy` and `python` runners, model cache, `b5090` / `bpc` / `bms` profiles |
 | 5. WTC connected | `wtc.transcription`, `wtc.transcode`, `wtc.ocr` |
 | 6. Fleet | service install, metrics, automated updates, Nepal and cloud machines |

@@ -20,7 +20,9 @@ just results              # print the last run's report
 Without `just`: `python3 run_tests.py [suites...] [-k text] [--no-build]`.
 From the repo root, `just test` runs the Go unit tests and then this suite.
 
-A full run is 74 tests in about 45 seconds on the Bryan laptop (M4 Max). Each run writes
+A full run is 93 tests in about 2 minutes on the Bryan laptop (M4 Max), as of 2026-10-27. The `broker` suite (14 tests)
+starts its own `nats-server` processes on free ports and is **skipped** when `nats-server` is not on PATH
+(`just broker-install` in the repo root). Each run writes
 `Test_Results/<date_time>_results.md`, `Test_Results/latest.md` and `Test_Results/latest.json`. These files are
 git-ignored.
 
