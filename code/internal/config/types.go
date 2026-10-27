@@ -29,14 +29,11 @@ type ThisServer struct {
 	Limits        Limits                     `yaml:"limits" json:"limits"`
 	Paths         Paths                      `yaml:"paths" json:"paths"`
 	LocalAPI      LocalAPI                   `yaml:"local_api" json:"local_api"`
-<<<<<<< HEAD
-	Security      Security                   `yaml:"security" json:"-"`
-=======
 	Queue         Queue                      `yaml:"queue" json:"queue"`
 	Continuity    Continuity                 `yaml:"continuity" json:"continuity"`
 	Callers       map[string]CallerSetting   `yaml:"callers" json:"callers"`
 	Models        ModelRules                 `yaml:"models" json:"models"`
->>>>>>> origin/main
+	Security      Security                   `yaml:"security" json:"-"`
 	Debug         Debug                      `yaml:"debug" json:"debug"`
 }
 

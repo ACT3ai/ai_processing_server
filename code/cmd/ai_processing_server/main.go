@@ -158,12 +158,8 @@ func main() {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
-<<<<<<< HEAD
-commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force] · version
-=======
-commands: init [--write-new] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
+commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
           broker status|config · version
->>>>>>> origin/main
 flags: --root --state-dir --config --log-dir --error-dir --listen --json
 `)
 }

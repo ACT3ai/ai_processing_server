@@ -59,12 +59,6 @@ local_api:
   token_file: "~/.credentials/ai_processing_server_local.token"
   allow_direct_jobs: true             # POST /v1/jobs without a platform (development, self tests, owner batches)
 
-<<<<<<< HEAD
-# Server identity key (pm/security.mdx §4). The PRIVATE key never leaves this machine and is never committed.
-# key_dir "" = data/git_ignore/keys. Init points it at the credentials checkout's git-ignored keys/ when there is one.
-security:
-  key_dir: "{{.KeyDir}}"
-=======
 # The task queue: NATS JetStream in its own nats-server process on this machine (pm/task_queue.mdx §8.2, D-014).
 # Install the broker once with `just broker-install`, write its config with `just broker-config`, start it with
 # `just broker-run` (or as an OS service). Without a reachable broker the server still runs direct mode and
@@ -95,7 +89,11 @@ callers:                              # whose queued jobs this machine pulls (sh
 models:                               # the owner's model fence (task_queue.mdx §11.2): deny wins; empty allow = every model
   allow: []                           # e.g. ["wan2.2-*", "seedvr2*", "whisper-*"]
   deny: []                            # vendor:* models are refused on every processing server regardless (D-021)
->>>>>>> origin/main
+
+# Server identity key (pm/security.mdx §4). The PRIVATE key never leaves this machine and is never committed.
+# key_dir "" = data/git_ignore/keys. Init points it at the credentials checkout's git-ignored keys/ when there is one.
+security:
+  key_dir: "{{.KeyDir}}"
 
 debug:
   keep_work_dirs: false

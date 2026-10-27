@@ -111,15 +111,11 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 	var off map[string]bool
 	localMode := LocalShare
 	if ks := MatchKnown(cat.Known, facts); ks != nil {
-<<<<<<< HEAD
-		id = Identity{Key: ks.Key, DisplayName: ks.DisplayName, Profile: ks.Profile, Family: ks.Family, Site: ks.Site,
-			ServersDir: ks.ServersDir}
-=======
 		if ks.LocalMode != "" {
 			localMode = ks.LocalMode
 		}
-		id = Identity{Key: ks.Key, DisplayName: ks.DisplayName, Profile: ks.Profile, Family: ks.Family, Site: ks.Site}
->>>>>>> origin/main
+		id = Identity{Key: ks.Key, DisplayName: ks.DisplayName, Profile: ks.Profile, Family: ks.Family, Site: ks.Site,
+			ServersDir: ks.ServersDir}
 		off = map[string]bool{}
 		for _, s := range ks.ServicesOff {
 			off[s] = true
@@ -158,11 +154,8 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 		"MachineID":    id.BoundTo.MachineID,
 		"HardwareYAML": indent(string(hwYAML), "  "),
 		"ServicesYAML": strings.TrimRight(svc.String(), "\n"),
-<<<<<<< HEAD
-		"KeyDir":       DefaultKeyDir(id.Key),
-=======
 		"LocalMode":    localMode,
->>>>>>> origin/main
+		"KeyDir":       DefaultKeyDir(id.Key),
 	}
 	tpl, err := template.New("this_server").Option("missingkey=error").Parse(cat.Template)
 	if err != nil {
