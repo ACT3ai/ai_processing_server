@@ -15,12 +15,15 @@ export CGO_ENABLED := "0"     # pure Go: no C toolchain needed (spec §3.1, D-00
 default:
     @just --list
 
-# Compile code/ into ./ai_processing_server, then create data/git_ignore/this_server.yaml if missing (never overwrites it)
+# this_server.yaml is created once and never overwritten (pm/ai_processing_server.mdx §6.1).
+# Compile, install nats-server if missing, create this_server.yaml if missing, write the broker config
 build:
     @echo "building {{bin}} {{version}} (git {{git_sha}}) with `go version | cut -d' ' -f3`"
     @cd code && go build -trimpath -ldflags "{{ldflags}}" -o ../{{bin}} ./cmd/ai_processing_server
     @echo "built ./{{bin}}"
+    @just _broker-ensure
     @./{{bin}} init
+    @./{{bin}} broker config >/dev/null 2>&1 && echo "broker config: `./{{bin}} broker config`" || echo "broker config: skipped until this_server.yaml loads"
 
 # Start the server in the background and print where its API and logs are
 [unix]
@@ -28,6 +31,10 @@ run: _binary
     #!/usr/bin/env bash
     set -euo pipefail
     if ./{{bin}} status >/dev/null 2>&1; then echo "already running:"; ./{{bin}} status; exit 0; fi
+    # The queue needs this machine's nats-server: start it first when it is not answering (problems 2026_oct_27 #1).
+    if command -v nats-server >/dev/null && ! ./{{bin}} broker status >/dev/null 2>&1; then
+      just broker-run || echo "warning: the broker did not start; the server runs direct mode only (just broker-status)"
+    fi
     mkdir -p data/git_ignore/logs
     nohup ./{{bin}} run > data/git_ignore/logs/server.stdout.log 2>&1 &
     pid=$!
@@ -109,6 +116,18 @@ broker-install:
 broker-install:
     if (Get-Command nats-server -ErrorAction SilentlyContinue) { nats-server --version } else { winget install NATS.Server }
 
+# `just build` calls this: install nats-server when missing; never fails the build (without a broker the server
+# still runs direct mode and GET /v1/health says broker_missing with the fix)
+[unix]
+_broker-ensure:
+    #!/usr/bin/env bash
+    if just broker-install; then exit 0; fi
+    echo "WARNING: nats-server is not installed, so the task queue cannot start on this machine (see above)."
+
+[windows]
+_broker-ensure:
+    try { just broker-install } catch { Write-Output "WARNING: nats-server is not installed; the task queue cannot start on this machine." }
+
 # Write this machine's nats-server config from this_server.yaml (to ~/.act3_processing/nats/, never hand edited)
 broker-config: _binary
     ./{{bin}} broker config
@@ -139,6 +158,37 @@ broker-stop:
 # Is this machine's broker up, which version, how many jobs are stored
 broker-status: _binary
     ./{{bin}} broker status
+
+# ---- model services and real renders (problems 2026_oct_27, pm/task_authoring.mdx §7.1) ----
+
+# Turn services (or the queue) on in this_server.yaml, keeping its comments: just enable act3.upscale_open_source
+enable +items: _binary
+    ./{{bin}} enable {{items}}
+
+# Turn services (or the queue) off in this_server.yaml
+disable +items: _binary
+    ./{{bin}} disable {{items}}
+
+# Is this machine ready to render Wan 2.2 and SeedVR2? Broker, config, and each model service's offer + reason
+render-check: _binary
+    -./{{bin}} broker status
+    @echo
+    -./{{bin}} validate
+    @echo
+    @./{{bin}} status 2>/dev/null | grep -E "SERVICE|open_source|local API" || echo "server not running: just run"
+
+# One real job through the queue on this machine's installed models: wan, upscale, or all (Wan, then upscale its clip)
+render-test what="all": _binary
+    python3 tests/real_render.py {{what}}
+
+# On the Mac Studio: build (installs the broker), turn the queue + both model services on, (re)start, check
+render-setup: build
+    ./{{bin}} enable queue act3.video_gen_open_source act3.upscale_open_source
+    ./{{bin}} validate
+    -./{{bin}} stop
+    just run
+    @echo
+    just render-check
 
 # Secret scan, Go unit tests (with vet), then the black-box test suite in tests/
 test: check-secrets test-go test-suite

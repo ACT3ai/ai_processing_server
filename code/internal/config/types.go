@@ -275,7 +275,10 @@ type KnownServer struct {
 	ServersDir  string   `yaml:"servers_dir"` // its directory under servers/, when checked in
 	Match       Match    `yaml:"match"`
 	ServicesOff []string `yaml:"services_off"`
-	LocalMode   string   `yaml:"local_mode"` // callers.local.mode init writes; share when empty
+	// ServicesOn: services init writes enabled: true on this machine even when the catalog defaults them off (the
+	// model services on the box whose weights are installed: BMS Wan 2.2 + SeedVR2, problems 2026_oct_27 #2).
+	ServicesOn []string `yaml:"services_on"`
+	LocalMode  string   `yaml:"local_mode"` // callers.local.mode init writes; share when empty
 }
 
 type Match struct {

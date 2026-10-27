@@ -145,6 +145,8 @@ func main() {
 		err = cmdStop(p)
 	case "broker":
 		err = cmdBroker(p, append(sub, fs.Args()...))
+	case "enable", "disable":
+		err = cmdEnable(p, append(sub, fs.Args()...), cmd == "enable")
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -159,7 +161,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
 commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
-          broker status|config · version
+          broker status|config · enable|disable <service-id|queue>... · version
 flags: --root --state-dir --config --log-dir --error-dir --listen --json
 `)
 }
@@ -361,7 +363,8 @@ func cmdDetect(p paths) error {
 		warns = append(warns, "using a generated config: "+err.Error())
 	}
 	eff, drift := hardware.Effective(facts, ts.Hardware)
-	offers := capability.ComputeOffers(capability.Input{Catalog: cat, Server: ts, Facts: eff, Runners: runners.Names()})
+	offers := capability.ComputeOffers(capability.Input{Catalog: cat, Server: ts, Facts: eff, Runners: runners.Names(),
+		NotInstalled: runners.InstallProblems()})
 	if p.JSONOut {
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"detected": facts, "effective": eff, "drift": drift, "offers": offers, "warnings": warns})
 	}
@@ -726,6 +729,29 @@ func cmdBroker(p paths, args []string) error {
 		return nil
 	}
 	return fmt.Errorf("usage: ai_processing_server broker status|config")
+}
+
+// cmdEnable turns services (or the queue) on or off in this_server.yaml at the owner's request, keeping comments
+// (config.SetEnabled). A running server reads the file at boot: restart it (`just stop && just run`) to apply.
+func cmdEnable(p paths, items []string, on bool) error {
+	if len(items) == 0 {
+		return errors.New("usage: ai_processing_server enable|disable <service-id|queue>...")
+	}
+	cat, err := config.LoadCatalog(p.Data)
+	if err != nil {
+		return err
+	}
+	did, err := config.SetEnabled(p.Config, cat, items, on)
+	for _, d := range did {
+		fmt.Println(d)
+	}
+	if err != nil {
+		return err
+	}
+	if c, cerr := newClient(p); cerr == nil && c.do("GET", "/v1/health", &map[string]any{}) == nil {
+		fmt.Println("the server is running on the old settings: restart it to apply (just stop && just run)")
+	}
+	return nil
 }
 
 func errString(err error) string {
