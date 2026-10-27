@@ -56,9 +56,13 @@ type InitResult struct {
 }
 
 // InitKey creates the private key in dir when none exists (mode 0600 in a 0700 directory, written atomically and
-// create-only) and otherwise only loads and checks the existing one. It never replaces a key.
+// create-only) and otherwise only loads and checks the existing one. It never replaces a key, and it refuses a dir
+// where git could commit the key.
 func InitKey(dir string) (InitResult, error) {
 	path := filepath.Join(dir, PrivateFile)
+	if err := CheckNotCommittable(path); err != nil {
+		return InitResult{}, err
+	}
 	if _, err := os.Stat(path); err == nil {
 		k, err := LoadKey(path)
 		return InitResult{Key: k}, err
@@ -67,6 +71,11 @@ func InitKey(dir string) (InitResult, error) {
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return InitResult{}, err
+	}
+	if st, err := os.Stat(dir); err == nil && runtime.GOOS != "windows" && st.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil { // the key dir is ours alone, even if it existed before
+			return InitResult{}, err
+		}
 	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -83,8 +92,12 @@ func InitKey(dir string) (InitResult, error) {
 	return InitResult{Created: true, Key: &Key{Private: priv, Public: pub, KID: Thumbprint(pub), Path: path}}, nil
 }
 
-// LoadKey reads a PKCS #8 PEM Ed25519 private key and refuses one that other users can read (security.mdx §4.2).
+// LoadKey reads a PKCS #8 PEM Ed25519 private key and refuses one that other users can read (security.mdx §4.2)
+// or that git could commit (§4.4).
 func LoadKey(path string) (*Key, error) {
+	if err := CheckNotCommittable(path); err != nil {
+		return nil, err
+	}
 	if err := CheckPermissions(path); err != nil {
 		return nil, err
 	}

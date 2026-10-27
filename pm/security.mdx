@@ -9,7 +9,7 @@ extends §16. No code exists yet. */}
 
 # ai_processing_server: security specification
 
-**Owner:** CTO · **As of:** 2026-10-27 · **Status:** specified, not built
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** specified; server keys (§4, §5.1) built, transport not built
 · **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
 · **Companions:** [apis.mdx](./apis.mdx) (every endpoint, header and signature on the wire) ·
 [ai_processing_server.mdx](./ai_processing_server.mdx) (the server as a whole) ·
@@ -232,8 +232,15 @@ data/git_ignore/keys/                       # 0700, git-ignored (/data/git_ignor
 └── platform_overrides/                     # nothing secret; reserved for future per-platform key choices
 ```
 
-* **Path override:** `security.key_dir` in `this_server.yaml`, for a machine that keeps keys on an encrypted volume.
-  Default `data/git_ignore/keys/`.
+* **Path override:** `security.key_dir` in `this_server.yaml`, for a machine that keeps keys elsewhere. Default
+  `data/git_ignore/keys/`.
+* **Fleet machines with the credentials repo:** when `init` creates `this_server.yaml` on a machine that has the
+  `act3ai-credentials` checkout (`~/repos/act3ai-credentials` or `~/BGit/act3/act3ai-credentials`), it sets
+  `security.key_dir` to `{checkout}/keys/ai_processing_server/{KEY}/`. That repo git-ignores `/keys/` and never
+  SOPS-encrypts it into git, so the key stays local and unbacked-up (§4.4), and every secret on the machine sits under
+  one tree. BMS uses this since 2026-10-27.
+* **Git guard:** `keys init` and every key load refuse a key path inside a git work tree unless that repo's own
+  `git check-ignore` says the path is ignored. A key that git could commit is never created and never used.
 * **Windows:** POSIX modes do not exist; `keys init` sets an ACL that grants access to the current user and SYSTEM
   only, removes inherited entries, and verifies it by reading the ACL back. A key file readable by `Users` or
   `Everyone` makes `run` refuse to start.
@@ -854,8 +861,19 @@ Signing every platform request (RFC 9421 + Content-Digest) is implemented in cod
 Verifying platform responses against pinned keys is implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/security/httpsig/verify.go` — `Verifier.VerifyResponse`
 
-Enrollment and rotation commands are implemented in code:
-`~/BGit/act3/ai_processing_server/code/cmd/ai_processing_server/keys.go` — `cmdEnroll`, `cmdKeysRotate`, `cmdKeysShow`
+Refusing a private key path that git could commit is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/security/keys/gitguard.go` — `CheckNotCommittable`
+
+The key commands (`init` key step, `keys init`, `keys show`), key-dir resolution and publishing to `servers/` are
+implemented in code:
+`~/BGit/act3/ai_processing_server/code/cmd/ai_processing_server/keys.go` — `setupKey`, `publish`, `keyDir`,
+`publishDir`, `cmdKeys` (`cmdEnroll` and `cmdKeysRotate` to write in phase 3)
+
+The default `security.key_dir` under the credentials checkout is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/config/init.go` — `DefaultKeyDir`
+
+The tracked-file private-key scan (§4.4 rule 2) is implemented in:
+`~/BGit/act3/ai_processing_server/justfile` — recipe `check-secrets` (part of `just test`)
 
 The SSRF guard for envelope URLs is implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/storage/safedial.go` — `SafeDialer`, `CheckURL`
@@ -872,3 +890,8 @@ Platform-side verification for ACT3 is implemented in code (appsrv, to write):
 ### 22.2 Upgrade log
 
 * 2026-10-27: spec written. `/data/git_ignore/` and private-key patterns added to `.gitignore`. No code yet.
+* 2026-10-27: §4 and §5.1 built. `init` creates the key once and publishes the JWK Set; `keys init|show`; `run`
+  loads the key at boot (missing = WARN until the transport needs it; unsafe mode or committable path = refuse);
+  `validate` checks it; `security.key_dir`, `server.servers_dir`, the git guard and `just check-secrets` added.
+  BMS key created in `act3ai-credentials/keys/ai_processing_server/BMS/` (fingerprint `SHA256:Pyaz-gkZk-HvFC-kAQd`)
+  and published in `servers/Bryan_Mac_Studio/keys/`.

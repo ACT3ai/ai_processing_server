@@ -110,7 +110,8 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 	id := Identity{Key: "CHANGE_ME", DisplayName: facts.Hostname, Profile: "generic", Family: "office", Site: "unknown"}
 	var off map[string]bool
 	if ks := MatchKnown(cat.Known, facts); ks != nil {
-		id = Identity{Key: ks.Key, DisplayName: ks.DisplayName, Profile: ks.Profile, Family: ks.Family, Site: ks.Site}
+		id = Identity{Key: ks.Key, DisplayName: ks.DisplayName, Profile: ks.Profile, Family: ks.Family, Site: ks.Site,
+			ServersDir: ks.ServersDir}
 		off = map[string]bool{}
 		for _, s := range ks.ServicesOff {
 			off[s] = true
@@ -149,6 +150,7 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 		"MachineID":    id.BoundTo.MachineID,
 		"HardwareYAML": indent(string(hwYAML), "  "),
 		"ServicesYAML": strings.TrimRight(svc.String(), "\n"),
+		"KeyDir":       DefaultKeyDir(id.Key),
 	}
 	tpl, err := template.New("this_server").Option("missingkey=error").Parse(cat.Template)
 	if err != nil {
@@ -163,6 +165,24 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 		return "", nil, fmt.Errorf("the template produced an invalid file (bug in data/templates): %w", err)
 	}
 	return buf.String(), ts, nil
+}
+
+// CredentialsCheckouts are where the act3ai-credentials repo is cloned on fleet machines, in order of preference.
+// Its /keys/ directory is git-ignored and never encrypted into the repo, so a private key there stays local.
+var CredentialsCheckouts = []string{"~/repos/act3ai-credentials", "~/BGit/act3/act3ai-credentials"}
+
+// DefaultKeyDir is the security.key_dir that init writes into a new this_server.yaml: under the credentials checkout
+// when this machine has one, keys/ai_processing_server/{key}/, else "" (data/git_ignore/keys, security.mdx §4.2).
+func DefaultKeyDir(serverKey string) string {
+	if !ValidKey(serverKey) {
+		return ""
+	}
+	for _, c := range CredentialsCheckouts {
+		if st, err := os.Stat(filepath.Join(ExpandHome(c), ".git")); err == nil && st.IsDir() {
+			return c + "/keys/ai_processing_server/" + serverKey
+		}
+	}
+	return ""
 }
 
 // MatchKnown finds this machine in known_servers.yaml: hostname first, then hardware hints (spec §6.6).

@@ -119,6 +119,9 @@ func Validate(ts *ThisServer, cat *Catalog) (errs []string, warns []string) {
 	} else if !ValidKey(ts.Server.Key) {
 		errs = append(errs, fmt.Sprintf("server.key %q must be A-Z and 0-9, 1 to 12 characters", ts.Server.Key))
 	}
+	if d := ts.Server.ServersDir; d != "" && (d != filepath.Base(d) || d == "." || d == "..") {
+		errs = append(errs, fmt.Sprintf("server.servers_dir %q must be a directory name under servers/, not a path", d))
+	}
 	seen := map[string]bool{}
 	for _, s := range ts.Services {
 		if seen[s.ID] {

@@ -1,0 +1,15 @@
+{
+  "keys": [
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "KWEEsGTpVxKPm2lDFtf_5FnzH7d4leKwA98tItuTIPY",
+      "kid": "PyazgkZkHvFCkAQdUN6UzdjSIdX34ZxKkQQvPYg108w",
+      "use": "sig",
+      "alg": "EdDSA",
+      "act3:server_key": "BMS",
+      "act3:created_at": "2026-10-27T10:48:27-07:00",
+      "act3:status": "current"
+    }
+  ]
+}

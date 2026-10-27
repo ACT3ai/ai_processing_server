@@ -22,8 +22,12 @@
 ## Next
 * [ ] Bryan: confirm D-001 (transport) and answer spec §23 Q2 (real hostnames for B5090, BPC, BMT, BMS).
 * [x] Laptop (BLAP): generated config promoted to `data/git_ignore/this_server.yaml` on 2026-10-27; the hand-written probe is kept as `this_server.legacy_probe_2026_10_27.yaml` (nothing in it needed merging).
-* [ ] Wire `keys.InitKey` into `init` (write `servers/{Server}/keys/server_identity.jwks.json`), add `keys show`,
-  and `data/platforms/{act3,wtc}.yaml` + pinned `.jwks.json` (security.mdx §4, §5.1, §8.1).
+* [x] Wire `keys.InitKey` into `init` (write `servers/{Server}/keys/server_identity.jwks.json`), add `keys show`
+  (done 2026-10-27; BMS key in `act3ai-credentials/keys/ai_processing_server/BMS/`, security.mdx §4, §5.1).
+* [ ] Other machines (BLAP, B5090, …): `git pull` + `just build`, add `servers_dir` and `security.key_dir` to their
+  existing `this_server.yaml` by hand first (init never rewrites it), then commit `servers/{Server}/keys/`.
+* [ ] `data/platforms/{act3,wtc}.yaml` + pinned `.jwks.json` (security.mdx §8.1); `keys rotate`, `enroll` (§5.2, §10).
+* [ ] Retire `platforms.*.credentials_file` in the template (security.mdx §14: signed requests need no token).
 * [ ] SSRF guard and `SafeJoin` for platform jobs (`storage/safedial.go`, `storage/paths.go`, security.mdx §12.2–12.3);
   direct mode keeps loopback inputs allowed (the test FakeStorage is on 127.0.0.1).
 * [ ] Bryan: D-001 (HTTPS lease, apis.mdx) and D-Q1 (NATS JetStream as a separate nats-server service, task_queue.mdx §3) contradict each other; pick one.

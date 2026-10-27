@@ -11,6 +11,7 @@ server:
   profile: {{.ID.Profile}}            # generic | b5090 | bpc | bmt | bms | cloud
   family: {{.ID.Family}}              # bryan | office | cloud | runpod
   site: {{.ID.Site}}
+  servers_dir: "{{.ID.ServersDir}}"    # its directory under servers/ (public key published there); "" = not checked in
   bound_to:                           # a mismatch at boot means this file was copied from another machine
     hostname: "{{.ID.BoundTo.Hostname}}"
     machine_id: "{{.MachineID}}"
@@ -57,6 +58,11 @@ local_api:
   listen: "127.0.0.1:9440"            # loopback; LAN only on purpose (§16.4)
   token_file: "~/.credentials/ai_processing_server_local.token"
   allow_direct_jobs: true             # POST /v1/jobs without a platform (development, self tests, owner batches)
+
+# Server identity key (pm/security.mdx §4). The PRIVATE key never leaves this machine and is never committed.
+# key_dir "" = data/git_ignore/keys. Init points it at the credentials checkout's git-ignored keys/ when there is one.
+security:
+  key_dir: "{{.KeyDir}}"
 
 debug:
   keep_work_dirs: false

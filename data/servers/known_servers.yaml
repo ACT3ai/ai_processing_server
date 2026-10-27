@@ -4,12 +4,14 @@ schema_version: 1
 servers:
   - key: BLAP
     display_name: "Bryan Laptop"
+    servers_dir: Bryan_Laptop
     match: { hostname: ["Bry-MacBook-Pro-2025b", "Bry-MacBook-Pro-2025b.local"] }   # detected 2026-10-27
     profile: generic
     family: bryan
     site: bryan_office
   - key: B5090
     display_name: "Bryan 5090"
+    servers_dir: Bryan_5090
     match: { hostname: ["bryan-5090", "DESKTOP-B5090"], gpu_name_contains: "RTX 5090" }   # hostnames: guess
     profile: b5090
     family: bryan
@@ -28,6 +30,7 @@ servers:
     site: bryan_office
   - key: BMS
     display_name: "Bryan Mac Studio"
+    servers_dir: Bryan_Mac_Studio
     match: { hostname: ["BryansMacStudio.home", "Bryans-Mac-Studio", "Bryans-Mac-Studio.local"] }   # detected 2026-10-27
     profile: bms
     family: bryan

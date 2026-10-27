@@ -94,8 +94,18 @@ detect: _binary
 validate: _binary
     ./{{bin}} validate
 
-# Go unit tests (with vet), then the black-box test suite in tests/
-test: test-go test-suite
+# Secret scan, Go unit tests (with vet), then the black-box test suite in tests/
+test: check-secrets test-go test-suite
+
+# Fail if any tracked file holds a private key: a PEM private key block or a JWK with a "d" member
+# (pm/security.mdx §4.4). *_test.go files are skipped: they hold the public RFC 9421 / RFC 8037 test vectors.
+[unix]
+check-secrets:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    hits=$(git grep -l -E '^-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' -- . ':!*_test.go'; git grep -l -E '"d"[[:space:]]*:' -- '*.json' '*.jwk')
+    if [ -n "$hits" ]; then echo "PRIVATE KEY material in tracked files (revoke that key, then remove it):"; echo "$hits"; exit 1; fi
+    echo "check-secrets: no private keys in tracked files"
 
 # Go unit tests next to the code
 test-go:

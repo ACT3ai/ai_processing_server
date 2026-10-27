@@ -1,7 +1,9 @@
 // Command ai_processing_server is the single binary that runs on every ACT3 processing and render-queue machine
 // (pm/ai_processing_server.mdx). Subcommands:
 //
-//	init [--write-new]   create data/git_ignore/this_server.yaml if missing (never overwrite); --write-new writes .new
+//	init [--write-new]   create data/git_ignore/this_server.yaml if missing (never overwrite); --write-new writes .new;
+//	                     then create the server identity key if missing and publish its public JWK Set
+//	keys [init|show]     the server identity key (pm/security.mdx §4): create once, or print its public half
 //	run                  start the server (local API, scheduler, runners) until SIGINT/SIGTERM
 //	detect               print detected hardware and the offers it would make
 //	validate             check this_server.yaml and data/ without starting
@@ -18,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -100,6 +103,8 @@ func main() {
 		fmt.Printf("ai_processing_server %s (git %s, built %s)\n", version, gitSHA, buildTime)
 	case "init":
 		err = cmdInit(p)
+	case "keys":
+		err = cmdKeys(p, fs.Args())
 	case "run":
 		err = cmdRun(p)
 	case "detect":
@@ -134,7 +139,7 @@ func main() {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
-commands: init [--write-new] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force] · version
+commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force] · version
 flags: --root --state-dir --config --log-dir --error-dir --listen --json
 `)
 }
@@ -286,6 +291,13 @@ func cmdInit(p paths) error {
 	if _, err := config.EnsureTokenFile(tokenFile); err != nil {
 		return fmt.Errorf("local API token: %w", err)
 	}
+	if ts, err := config.Load(p.Config); err == nil {
+		if err := setupKey(p, ts); err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("server identity key: skipped until this_server.yaml loads")
+	}
 	if res.Created {
 		fmt.Println("  check server.key, the services list and limits, then `just run`")
 	}
@@ -301,7 +313,17 @@ func cmdValidate(p paths) error {
 	if err != nil {
 		return err
 	}
+	k, err := loadServerKey(p, ts)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		fmt.Println("warning: no server identity key yet in", keyDir(p, ts)+": run `ai_processing_server keys init`")
+	case err != nil:
+		return fmt.Errorf("server identity key: %w", err)
+	}
 	fmt.Printf("OK: %s (%s), %d services listed\n", ts.Server.Key, ts.Server.DisplayName, len(ts.Services))
+	if k != nil {
+		fmt.Println("OK: server identity key", k.Fingerprint())
+	}
 	return nil
 }
 
@@ -361,6 +383,19 @@ func cmdRun(p paths) error {
 	}
 	for _, w := range warns {
 		log.Warn(w)
+	}
+	// The identity key is loaded once here and held in memory only (security.mdx §4.4). Platform signing is not
+	// wired yet (phase 3), so a missing key only warns; an unsafe or unreadable one refuses to start.
+	idKey, err := loadServerKey(p, ts)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		log.Warn("no server identity key yet: run `ai_processing_server keys init` (pm/security.mdx §4)", "context", "security",
+			"dir", keyDir(p, ts))
+	case err != nil:
+		log.Error("refusing to start: server identity key", "context", "security", "error", err)
+		return fmt.Errorf("server identity key: %w", err)
+	default:
+		log.Info("server identity key loaded", "context", "security", "fingerprint", idKey.Fingerprint(), "kid", idKey.KID)
 	}
 	token, err := config.EnsureTokenFile(ts.LocalAPI.TokenFile)
 	if err != nil {

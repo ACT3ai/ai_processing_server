@@ -27,6 +27,7 @@ type ThisServer struct {
 	Limits        Limits                     `yaml:"limits" json:"limits"`
 	Paths         Paths                      `yaml:"paths" json:"paths"`
 	LocalAPI      LocalAPI                   `yaml:"local_api" json:"local_api"`
+	Security      Security                   `yaml:"security" json:"-"`
 	Debug         Debug                      `yaml:"debug" json:"debug"`
 }
 
@@ -36,6 +37,7 @@ type Identity struct {
 	Profile     string  `yaml:"profile" json:"profile"`
 	Family      string  `yaml:"family" json:"family"`
 	Site        string  `yaml:"site" json:"site"`
+	ServersDir  string  `yaml:"servers_dir" json:"servers_dir,omitempty"` // servers/{dir}/ in this repo; "" = not checked in
 	BoundTo     BoundTo `yaml:"bound_to" json:"bound_to"`
 }
 
@@ -80,6 +82,11 @@ type LocalAPI struct {
 	Listen          string `yaml:"listen" json:"listen"`
 	TokenFile       string `yaml:"token_file" json:"-"`
 	AllowDirectJobs bool   `yaml:"allow_direct_jobs" json:"allow_direct_jobs"`
+}
+
+// Security holds where this machine keeps its identity key (pm/security.mdx §4.2).
+type Security struct {
+	KeyDir string `yaml:"key_dir"` // private key directory; "" = data/git_ignore/keys
 }
 
 type Debug struct {
@@ -166,6 +173,7 @@ type KnownServer struct {
 	Profile     string   `yaml:"profile"`
 	Family      string   `yaml:"family"`
 	Site        string   `yaml:"site"`
+	ServersDir  string   `yaml:"servers_dir"` // its directory under servers/, when checked in
 	Match       Match    `yaml:"match"`
 	ServicesOff []string `yaml:"services_off"`
 }
