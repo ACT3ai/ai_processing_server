@@ -3,7 +3,7 @@
 
 set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
-version := "0.1.0"
+version := "0.2.0"
 bin := if os_family() == "windows" { "ai_processing_server.exe" } else { "ai_processing_server" }
 git_sha := `git rev-parse --short HEAD 2>/dev/null || echo unknown`
 ldflags := "-s -w -X main.version=" + version + " -X main.gitSHA=" + git_sha + " -X main.buildTime=" + datetime_utc("%Y-%m-%dT%H:%M:%SZ")
@@ -94,6 +94,7 @@ detect: _binary
 validate: _binary
     ./{{bin}} validate
 
+<<<<<<< HEAD
 # Secret scan, Go unit tests (with vet), then the black-box test suite in tests/
 test: check-secrets test-go test-suite
 
@@ -106,6 +107,56 @@ check-secrets:
     hits=$(git grep -l -E '^-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' -- . ':!*_test.go'; git grep -l -E '"d"[[:space:]]*:' -- '*.json' '*.jwk')
     if [ -n "$hits" ]; then echo "PRIVATE KEY material in tracked files (revoke that key, then remove it):"; echo "$hits"; exit 1; fi
     echo "check-secrets: no private keys in tracked files"
+=======
+# ---- task queue broker: NATS JetStream in its own nats-server process (pm/task_queue.mdx §8.2, §18, D-014) ----
+
+# Once per machine: install nats-server (data/queue/broker.yaml lists the command per OS), then check its version
+[unix]
+broker-install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v nats-server >/dev/null; then echo "nats-server present: $(nats-server --version)"; exit 0; fi
+    if [ "$(uname)" = "Darwin" ] && command -v brew >/dev/null; then brew install nats-server; nats-server --version; exit 0; fi
+    echo "nats-server is not installed. Install the 2.15.x line:"; grep -A3 '^install:' data/queue/broker.yaml; exit 1
+
+[windows]
+broker-install:
+    if (Get-Command nats-server -ErrorAction SilentlyContinue) { nats-server --version } else { winget install NATS.Server }
+
+# Write this machine's nats-server config from this_server.yaml (to ~/.act3_processing/nats/, never hand edited)
+broker-config: _binary
+    ./{{bin}} broker config
+
+# Start nats-server in the background with the generated config (until it is installed as an OS service)
+[unix]
+broker-run: _binary
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ./{{bin}} broker status >/dev/null 2>&1; then ./{{bin}} broker status; exit 0; fi
+    conf=$(./{{bin}} broker config)
+    dir=$(dirname "$conf")
+    nohup nats-server -c "$conf" > "$dir/nats-server.log" 2>&1 &
+    echo $! > "$dir/nats-server.pid"
+    for _ in $(seq 1 40); do
+      if ./{{bin}} broker status >/dev/null 2>&1; then ./{{bin}} broker status; echo "pid $(cat "$dir/nats-server.pid") · log $dir/nats-server.log · stop: just broker-stop"; exit 0; fi
+      sleep 0.25
+    done
+    echo "nats-server did not answer; see $dir/nats-server.log"; tail -n 20 "$dir/nats-server.log"; exit 1
+
+# Stop the nats-server started by broker-run (queued jobs and claims stay in its store)
+[unix]
+broker-stop:
+    #!/usr/bin/env bash
+    f="${APS_BROKER_DIR:-$HOME/.act3_processing/nats}/nats-server.pid"
+    if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then kill "$(cat "$f")" && rm -f "$f" && echo stopped; else echo "no broker started by broker-run"; fi
+
+# Is this machine's broker up, which version, how many jobs are stored
+broker-status: _binary
+    ./{{bin}} broker status
+
+# Go unit tests (with vet), then the black-box test suite in tests/
+test: test-go test-suite
+>>>>>>> origin/main
 
 # Go unit tests next to the code
 test-go:

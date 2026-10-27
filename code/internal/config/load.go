@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -148,12 +150,50 @@ func Validate(ts *ThisServer, cat *Catalog) (errs []string, warns []string) {
 	if ts.LocalAPI.Listen == "" {
 		errs = append(errs, "local_api.listen is required (default 127.0.0.1:9440)")
 	}
+	if q := ts.Queue; q.Enabled {
+		switch q.Role {
+		case "standalone", "worker":
+		case "hub":
+			errs = append(errs, "queue.role hub is build phase Q3 (pm/task_queue.mdx §22); use standalone or worker")
+		default:
+			errs = append(errs, fmt.Sprintf("queue.role %q must be standalone or worker", q.Role))
+		}
+		if q.BrokerURL == "" {
+			errs = append(errs, "queue.broker_url is required when queue.enabled (default nats://127.0.0.1:4222)")
+		}
+		ack, hb := ts.Continuity.AckWait.Or(5*time.Minute), ts.Continuity.Heartbeat.Or(20*time.Second)
+		if hb*2 > ack {
+			errs = append(errs, fmt.Sprintf("continuity.heartbeat (%s) must be at most half of continuity.ack_wait (%s)", hb, ack))
+		}
+		for id := range ts.Callers {
+			if !validCaller(id) {
+				errs = append(errs, fmt.Sprintf("callers.%s: a caller id is 1-32 characters of a-z 0-9 _ -", id))
+			}
+		}
+		switch m := ts.Callers["local"].Mode; m {
+		case "", LocalFirst, LocalShare, LocalIdleOnly:
+		default:
+			errs = append(errs, fmt.Sprintf("callers.local.mode %q: use first, share or idle_only", m))
+		}
+	}
+	for _, pat := range append(append([]string(nil), ts.Models.Allow...), ts.Models.Deny...) {
+		if _, err := path.Match(pat, ""); err != nil {
+			errs = append(errs, fmt.Sprintf("models: %q is not a valid pattern (use * and ?, like wan2.*)", pat))
+		}
+	}
 	for name, p := range ts.Platforms {
 		if p.Share < 0 || p.Share > 100 {
 			errs = append(errs, fmt.Sprintf("platforms.%s.share must be within 0..100", name))
 		}
 	}
 	return errs, warns
+}
+
+func validCaller(id string) bool {
+	if len(id) == 0 || len(id) > 32 {
+		return false
+	}
+	return strings.IndexFunc(id, func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-') }) < 0
 }
 
 func readYAML(path string, v any) error {

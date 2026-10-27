@@ -28,7 +28,7 @@ engines: {}
 services:
 {{.ServicesYAML}}
 
-platforms:                            # connections are not built yet (phase 3); kept for the shape
+platforms:                            # superseded by queue + callers below (task_queue.mdx §17.1); kept for the shape
   act3:
     enabled: false
     base_url: "https://api.act3ai.com"
@@ -59,10 +59,43 @@ local_api:
   token_file: "~/.credentials/ai_processing_server_local.token"
   allow_direct_jobs: true             # POST /v1/jobs without a platform (development, self tests, owner batches)
 
+<<<<<<< HEAD
 # Server identity key (pm/security.mdx §4). The PRIVATE key never leaves this machine and is never committed.
 # key_dir "" = data/git_ignore/keys. Init points it at the credentials checkout's git-ignored keys/ when there is one.
 security:
   key_dir: "{{.KeyDir}}"
+=======
+# The task queue: NATS JetStream in its own nats-server process on this machine (pm/task_queue.mdx §8.2, D-014).
+# Install the broker once with `just broker-install`, write its config with `just broker-config`, start it with
+# `just broker-run` (or as an OS service). Without a reachable broker the server still runs direct mode and
+# GET /v1/health reports broker: broker_missing with the fix.
+queue:
+  enabled: true
+  role: standalone                    # standalone | worker (hub is build phase Q3)
+  broker_url: "nats://127.0.0.1:4222"
+  hub_url: ""                         # worker only: the hub's leaf-node URL, used by broker-config
+  credentials_file: ""                # NATS .creds file; empty for a local standalone broker
+  broker_version: "2.15"              # supported nats-server line; any other line logs a warning
+  store_dir: "~/.act3_processing/nats/jetstream"
+  store_max_gb: 20
+
+continuity:                           # pm/task_queue.mdx §9
+  ack_wait: 5m                        # a claim not extended this long is handed to another worker
+  heartbeat: 20s                      # how often a held job's claim is extended
+
+callers:                              # whose queued jobs this machine pulls (shares and accept/deny: phase Q2)
+  act3:
+    enabled: true
+  wtc:
+    enabled: true
+  local:
+    enabled: true
+    mode: {{.LocalMode}}                 # first | share | idle_only: how this machine ranks its owner's jobs (task_queue.mdx §14.5)
+
+models:                               # the owner's model fence (task_queue.mdx §11.2): deny wins; empty allow = every model
+  allow: []                           # e.g. ["wan2.2-*", "seedvr2*", "whisper-*"]
+  deny: []                            # vendor:* models are refused on every processing server regardless (D-021)
+>>>>>>> origin/main
 
 debug:
   keep_work_dirs: false

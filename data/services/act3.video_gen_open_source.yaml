@@ -1,15 +1,20 @@
 schema_version: 1
 id: act3.video_gen_open_source
 platform: act3
-title: "Open-source video generation: Wan 2.2, LTX 2.5, Hunyuan 1.5"
-runner: comfy
-default_enabled: true
+title: "Open-source video generation on our own GPUs: Wan 2.2 A14B now (model wan2.2-a14b); LTX 2.5, Hunyuan later"
+# runner oss_video: render_wan.py from the job's frozen snapshot, in a detached task host, so a git pull or a
+# controller restart never stops a render (code/internal/runners/oss_video.go, pm/task_authoring.mdx §5).
+runner: oss_video
+# Off until the machine's owner turns it on in this_server.yaml: the weights (~/act3_render/wan_2_2/) are installed
+# per machine and hardware detection cannot see them (pm/task_authoring.mdx §7.1 step 6).
+default_enabled: false
 requires:
   gpu: required
   compute: [cuda, metal]
   min_vram_gb: 24
   min_unified_memory_gb: 96
-resources_per_job: { cpu_cores: 4, ram_gb: 32, vram_gb: 24 }
+resources_per_job: { cpu_cores: 4, ram_gb: 64, vram_gb: 24 }
 max_parallel_default: 1
-timeouts: { stage_inputs: 30m, run: 120m, upload: 20m }
+# Measured worst case: Wan 2.2 at 1280x720, 81 frames, 20 steps without Lightning on the Mac Studio (MPS).
+timeouts: { stage_inputs: 30m, run: 180m, upload: 20m }
 retry: { max_attempts: 2, retry_on: [transient, infra] }
