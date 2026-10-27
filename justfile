@@ -42,8 +42,8 @@ run: _binary
       if ./{{bin}} status >/dev/null 2>&1; then
         ./{{bin}} status
         echo
-        echo "pid $pid · stop with: just stop"
-        echo "logs: ~/_act3_logs/processing_server.info and .err (just logs) · stdout: data/git_ignore/logs/server.stdout.log"
+        echo "started pid $pid · stop: just stop · status: just status"
+        echo "logs: just logs (~/_act3_logs/processing_server.info, .err) · stdout: data/git_ignore/logs/server.stdout.log"
         exit 0
       fi
       if ! kill -0 "$pid" 2>/dev/null; then
@@ -67,13 +67,13 @@ run-fg: _binary
 
 # Drain running jobs, then stop. `just stop force` kills now.
 stop mode="": _binary
-    ./{{bin}} stop {{ if mode == "force" { "--force" } else { "" } }}
+    @./{{bin}} stop {{ if mode == "force" { "--force" } else { "" } }}
 
 # Health, services and running jobs of the server on this machine
 status: _binary
-    ./{{bin}} status
+    @./{{bin}} status
     @echo
-    ./{{bin}} jobs
+    @./{{bin}} jobs
 
 # Tail the server logs in ~/_act3_logs
 [unix]
@@ -109,7 +109,8 @@ broker-install:
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v nats-server >/dev/null; then echo "nats-server present: $(nats-server --version)"; exit 0; fi
-    if [ "$(uname)" = "Darwin" ] && command -v brew >/dev/null; then brew install nats-server; nats-server --version; exit 0; fi
+    # quiet install; `just broker-run` starts it with our config, so skip brew's "brew services start" advice
+    if [ "$(uname)" = "Darwin" ] && command -v brew >/dev/null; then HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew install --quiet nats-server >/dev/null; echo "installed $(nats-server --version)"; exit 0; fi
     echo "nats-server is not installed. Install the 2.15.x line:"; grep -A3 '^install:' data/queue/broker.yaml; exit 1
 
 [windows]

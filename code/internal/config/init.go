@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"text/template"
 	"time"
@@ -38,6 +39,7 @@ type InitResult struct {
 	Verdict  string
 	Errors   []string
 	Warnings []string
+	Next     []string // what the owner can do about the warnings
 }
 
 // InitThisServer creates this_server.yaml when it is missing and NEVER touches it when it exists (spec §6.1, P3).
@@ -71,6 +73,10 @@ func InitThisServer(o InitOptions) (InitResult, error) {
 			}
 		}
 		res.Verdict = fmt.Sprintf("this_server.yaml OK: %s, %d services on (left untouched)", ts.Server.Key, on)
+		if w := newerThanFile(o.Path, o.Catalog); len(w) > 0 {
+			res.Warnings = append(res.Warnings, w...)
+			res.Next = append(res.Next, "just reinit writes this_server.yaml.new and shows the diff; merge what you want by hand")
+		}
 		return res, nil
 	}
 
@@ -104,6 +110,43 @@ func InitThisServer(o InitOptions) (InitResult, error) {
 	}
 	return res, nil
 }
+
+// newerThanFile names what the current template and catalog have that an older this_server.yaml does not: top-level
+// sections (a missing one runs on its defaults, e.g. no queue: = task queue off) and services the file never
+// mentions (off until listed). Init still never rewrites the file; the owner merges from `just reinit`.
+func newerThanFile(path string, cat *Catalog) []string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	text := string(b)
+	have := map[string]bool{}
+	for _, m := range sectionKey.FindAllStringSubmatch(text, -1) {
+		have[m[1]] = true
+	}
+	var sections, services []string
+	for _, m := range sectionKey.FindAllStringSubmatch(cat.Template, -1) {
+		if !have[m[1]] {
+			sections = append(sections, m[1])
+		}
+	}
+	for _, id := range cat.IDs() {
+		if !strings.Contains(text, id) {
+			services = append(services, id)
+		}
+	}
+	var out []string
+	if len(sections) > 0 {
+		out = append(out, fmt.Sprintf("this_server.yaml predates section(s) %s; they run on defaults (no queue: = task queue off)",
+			strings.Join(sections, ", ")))
+	}
+	if len(services) > 0 {
+		out = append(out, fmt.Sprintf("new service(s) not listed, so off: %s", strings.Join(services, ", ")))
+	}
+	return out
+}
+
+var sectionKey = regexp.MustCompile(`(?m)^([a-z_]+):`)
 
 // Generate renders the template for this machine and parses it back, so what is written is exactly what loads.
 func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunFunc, keep *Identity) (string, *ThisServer, error) {
