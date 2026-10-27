@@ -19,10 +19,10 @@ On every machine it runs on, it:
    jobs on two GPUs, or several CPU-only jobs side by side).
 4. **Reports status and results** back: progress, logs, output files, success/failure.
 
-Coordination is **ours**. We can use RabbitMQ (or another message broker) internally for
-transport, but the scheduling rules (which machine takes which job, priority, retries, how
-capabilities are matched) are our own logic, written in this repo and specified in `pm/`. Which
-broker we use is an open decision; record it in `pm/` once it is made.
+Coordination is **ours**. The transport is NATS JetStream in its own nats-server process
+(pm/Decisions.yaml D-014); our binary is only a client. The scheduling rules (which machine takes
+which job, priority, retries, how capabilities are matched) are our own logic, written in this repo
+and specified in `pm/`.
 
 ## Language and build
 
@@ -75,8 +75,12 @@ code/
     ├── capability/   # Turn hardware into "job types I can run, and how many"
     ├── jobs/         # Job definitions, intake, lifecycle (queued → running → done/failed)
     ├── scheduler/    # Our coordination: matching, priority, parallel slots, retries
-    ├── broker/       # Transport to/from the queue (RabbitMQ or alternative)
+    ├── queue/        # Task queue transport: NATS JetStream (queue/natsq), contract tests
+    ├── brokerctl/    # This machine's nats-server: config, status
     ├── runners/      # One runner per job type (image, video, upscale, Blender, ...)
+    ├── taskhost/     # Detached task host: a render outlives a controller restart
+    ├── snapshot/     # Frozen, content-keyed copy of the task code a job runs
+    ├── scripts/      # (code/scripts/) task code that gets snapshotted
     └── report/       # Progress, logs, and result reporting back to the platform
 ```
 
@@ -95,8 +99,10 @@ code/
 
 ## Current state (2026-10-27)
 
-v0.1.0 is built: Go code in `code/`, the `justfile`, `data/` catalogs, Go unit tests, and the black-box
-suite in `tests/` (Python standard library; `cd tests && just`). Jobs arrive by direct mode
-(`POST /v1/jobs`); the platform transport (spec phase 3) is next. Builds use `GOWORK=off` because the
+v0.2.0: jobs arrive through NATS JetStream (POST /v1/queue/jobs, or NATS directly) or direct mode.
+Model runners oss_video (Wan 2.2) and oss_upscale (SeedVR2) run in detached task hosts from frozen
+snapshots (data/git_ignore/runs/, snapshots/), so a git pull and a restart never stop a render. Task
+scripts live in code/scripts/ (copies from ~/BGit/all; refresh with code/scripts/sync_from_all.sh).
+`just build` also installs nats-server; on the Mac Studio, `just render-setup` then `just render-test`. Builds use `GOWORK=off` because the
 parent `~/BGit/act3/go.work` would otherwise capture this module. See `pm/TO_DO.md` and
 `pm/Decisions.yaml`.

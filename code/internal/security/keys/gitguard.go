@@ -26,6 +26,10 @@ func CheckNotCommittable(path string) error {
 		return fmt.Errorf("%s is inside the git repo %s and git is not installed to confirm it is ignored; "+
 			"move security.key_dir outside the repo", abs, top)
 	}
+	// A ".git" git does not recognise (a stray folder left in $TMPDIR, say) is not a work tree: ask git itself.
+	if exec.Command(git, "-C", top, "rev-parse", "--is-inside-work-tree").Run() != nil {
+		return nil
+	}
 	cmd := exec.Command(git, "-C", top, "check-ignore", "-q", "--no-index", "--", abs)
 	err = cmd.Run()
 	var exit *exec.ExitError

@@ -265,7 +265,39 @@ binary, with `APS_FAKE_MODELS=on` so no weights are needed. The tests skip on a 
   requeue, and `code_version` names the old snapshot.
 * **G5:** a SeedVR2 upscale is cancelled mid-render. It ends `CANCELLED`, and no task host or render process is left.
 * Both pass 3 runs out of 3.
-* **Not written yet:** G3, G4, G6, G7, and runs with real weights on the Mac Studio and B5090.
+* **G3, G4, G6, G7** (2026-10-27, `tests/broker/test_task_gates.py`, same setup):
+  * G3: nats-server stopped and restarted mid-render. The render keeps going; `SUCCEEDED` once, attempt 1, no requeue.
+  * G4: a simulated power cut (controller SIGKILL, task host and render killed, broker restarted, then broker and
+    server back in boot order). Redelivered, run again, `SUCCEEDED` on attempt 2 with exactly one `succeeded` event.
+    Wan and SeedVR2 have no checkpoint (R8), so they restart from the beginning.
+  * G6: two servers on one broker. The worker holding the job is frozen with SIGSTOP past the ack wait, the other
+    worker gets the job too, then the frozen one wakes and its render finishes. Exactly one `succeeded` event, from
+    the claim holder, and still one after the fenced worker has had time to report.
+  * G7: five short jobs while the controller is restarted every 4 s (stop signal and SIGKILL in turn). Each is
+    `SUCCEEDED` once on attempt 1, with no requeue. Overhead is 0.2 s per job once controller downtime is taken out
+    (limit 2 s).
+  * Whole black-box suite: 99 of 99.
+* **Still to do:** real-weight runs on the Mac Studio (`just render-setup`, then `just render-test`; see §8.1) and
+  on B5090. A real power cycle stays a manual check.
+
+### 8.1 Real renders on the Mac Studio (problems 2026_oct_27)
+
+* `just build` installs nats-server when it is missing (Homebrew on macOS), creates this_server.yaml once, and
+  writes the broker config. `just run` starts the broker first if nothing answers on its URL.
+* `just render-setup` runs `build`, `enable queue act3.video_gen_open_source act3.upscale_open_source`, `validate`,
+  then stops and restarts the server on the new build, and ends with `render-check`.
+  * `ai_processing_server enable|disable <service-id|queue>...` is the owner's switch. It edits this_server.yaml as
+    text, keeping comments, and saves a .bak-<time> copy first. init still never rewrites the file.
+  * Implemented in: ~/BGit/act3/ai_processing_server/code/internal/config/enable.go, `SetEnabled`.
+* known_servers.yaml `services_on` makes a fresh init on BMS write both model services as `enabled: true`.
+* A machine that has a model service turned on but the model NOT installed offers 0 parallel for it, with the
+  reason (the missing path and the install guide). It never claims a fleet job it would fail.
+  * Implemented in: ~/BGit/act3/ai_processing_server/code/internal/runners/install.go, `InstallProblems`, read by
+    code/internal/capability/offers.go `ComputeOffers` (`Input.NotInstalled`).
+* `just render-test [all|wan|upscale]` sends one small real job through the queue, the same way the internal web app
+  does: Wan 480x272 with 17 frames and Lightning, then a SeedVR2 3B upscale of that clip to 960x544. It saves both
+  under ~/T/_ai_processing_server/real_render/<time>/ and checks them with ffprobe.
+  * Implemented in: ~/BGit/act3/ai_processing_server/tests/real_render.py, `main`.
 
 ## 9. Order of work
 
@@ -344,6 +376,10 @@ The caller side for ACT3 render jobs (the internal web app on a render server) i
 
 ## 12. Upgrade log
 
+* 2026-10-27 (afternoon, problems 2026_oct_27): `just build` installs nats-server; `enable`/`disable` command;
+  `just render-setup`, `render-check`, `render-test`; BMS `services_on`; a not-installed model offers 0 with the reason;
+  gate tests G3, G4, G6, G7 written and green (§8, §8.1). The key git guard ignores a stray `.git` git does not
+  recognise.
 * 2026-10-27 (later): first task types built for the Mac Studio and B5090: `oss_video` (Wan 2.2) and `oss_upscale`
   (SeedVR2), both in detached task hosts from frozen snapshots (`taskhost`, `snapshot` packages). Both services off by
   default. §4 status and §11 code map updated.

@@ -25,6 +25,7 @@ import time
 
 from broker.base import BrokerTestCase
 from lib.broker import BrokerProcess, queue_config
+from lib.client import APIError
 from lib.harness import ServerProcess, deep_merge
 
 WAN = "act3.video_gen_open_source"
@@ -176,6 +177,16 @@ class G7ShortJobsUnderRestarts(ModelGateCase):
     FAKE_SECONDS = "3"
     JOBS = 5
 
+    def wait_through_restarts(self, job_id, timeout):
+        """queue_wait that keeps polling while the storm has the controller down (connection refused, 503)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                return self.api.queue_wait(job_id, timeout=max(1, deadline - time.time()))
+            except (OSError, APIError):
+                time.sleep(0.2)
+        raise AssertionError(f"job {job_id} not final after {timeout}s")
+
     def test_g7_short_jobs_under_restart_storm(self):
         ids = [self.api.queue_submit(WAN, wan_params(f"boat {i}"), max_attempts=1)["job_id"] for i in range(self.JOBS)]
         stop, down = threading.Event(), [0.0]
@@ -194,7 +205,7 @@ class G7ShortJobsUnderRestarts(ModelGateCase):
         th = threading.Thread(target=storm, daemon=True)
         th.start()
         try:
-            done = [self.api.queue_wait(i, timeout=180) for i in ids]
+            done = [self.wait_through_restarts(i, timeout=180) for i in ids]
         finally:
             stop.set()
             th.join(60)

@@ -54,3 +54,21 @@ func TestCheckNotCommittableOutsideRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A stray ".git" folder git does not recognise (one sat in macOS $TMPDIR holding only a config file, 2026-10-27)
+// is not a repo: the guard must not refuse every key dir under it.
+func TestStrayDotGitIsNotARepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git", "config"), []byte("junk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckNotCommittable(filepath.Join(dir, "keys", PrivateFile)); err != nil {
+		t.Fatalf("stray .git treated as a repo: %v", err)
+	}
+}
