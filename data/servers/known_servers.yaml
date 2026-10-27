@@ -35,11 +35,12 @@ servers:
     local_mode: first
   - key: BMS
     display_name: "Bryan Mac Studio"
-    match: { hostname: ["Bryan-Mac-Studio"] }                    # guess
+    match: { hostname: ["BryansMacStudio.home", "Bryans-Mac-Studio", "Bryans-Mac-Studio.local"] }   # detected 2026-10-27
     profile: bms
     family: bryan
     site: bryan_office
     local_mode: share
+    # act3.video_gen_open_source stays on: Wan 2.2 renders here. The bms profile yields to OpenClaw when it is busy.
   # The three Nepal office machines (task_authoring.mdx §2, §10 Q1, D-020). Hostnames are placeholders until `init`
   # runs on each; the hardware is detected there, never guessed here. Customer data is allowed for site nepal_office
   # once the machine's disk encryption and server key are verified at enrollment (security.mdx, D-020).
