@@ -140,7 +140,7 @@ server:
       - "Shares the machine with OpenClaw agents, Ollama and transcription; reserve CPU and memory for them."
       - "10GbE port is linked at 1 Gb/s; large uploads/downloads are limited to 1 Gb/s until the switch/cable is 10G."
       - "Install Blender >= 4.2 to enable act3.blender_render; install ComfyUI to enable act3.comfy_on_prem."
-      - "data/git_ignore/this_server.yaml still has server.key CHANGE_ME; set a key before running jobs."
+      - "Fleet key BMS (data/git_ignore/this_server.yaml, profile bms); platforms act3/wtc not connected yet (phase 3)."
 
   services:
     act3: true

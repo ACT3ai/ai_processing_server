@@ -28,8 +28,8 @@ servers:
     site: bryan_office
   - key: BMS
     display_name: "Bryan Mac Studio"
-    match: { hostname: ["Bryan-Mac-Studio"] }                    # guess
+    match: { hostname: ["BryansMacStudio.home", "Bryans-Mac-Studio", "Bryans-Mac-Studio.local"] }   # detected 2026-10-27
     profile: bms
     family: bryan
     site: bryan_office
-    services_off: [act3.video_gen_open_source]                  # OpenClaw is the tenant here
+    # act3.video_gen_open_source stays on: Wan 2.2 renders here. The bms profile yields to OpenClaw when it is busy.
