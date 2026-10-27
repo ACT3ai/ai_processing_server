@@ -1,0 +1,126 @@
+---
+title: "ai_processing_server: error.err (errors that should not happen)"
+description: "Spec for the central error log of the processing server: one rolling file at ~/T/ai_processing_server/error.err, capped at 4 MB, one line per entry with a UTC timestamp and the absolute source path of the call site; which failures go in and which stay out; the errlog package every part of the code uses; crash hooks; repeat counting; and how it matches error.err in our other web apps."
+---
+
+# ai_processing_server: error.err
+
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** built (v0.1.0)
+
+## 0. The request
+
+Bryan (2026-10-27): when the code finds an error that should not happen, write it to `~/T/ai_processing_server/error.err`.
+Make one class that makes this easy, so the rolling-log code is in one place. Keep the file at 4 MB or less. Record a
+timestamp and the full path in the code where the error happened. Learn from how `the_starbucks`, `we_citizens` and
+`~/BGit/all/app` write their `error.err`, and upgrade the whole codebase to use it.
+
+## 1. Where
+
+* `~/T/ai_processing_server/error.err`, directory mode `0700`, file `0600`.
+* Override with `--error-dir <dir>` on any subcommand, or `$APS_ERROR_DIR`. The black-box tests set both, so a test
+  run never writes into `~/T/`.
+* This is **in addition to** the ACT3 platform logs (`~/_act3_logs/processing_server.info` and `.err`, spec §18),
+  which keep every WARN and ERROR, expected or not. `error.err` is the short list an engineer reads first.
+* The sibling apps use `~/T/_<app>/` with a leading underscore; this one follows Bryan's path exactly.
+
+## 2. What goes in, and what stays out
+
+| Goes in | Level |
+| --- | --- |
+| A panic anywhere: runner, job lifecycle, scheduler loop, local API handler, `main` | `FATAL` + full stack |
+| A job that failed with kind `internal` (a bug in our code) | `ERROR` |
+| A job that failed with kind `infra` (this machine or an engine is broken), except "server shutting down" | `WARN` |
+| The journal could not be saved or read; a work dir (possibly customer data) could not be deleted | `ERROR` |
+| The pid file could not be written; `this_server.yaml.new` could not be written | `ERROR` |
+| The local API answered 500 for an error with no mapped code | `ERROR` |
+| A log file could not be rotated or reopened | `ERROR` / `WARN` |
+| A child process wrote a line over 1 MB (its output is then drained and discarded so the job cannot hang) | `WARN` |
+| Running jobs did not stop within 30 s of shutdown | `ERROR` |
+| A cleanup failed (old journal entry, old results, sweeper) | `WARN` |
+
+**Stays out** (job record, job log and `~/_act3_logs/` only): `invalid_input`, `content_policy`, `transient`
+(retried), `timeout`, `cancelled`, a missing optional engine or GPU (that is an offer reason), probe errors from
+hardware detection, a config file the owner must fix (printed to the terminal), and "file not found" during cleanup.
+
+## 3. The line
+
+One line per entry, so `grep`, `tail` and `wc -l` work:
+
+```
+[2026-10-27T16:20:36.269Z] [ERROR] [scheduler] failed running sys.compute: internal: bug seen job_id=7c0e stage=RUNNING kind=internal at=/Users/bryanstarbuck/BGit/act3/ai_processing_server/code/internal/scheduler/execute.go:241 (scheduler.recordUnexpected) via=/Users/…/code/internal/scheduler/execute.go:131
+```
+
+* `[time]` UTC, milliseconds, `Z` (same as the sibling apps).
+* `[LEVEL]` `WARN`, `ERROR` or `FATAL`. `[context]` the package or subsystem (`scheduler`, `api`, `runner.compute`).
+* `failed <what we were attempting>: <cause>` (the `we_citizens` rule: the message says what we were trying to do).
+* `key=value` fields; secrets redacted (`internal/redact`, security.mdx §14).
+* `at=` the **absolute** source path and line of the call site and the function, `via=` the two callers above it.
+  The release build uses `-trimpath`; errlog maps `github.com/ACT3ai/ai_processing_server/…` back to
+  `<repo>/code/…`, so the path is always a real file on this machine.
+* `FATAL` entries add `| stack: …` with the whole goroutine stack, full paths, folded onto the same line.
+* Control characters become spaces; an entry is capped at 8000 bytes.
+
+## 4. Size and rotation
+
+* Library: `gopkg.in/natefinch/lumberjack.v2` (the standard Go rolling writer, MIT, decision D-012).
+* `error.err` never grows past **4 MB**: before a write would cross it, the file is renamed to
+  `error-<UTC time>.err` and a new one started. **3** rolled files are kept, so at most 16 MB on disk in total.
+* Writes are synchronous (`O_APPEND`, one write per line, behind a mutex), so an entry is on disk before a crash.
+  If the file cannot be written, the line goes to stderr; errlog never panics and never returns an error.
+* Every entry is also mirrored to stderr, which `just run` sends to `data/git_ignore/logs/server.stdout.log`.
+
+## 5. Repeats
+
+The same failure (same context, attempt and cause; fields and stack ignored) within 30 s is counted, not written
+again. The next line that gets through ends with `(+N identical in the previous 30s)`; counts still pending are
+written when the process stops. `FATAL` is never collapsed.
+
+## 6. How code uses it
+
+```go
+var elog = errlog.For("scheduler")                    // one per package
+
+elog.Error("saving the job journal", err, "job_id", j.ID)
+elog.Warn("running "+svc+" (infra)", err)
+return elog.Check("killing the server", proc.Kill()) // records when err != nil, returns err
+elog.Ignore("removing the pid file", os.Remove(pid))  // WARN, skips "not found"
+defer elog.Recover("the admit loop")                  // goroutines: record a panic and survive it
+defer elog.RecoverAndRepanic("running `ai_processing_server run`") // main: record, flush, crash
+elog.Go("serving the local API", fn)                  // goroutine with Recover
+```
+
+Before `errlog.Init` (unit tests, a failure before flags are parsed) entries go to stderr only. `main` calls
+`Init` for every subcommand except `version` and `help`.
+
+The central error log is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/errlog/errlog.go` — `Init`, `For`, `Logger.Error`, `Logger.Recover`
+
+Shared redaction (also used by `~/_act3_logs/` lines and job logs) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/redact/redact.go` — `Value`, `Text`, `URL`
+
+Deciding which job failures are unexpected is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/execute.go` — `recordUnexpected`
+
+Keeping the scheduler loop alive after a panic in one tick is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.safely`
+
+## 7. What we took from the other apps
+
+| App | Writer | Kept | Changed for Go |
+| --- | --- | --- | --- |
+| the_starbucks | `code/packages/backend/src/shared/logging.ts` `AppLogger`, `rolling-file-writer.ts` | `[ISO] [LEVEL] [Context] message`; one line per entry; synchronous writes; stderr fallback; crash hooks log FATAL | 4 MB instead of 5 MiB; `at=` source path (JS relies on `err.stack`) |
+| we_citizens | `code/packages/backend/src/shared/logging.ts`, `errors.ts` `loggerFor`, `burst-coalescer.ts`; spec `pm/errors.mdx` | "failed <what we were attempting>"; repeat counting `(+N identical…)`; secrets never logged | `Logger.Check`/`Ignore` in place of `tryOrLog` |
+| all/app | `code/packages/logging/src/log-channel.ts` | per-subsystem logger (`subsystemLogger(name)` → `errlog.For(ctx)`) | synchronous (it buffers); stack folded onto one line |
+
+## 8. Tests
+
+* Go: `code/internal/errlog/errlog_test.go`: line format and absolute `at=`; `-trimpath` mapping; repeat counting;
+  `Recover` writes FATAL with the stack; the file stays under its cap with rolled backups; safe before `Init`.
+* Black box: `tests/lifecycle/test_error_log.py`: a runner panic produces one FATAL line whose `at=` is an existing
+  file under `code/`; `internal` failures are recorded; `invalid_input` and successful jobs add nothing; every line
+  matches the format; the file is at most 4 MB.
+
+## 9. Upgrade log
+
+* 2026-10-27: built. `errlog` and `redact` packages; every package upgraded (scheduler, api, main, procs, logging);
+  `procs.Run` now drains a pipe after an over-long line instead of hanging the child.

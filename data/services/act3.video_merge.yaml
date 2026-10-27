@@ -1,0 +1,15 @@
+schema_version: 1
+id: act3.video_merge
+platform: act3
+title: "Scene and episode video merge (concatenate shots, re-encode H.264)"
+runner: ffmpeg
+default_enabled: true
+requires:
+  engines: { ffmpeg: ">=6.0", ffprobe: ">=6.0" }
+  gpu: optional
+  compute: [cuda, metal, none]
+resources_per_job: { cpu_cores: 4, ram_gb: 4, vram_gb: 0 }
+max_parallel_default: 3
+timeouts: { stage_inputs: 10m, run: 60m, upload: 20m }
+retry: { max_attempts: 2, retry_on: [transient, infra] }
+platform_job_types: [SCENE_VIDEO_GENERATION_FLASH, EPISODE_VIDEO_GENERATION_FLASH]

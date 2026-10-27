@@ -1,0 +1,11 @@
+schema_version: 1
+id: sys.render_test
+platform: sys
+title: "Test render: Mandelbrot zoom frames as PNG, encoded to H.264 MP4 when ffmpeg is present"
+runner: render
+default_enabled: true
+requires: { gpu: none }
+resources_per_job: { cpu_cores: 2, ram_gb: 1, vram_gb: 0 }
+max_parallel_default: 2
+timeouts: { stage_inputs: 2m, run: 30m, upload: 10m }
+retry: { max_attempts: 1, retry_on: [transient, infra] }

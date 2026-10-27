@@ -1,0 +1,1543 @@
+---
+title: "Task queue: engineering specification"
+description: "CTO engineering spec for the task system that ai_processing_server runs. Opens with the vendor selection (the 15 best open-source contenders scored and ranked best first, with pros and cons) and the selection criteria, led by task continuity across frequent code updates and a broker that runs as its own long-lived process outside our Go binary. Then: how ACT3, We The Citizens and the local machine submit jobs; detached task hosts and frozen code snapshots so running tasks survive code updates; capabilities and accepting or refusing job categories and AI models; the standard task contract; prioritization; security; reliability; configuration."
+---
+
+{/* Written 2026-10-27 by the CTO pass from Bryan's dictation of the same day. Companion to ./ai_processing_server.mdx (the server itself). This spec owns the transport and queueing layer; it replaces the transport proposal in ai_processing_server.mdx §11 and decision D-001 there. Read for context: ~/BGit/all/film/pm/subp/render_queue/RenderEngine.mdx (ACT3 job_runner on Temporal + appsrv BullMQ), ~/BGit/act3/AI_Coding/go.mod (WTC already uses nats.go, amqp091-go and go-redis). No code exists yet. Revised the same day from Bryan's second dictation: vendor ranking and criteria moved to the top; criteria v2 adds task continuity across code updates, an external long-lived broker and TypeScript task hosts; NATS moves from embedded to a separate nats-server service; new §9 (task continuity). */}
+
+# Task queue: engineering specification
+
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** specified, not built
+· **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
+· **Parent spec:** [ai_processing_server.mdx](./ai_processing_server.mdx) (hardware, `this_server.yaml`, runners, job
+lifecycle on one machine)
+· **Siblings:** `~/BGit/all/film/pm/subp/render_queue/RenderEngine.mdx` (ACT3's render engine, the biggest caller)
+
+Every section that holds facts that can go stale (vendor facts above all) carries an **As of** line. The vendor
+section is meant to be re-scored over time: change the scores, keep the history in §25.
+
+The vendor decision comes first because everything else depends on it: §1 is the ranked list, §2 the criteria it was
+scored against, §3 the pick. The engineering spec follows from §4.
+
+## 1. Vendor selection: the 15 contenders, ranked
+
+**Goal of this section:** every serious possibility, scored, sorted best first, with pros and cons (T11). **As of
+2026-10-27, criteria v2** (§2). Vendor facts move; re-check versions and licenses before acting on any row.
+
+**The short answer.** Run **NATS with JetStream as its own long-lived `nats-server` process** (an OS service on the hub
+and on every worker), never inside our Go binary. Our binary connects to it, and our tasks run as **detached task
+hosts from a frozen copy of their code**, so a `git pull` and restart of `ai_processing_server` every 10 minutes never
+stops a 30-minute render (§9). Temporal is a close second on points; RabbitMQ is third and the practical fallback.
+
+### 1.1 Ranking
+
+Scores are C1 to C14 from §2.2, in order. Criteria v2 kept the top three but reshuffled the rest. The v1 pick was
+NATS **embedded** in our binary, which is exactly what §2 now rules against; NATS stays first only as a separate
+process.
+
+| Rank | Contender | License | Scores C1–C14 | Total | v1 rank (v1 total) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **NATS with JetStream** (separate `nats-server`) | Apache-2.0 | 5 5 5 5 2 4 4 4 5 4 5 5 4 4 | **88.8** | 1 (85.6, embedded) |
+| 2 | **Temporal** | MIT | 4 5 4 5 3 5 5 5 4 5 2 3 5 4 | **86.4** | 2 (79.8) |
+| 3 | **RabbitMQ** | MPL-2.0 | 3 5 4 4 5 3 5 5 3 4 3 3 5 5 | **80.8** | 3 (78.4) |
+| 4 | **Apache ActiveMQ Artemis** | Apache-2.0 | 3 5 4 3 5 3 5 4 3 5 3 4 4 1 | **76.8** | 5 (73.4) |
+| 5 | **Apache Pulsar** | Apache-2.0 | 3 5 5 3 2 4 5 4 4 5 1 2 4 1 | **74.8** | 7 (69.4) |
+| 6 | **Hatchet** | MIT | 3 4 4 5 4 4 4 2 4 5 3 3 5 1 | **74.0** | 4 (73.6) |
+| 7 | **Faktory** | AGPL-3.0 | 4 5 3 3 5 4 4 3 3 2 4 2 4 1 | **73.6** | 8 (66.2) |
+| 8 | **BullMQ** (Node + Redis/Valkey) | MIT | 4 3 2 5 5 4 4 4 2 4 4 2 4 4 | **72.8** | 12 (62.8) |
+| 9 | **Valkey Streams** | BSD-3-Clause | 4 4 3 4 1 4 3 5 2 5 4 2 3 3 | **69.6** | 13 (62.4) |
+| 10 | **River** (Go + Postgres) | MPL-2.0 | 4 3 3 1 4 4 5 3 2 4 3 4 4 3 | **66.8** | 6 (71.4) |
+| 11 | **Apache Kafka** | Apache-2.0 | 2 5 4 3 1 2 5 5 3 5 1 4 4 1 | **65.6** | 11 (63.0) |
+| 12 | **Beanstalkd** | MIT | 3 5 1 2 5 5 3 3 2 5 5 1 2 1 | **64.8** | 14 (58.6) |
+| 13 | **NSQ** | MIT | 2 4 3 2 1 3 3 3 3 5 5 4 3 1 | **57.2** | 10 (63.2) |
+| 14 | **Asynq** (Go + Redis/Valkey) | MIT | 2 3 2 1 5 3 3 3 2 4 4 2 4 3 | **54.8** | 9 (63.4) |
+| 15 | **Celery** | BSD-3-Clause | 1 3 2 1 4 3 3 5 2 5 3 2 3 1 | **52.0** | 15 (56.4) |
+
+How to read C1 (task continuity), the heaviest criterion. Every broker hands a worker a **claim** on a job. What
+matters is whether that claim survives our process restarting:
+
+* **5:** the claim is a durable handle (a reply subject, a task token) that any process can renew and complete after a
+  restart. Our new process picks the job back up; the broker never notices.
+* **4:** a durable handle exists (a row id, a lock token, a consumer name), but renewing it leans on library internals
+  or a timeout we must tune.
+* **3:** the claim is tied to a network connection. It still works if a separate, long-lived task host process holds
+  that connection for the life of the job, at one connection per running job.
+* **2:** connection-bound and the broker's timeouts or ordering fight 30-minute jobs.
+* **1:** the process that holds the claim is the code we update, so an update kills or re-runs the job.
+
+### 1.2 Each contender, best first
+
+#### 1. NATS with JetStream (separate `nats-server` process): 88.8
+
+Go messaging server (CNCF project) with JetStream for persistence, work-queue streams, KV and object store. Run as its
+own service: one static `nats-server` binary per machine, upgraded on its own schedule.
+
+* **Pros**
+  * **Claims survive our restarts (C1: 5).** A JetStream ack is a message to the delivery's reply subject. We store that
+    subject on disk with the running job; after `ai_processing_server` restarts, the new process keeps sending
+    "in progress" to it and finally acks it. The broker sees one long job, never a lost consumer (§9.4).
+  * **External and mature (C2: 5).** One small static binary with no runtime, running as a launchd, systemd or Windows
+    service on the hub and on every worker. Trivial to install on all three operating systems, which RabbitMQ (Erlang)
+    and the JVM brokers are not.
+  * **TypeScript first-class (C4: 5).** Official `nats.js` client, so a task host written in TypeScript can renew its
+    own claim and publish its own progress if we choose (§9.3).
+  * **Accounts, users, subject permissions, NKey/JWT auth and revocation** give clean isolation between ACT3, WTC and
+    local callers without separate brokers.
+  * **Leaf nodes** connect home and office workers to the cloud hub with outbound TLS only, and keep working locally
+    when the link drops: exactly our NAT problem.
+  * Work-queue streams, ack wait with `InProgress` extension, max deliveries, backoff, message-id **dedupe**, and **KV**
+    for capabilities, job state (compare-and-set, our fencing token) and cancel flags, all in one product.
+  * Very small footprint; mature core (since 2011), JetStream in production since 2021. Already in WTC's Go backend
+    (`nats.go`, JetStream).
+* **Cons**
+  * **No per-message priority.** We build priority from five band subjects and our pull order (§14.4). It works and keeps
+    priority logic ours (T12), but it is code we own.
+  * Work-queue streams need non-overlapping consumer filters, which shapes our subject design.
+  * One more service to install once per machine (`just broker-install`, §18), where v1 had none. That is the price of
+    the continuity Bryan asked for, and it is a single binary.
+  * Governance scare in 2025 (Synadia proposed leaving the CNCF and relicensing); resolved with NATS staying in the
+    CNCF under Apache-2.0. Watched (§3.3 is our exit).
+  * Fewer people know JetStream deeply than know RabbitMQ.
+
+#### 2. Temporal: 86.4
+
+Durable execution platform (workflows and activities), MIT licensed; ACT3's job_runner runs on it today.
+
+* **Pros**
+  * Built around continuity: workflow state lives in the Temporal server, and **async activity completion** lets any
+    process heartbeat and complete an activity by its task token, so a detached task host survives worker restarts.
+  * Best long-job semantics of all: heartbeats, heartbeat timeouts, start-to-close timeouts, cancellation, full history.
+  * **Official TypeScript SDK** (job_runner is TypeScript today) and a first-class Go SDK.
+  * Durable, battle-tested at very large companies; excellent Web UI. Workers connect outbound over gRPC; mTLS and
+    namespaces for isolation.
+* **Cons**
+  * **Frequent code updates are its known hazard (C1: 4).** Workflow code is replayed; changing it while workflows are
+    in flight causes non-determinism failures unless every change is patched or worker-versioned. With a deploy every
+    10 minutes, that discipline is a permanent tax. Activities are safe; workflows are not.
+  * Heavy to operate: several server services plus Postgres, MySQL or Cassandra. The dev server is not for production.
+  * Its scheduling model (first poller wins) is what Bryan wants to replace with our own coordination (T12).
+  * Today's pain (renders torn down by code updates) happens on Temporal now, because job_runner runs activities
+    in-process; Temporal alone does not fix it, the detached task host does (§9).
+
+#### 3. RabbitMQ: 80.8
+
+The classic message broker (AMQP 0-9-1, AMQP 1.0, MQTT, STOMP), MPL-2.0, maintained by Broadcom's team. The model
+Bryan named: a mature process that runs on its own and outlives our code.
+
+* **Pros**
+  * **External and mature (C2: 5)**, extremely widely known; dead-letter exchanges, TTLs, quorum queues, streams.
+  * **Native message priority** (`x-max-priority`, up to 255 levels on classic queues).
+  * Management UI and Prometheus metrics out of the box. Already in WTC (content moderation priority queues);
+    official Go client `amqp091-go`; mature Node clients (`amqplib`) for TypeScript task hosts.
+  * vhosts, users and permissions give per-caller isolation; shovel and federation link sites.
+* **Cons**
+  * **Unacked deliveries belong to a channel (C1: 3).** When the connection that holds a job closes, which is what a
+    restart of our process does, RabbitMQ puts the job back and another worker starts it again. To keep running jobs
+    alive across our restarts, each running job's **task host must hold its own AMQP connection** until it finishes.
+    That works, at one connection per running job.
+  * Long unacked deliveries hit `consumer_timeout` (30 minutes by default) with no "extend" call; it must be raised per
+    queue for long renders.
+  * **Erlang runtime** to install and upgrade on the hub and any standalone machine, including Windows.
+  * Priority classic queues are not replicated; quorum queues offer only two priority levels.
+  * No KV: capabilities, job state and fencing need a Postgres or Valkey beside it.
+
+#### 4. Apache ActiveMQ Artemis: 76.8
+
+The Apache Software Foundation's high-performance broker (JMS, AMQP 1.0, MQTT, STOMP, OpenWire).
+
+* **Pros**
+  * External, mature, **native message priority 0 to 9**, durable journal, dead-letter and expiry addresses.
+  * Apache-2.0 under the ASF: the strongest governance in the list. Fine-grained security per address.
+* **Cons**
+  * Session-bound acknowledgments (C1: 3): same task-host-holds-the-connection pattern as RabbitMQ.
+  * **JVM** to install and tune. Go and TypeScript are second-class (AMQP 1.0 clients `go-amqp` and `rhea`).
+  * No KV or capability store; not in our stack.
+
+#### 5. Apache Pulsar: 74.8
+
+Multi-tenant pub/sub and queuing (ASF), with shared subscriptions that act like work queues.
+
+* **Pros**
+  * **Strongest multi-tenancy**: tenants, namespaces, auth and quotas are first-class. External and durable.
+  * Per-message ack, negative ack, ack timeout, delayed delivery, dead-letter topics, geo-replication.
+* **Cons**
+  * Heaviest operations in the list: brokers plus BookKeeper plus a metadata store. Far too much for a 2-vCPU hub.
+  * Consumer-bound acks (C1: 3); no message priority; JVM; Windows is not a supported server platform.
+
+#### 6. Hatchet: 74.0
+
+A task orchestration platform for AI and background work (MIT), Go engine on Postgres, with Go, Python and TypeScript
+SDKs.
+
+* **Pros**
+  * Designed for our kind of work: priorities, per-tenant concurrency (fairness), retries, timeouts, durable tasks,
+    cancellation, rate limits. **Official TypeScript SDK.**
+  * Workers connect outbound over gRPC; multi-tenant with API tokens; very good dashboard.
+* **Cons**
+  * **Young** (public since 2024): weakest maturity in the top ten.
+  * A worker that disconnects has its tasks reassigned after a timeout; re-adopting an in-flight task from a restarted
+    process is not a documented path (C1: 3, verify before adopting).
+  * Needs Postgres; its scheduling opinions overlap with what we want to own.
+
+#### 7. Faktory: 73.6
+
+A language-agnostic background job server by the author of Sidekiq; server written in Go.
+
+* **Pros**
+  * A real job server: **priorities**, retries with backoff, dead set, and reservations with `reserve_for` up to a day,
+    acknowledged by job id rather than by connection, so a restarted process can finish a job it held (C1: 4, verify).
+  * Single small external server process; a web UI.
+* **Cons**
+  * **AGPL-3.0**, with batches and throttling only in the paid edition: the weakest license here for a commercial
+    product.
+  * Linux and macOS only; single-node storage; TypeScript client is community-maintained.
+
+#### 8. BullMQ: 72.8
+
+A Node.js job queue on Redis or Valkey (MIT); ACT3 appsrv uses it today.
+
+* **Pros**
+  * **TypeScript native (C4: 5).** Tasks written in TypeScript are its home ground.
+  * A job's lock is a token stored in Redis; a restarted process can extend the lock and complete the job with that
+    token (C1: 4), and a stalled-job checker requeues only if the lock really lapses.
+  * Priorities, delayed jobs, rate limits, retries, parent/child flows. Known to the ACT3 team.
+* **Cons**
+  * The queue logic lives in the client library; the external part is Redis/Valkey, a database, not a broker (C2: 3).
+  * Our server is Go: we would write a compatible client against BullMQ's Lua scripts or run every claim through Node.
+  * Redis/Valkey: one keyspace, ACLs only, workers need database access across the internet; no Windows server build.
+
+#### 9. Valkey Streams: 69.6
+
+Redis-compatible streams with consumer groups (BSD-3, Linux Foundation fork of Redis).
+
+* **Pros**
+  * Pending entries belong to a consumer **name**, not a connection: a restarted process with the same name still owns
+    its jobs, can `XCLAIM` to refresh them and `XACK` them (C1: 4).
+  * Clean license, mature, small and fast; good TypeScript clients.
+* **Cons**
+  * A primitive, not a job system: **no priority**, no dead-letter, no dedupe; we would write all of it.
+  * No native Windows build; per-caller isolation limited to ACLs on key patterns.
+
+#### 10. River: 66.8
+
+A Go job queue library on Postgres (MPL-2.0).
+
+* **Pros**
+  * A job is a Postgres row; a restarted process can complete it by id (C1: 4). Priorities 1 to 4, unique jobs,
+    retries, timeouts, cancellation, a web UI. **Transactional enqueue** from a platform's own transaction.
+* **Cons**
+  * **Go only** (C4: 1): no TypeScript worker.
+  * Every worker needs a connection to the shared Postgres: poor for home machines behind NAT, large security surface.
+  * The queue logic runs in our process; Postgres is the external part. Younger (since 2023).
+
+#### 11. Apache Kafka: 65.6
+
+The dominant distributed log (ASF).
+
+* **Pros**
+  * The most robust and heavily used streaming system there is; external, mature; ACLs, TLS, SASL; huge ecosystem.
+* **Cons**
+  * **A log, not a job queue**: no per-message ack, no priority, a slow job blocks its partition (C1: 2). Share groups
+    (KIP-932, queue semantics) are new and unproven for long GPU jobs.
+  * JVM and heavy operations for our size.
+
+#### 12. Beanstalkd: 64.8
+
+A small, fast work queue daemon in C (MIT).
+
+* **Pros**
+  * Semantics close to ours: **native priority**, time-to-run per job with `touch`, `bury` for dead jobs, delays.
+  * Tiny, stable, external.
+* **Cons**
+  * **No authentication and no TLS**: unusable across the internet without wrapping it.
+  * Reservations are bound to the connection (C1: 3); no replication; no Windows build; slow development.
+
+#### 13. NSQ: 57.2
+
+A simple distributed messaging platform in Go (MIT), from Bitly.
+
+* **Pros**
+  * Pure Go, tiny, easy to run; at-least-once delivery with `TOUCH` to extend timeouts. Runs on every OS.
+* **Cons**
+  * In-flight messages are bound to the connection and capped by `max-msg-timeout` (C1: 2). **No priorities**, no
+    replication, limited auth. Development has largely slowed.
+
+#### 14. Asynq: 54.8
+
+A Go task queue library on Redis or Valkey (MIT).
+
+* **Pros**
+  * Pure Go; strict or weighted priority queues, scheduled tasks, retries, deadlines, unique tasks, Asynqmon UI.
+* **Cons**
+  * A restarted server re-runs the tasks its old self held once their lease lapses (C1: 2); **Go only** (C4: 1).
+  * Redis/Valkey security model; no Windows server build; maintenance pace has slowed.
+
+#### 15. Celery: 52.0
+
+The standard Python distributed task queue (BSD-3), on RabbitMQ or Redis.
+
+* **Pros**
+  * Hugely used in Python and ML shops; priorities (broker dependent), retries, routing, Flower monitor.
+* **Cons**
+  * **The Celery worker is the process that holds the claim and runs the task**, so updating its code kills or re-runs
+    the job (C1: 1). Python-only workers; our server is Go. Adds a layer on top of a broker rather than replacing one.
+
+### 1.3 Considered and excluded
+
+| Product | Why it is not in the 15 |
+| --- | --- |
+| Amazon SQS, Google Pub/Sub, Azure Service Bus, Cloud Tasks | not open source (G1); also cloud lock-in |
+| Redpanda | Business Source License (G1) |
+| EMQX (recent versions) | moved to the Business Source License (G1); MQTT is not a job queue anyway |
+| Inngest | server under SSPL / source-available terms (G1) |
+| Redis 7.4 to 7.x | source-available (RSAL/SSPL); Redis 8 adds AGPL; Valkey is listed instead |
+| Ray | Apache-2.0 and strong for Python ML clusters, but it is a compute framework, Python-centric, and wants to own scheduling and the GPUs (T12) |
+| Kubernetes Jobs, Kueue, Argo Workflows, Volcano | require Kubernetes on every machine; our fleet is home Macs and Windows towers |
+| Apache RocketMQ | heavy JVM, Go client second-class, small presence outside China; no gain over Artemis or Pulsar |
+| Machinery, Gocraft/work, Dramatiq, RQ, Gearman, ZeroMQ | unmaintained, language-bound, or a library without a durable broker (G3/G4) |
+| Conductor (Netflix/Orkes) | workflow engine like Temporal, heavier, JVM, less adoption in Go |
+| Windmill, Trigger.dev | AGPL or platform-oriented; built for scripts and app workflows, not GPU job queues |
+
+## 2. Vendor selection criteria
+
+**Goal of this section:** the rules a task system must meet, written so we can improve them over time (T10).
+**As of 2026-10-27, criteria v2.** v2 adds Bryan's continuity requirements (T13 to T15, §4) and drops v1's "one-binary
+fit": we now want the broker **outside** our binary.
+
+### 2.1 Gates (pass or out)
+
+A product is only listed in §1 if it passes all four. These are Bryan's words turned into tests.
+
+| Gate | Test |
+| --- | --- |
+| **G1. Open source** | an OSI-approved license on the server and the client we would use. Source-available licenses (BSL, SSPL, Elastic, RSAL, "fair source") fail. |
+| **G2. Clear copyright** | a known copyright holder or foundation, a license that has not been changed out from under users without a fork path, and no contributor license trap that would block us from running it commercially. |
+| **G3. Fairly heavily used** | years of production use at known companies, an active release history, and a community large enough that answers to hard problems exist. |
+| **G4. Very robust** | persistent storage, at-least-once delivery, survives a process crash without losing acknowledged work, and documented behavior under failure. |
+
+### 2.2 Weighted criteria (how the passers are ranked)
+
+Each contender scores 0 to 5 per criterion. Weighted total = sum of (weight × score) ÷ 5, out of 100.
+
+| # | Criterion | Weight | What a 5 looks like |
+| --- | --- | --- | --- |
+| C1 | **Task continuity across our code updates** | 16 | a running job's claim is a durable handle that a restarted `ai_processing_server` can pick back up and renew; restarting our process neither kills, re-queues nor re-runs work in flight (scale in §1.1) |
+| C2 | **External, long-lived broker process** | 12 | a mature server that runs as its own OS service, outside our Go binary, with its own release cycle; it keeps every queued job and claim while our code restarts, and our process just reconnects |
+| C3 | **Security and caller isolation** | 12 | TLS, per-user credentials, subject or queue level permissions, multi-tenant accounts, credential revocation |
+| C4 | **TypeScript task hosts** | 8 | an official, mature TypeScript/Node client, so a task can be written in TypeScript and, if we want, hold its own claim |
+| C5 | **Priorities** | 8 | native per-message priority with several levels on a durable queue |
+| C6 | **Long-job semantics** | 8 | ack or visibility timeouts a worker can extend while a 30-minute GPU job runs; redelivery on worker death; cancel signals |
+| C7 | **Durability and delivery** | 8 | replicated persistent storage, dead-letter handling, max-attempts, dedupe |
+| C8 | **Maturity and adoption** | 8 | many years in production at scale; large community (also G3/G4, scored by degree) |
+| C9 | **Network topology** | 6 | workers behind NAT connect outbound only; multi-site linking (leaf nodes, federation) |
+| C10 | **License and governance** | 4 | permissive license (Apache, MIT, BSD), foundation governance, low risk of a license change (also G1/G2) |
+| C11 | **Operational burden** | 4 | one small process, no external database or coordinator, no language runtime, simple upgrades |
+| C12 | **Cross-platform** | 2 | the broker runs on Linux (hub) and macOS (development); clients on Windows, macOS and Linux |
+| C13 | **Observability** | 2 | metrics endpoint, admin UI or CLI, inspectable queues |
+| C14 | **Already in our stack** | 2 | we already run it in ACT3 or WTC, so people and code know it |
+
+Why these weights:
+
+* **C1 is the heaviest** because it is the problem Bryan named: a render takes about 30 minutes and our code may update
+  every 10, so any design where an update tears down running work fails in practice, whatever else it does well.
+* **C2 is next** because Bryan prefers a mature process outside Go ("RabbitMQ or whatever") that keeps running while
+  our binary is replaced, so the queue and its claims are never churned with our code.
+* **C3 security** stays high because three callers share machines that also hold our own data.
+* **C4 TypeScript** is a real plus Bryan named, but secondary: what matters is that a task survives code changes,
+  whatever language it is in. §9 makes any language work; C4 rewards brokers that let a TypeScript task host speak to
+  them directly.
+* Priorities, long jobs, durability and maturity each matter about equally. Cross-platform dropped from 6 to 2 because
+  the broker no longer has to run on every Windows machine inside our binary; only clients do.
+
+Note what C1 does **not** cover: whether a task keeps running when its script files change on disk. No broker can give
+that; it is our job, done by freezing a snapshot of the task's code when it starts (§9.2). The criteria score only
+what the broker contributes.
+
+### 2.3 How to change the criteria
+
+Add or reweight a criterion in this section, record why in §25.2, re-score every contender in §1.1, and re-sort. A
+gate failure removes a product even if it scored well before (this is what would happen if a broker relicensed).
+
+## 3. Recommendation
+
+**Goal of this section:** the pick, the runner-up, and how we would change our mind.
+
+### 3.1 Pick: NATS with JetStream, as its own service, outside `ai_processing_server`
+
+`nats-server` runs as a separate, long-lived OS service: a cluster on the cloud hub, and one leaf node process on every
+worker. Our binary is only a client of it. Together with detached task hosts and frozen code snapshots (§9), this
+gives what Bryan asked for:
+
+* `git pull`, `just build`, restart: queued jobs wait in the broker, running jobs keep running in their task hosts,
+  and the new process re-adopts them through the stored ack subjects. Nothing is torn down, nothing re-runs.
+* It still solves **NAT** with leaf nodes, gives **per-caller security** with accounts, and supplies **KV with
+  compare-and-set** for capabilities, job state and fencing, while being Apache-2.0, CNCF-governed, heavily used and
+  already in our WTC code. Its one gap, message priority, is the part CLAUDE.md wants in our own code anyway (§14).
+
+### 3.2 Runner-up: Temporal on points, RabbitMQ in practice
+
+* **Temporal (86.4)** is second on points and best on long-job semantics, and ACT3 runs it today. It loses on the
+  thing Bryan stressed: with deploys every 10 minutes, in-flight workflows break unless every change is versioned, it is
+  heavy to operate, and it wants to own scheduling. It stays where it is in job_runner during migration (§20).
+* **RabbitMQ (80.8)** is the swap if broker-native priority ever matters more than durable claims and KV. It needs the
+  per-job AMQP connection pattern (§1.2 #3) for continuity, plus a Postgres or Valkey for state.
+
+### 3.3 Swap cost and exit plan
+
+* Everything above the broker uses `queue.Queue` (§13.7). A swap means a new adapter package (`queue/rabbitq/`), a new
+  `streams.yaml` equivalent, and a credentials migration. Envelope, events, error kinds, priority logic, signatures,
+  task hosts, snapshots and runners do not change.
+* KV-backed features (capabilities, job state, control) would move to the adapter's equivalents (for RabbitMQ: a
+  small Postgres or Valkey alongside).
+* Triggers to re-run §2 and §1: a license change on the pick; a governance change; a production incident class we
+  cannot fix; a new criterion (for example, a partner who requires AMQP).
+
+## 4. The request, verbatim in intent
+
+**Goal of this section:** pin what Bryan asked for, so every later section answers a numbered item.
+
+Bryan's dictation (2026-10-27), cleaned of transcription noise:
+
+> Review different task systems we can use: RabbitMQ and other ones. Our server will just run one of those, and then
+> we'll be dealing with security and prioritization.
+>
+> When different places call into us, we'll have ACT3 calling into us, and we'll have We The Citizens calling into us.
+> In our config files, we'll know how to prioritize our local computer and give out our server specifications for
+> capabilities and so on. We will accept certain jobs of certain categories and not other ones based on the AI we can
+> choose to handle or not. We will generally feed them over to RabbitMQ or whatever.
+>
+> The vendor selection part of the spec is a list: all the possibilities. To be in vendor selection they must be open
+> source, with a clear copyright, fairly heavily used, and very robust. We're going to have different kinds of tasks
+> that run, and we want to somewhat standardize how they interact with those. Build the best 15 contenders and sort
+> them by the best. Another section of the spec is the criteria: capture the criteria so far; we'll improve it over
+> time. Sort the 15 by their pros and cons, list the pros and cons, best match at the top.
+
+Bryan's second dictation (2026-10-27), cleaned of transcription noise:
+
+> Move the vendor selection criteria to the top of the file, and the prioritized list of vendors above even that.
+>
+> We actually do prefer a process that runs outside of Go. Think of RabbitMQ or whatever. When we have very rapid,
+> frequent code updates to our repo, and our process comes down and the new code gets there and gets up and running,
+> it can reconnect to the mature external process (RabbitMQ or whatever) that has been running all along, and continue
+> forward with its tasks without tearing them down.
+>
+> That has been a big problem in the past. Rendering often takes half an hour per task, and we may update the code
+> every 10 minutes, so it keeps tearing down the process. We need continuity, so the actual processing does not get
+> churned and does not get lost.
+>
+> The second criterion, also very valuable: the scripts the task runs may change on disk. If the task loaded them into
+> memory when it started, it can continue even though the code was pulled and refreshed. It would be a big positive
+> if our tasks could be written in TypeScript, but the critical part is that a code pull and change does not destroy
+> the task underway.
+>
+> Do the evaluation and update the file.
+
+Transcription note: the dictation said "Wispr Flow calling into us". This spec reads it as **We The Citizens (WTC)**,
+the second platform in the parent spec. If a separate caller was meant, it is one more entry under `callers:` (§17)
+and nothing else changes (§24 Q1).
+
+Requirements derived from it (each answered later and tested in §21):
+
+* **T1. The server runs one task system.** We pick one open-source broker and run it ourselves, as its own process
+  next to our binary (T13). §8, §3.
+* **T2. Several callers submit work:** ACT3, WTC, and the local machine (the owner's own jobs). More can be added
+  by config. §10.
+* **T3. Config decides local priority:** how this machine ranks its owner's jobs against platform jobs. §14.5, §17.
+* **T4. Servers publish their capabilities** (hardware, services, models, free capacity) so callers and the
+  scheduler know who can do what. §12.
+* **T5. Servers accept some job categories and refuse others,** including by which AI model or vendor a job needs.
+  §11.
+* **T6. Jobs are fed into the task system;** we do not hand-roll persistence or delivery. §8, §13.
+* **T7. Security:** who may submit what, isolation between callers, protection of machines and customer data. §15.
+* **T8. Prioritization:** across callers, across priorities, without starvation. §14.
+* **T9. One standard task contract** that every kind of task follows (envelope, lifecycle, progress, result,
+  errors). §13.
+* **T10. Vendor selection criteria,** written down and improvable. §2.
+* **T11. Vendor selection list:** 15 open-source, clearly licensed, heavily used, robust contenders, with pros and
+  cons, sorted best first. §1.
+* **T12. Our coordination stays ours** (CLAUDE.md): the broker is transport and durability; matching, priority,
+  slots and retries policy are our Go code. §8.3.
+* **T13. The broker runs outside our Go binary,** as a mature, long-lived process. When our process restarts on new
+  code, it reconnects to the broker, which kept every queued job and claim. §2.2 C2, §8.2.
+* **T14. Running tasks survive our code updates.** Restarting `ai_processing_server` (every 10 minutes, if need be)
+  never stops, re-queues or re-runs a task in flight, even a 30-minute render. §2.2 C1, §9.3, §9.4.
+* **T15. A task is immune to its code changing on disk.** It runs from a copy of its code frozen when it started.
+  Tasks may be written in TypeScript (a plus, not a must). §9.2, §9.3, §2.2 C4.
+
+## 5. Goals
+
+**Goal of this section:** what success means.
+
+1. **One durable intake for all AI work** on our machines, whichever product sent it.
+2. **Callers never wait on a machine to be reachable.** A job submitted while every GPU is busy or a home machine is
+   asleep is stored durably and runs when capacity appears.
+3. **Home and office machines behind NAT take work** with outbound connections only (the parent spec §2 rule).
+4. **The machine owner's fence is absolute:** a machine never runs a category, model or caller its owner did not
+   allow, whatever a caller asks.
+5. **A new job type is a catalog entry plus a runner,** never a change to the queueing layer.
+6. **Replaceable broker.** All broker calls sit behind one Go interface (§13.7), so a future swap costs one adapter
+   package, not a rewrite.
+7. **A code update never costs a running task.** We can pull and restart as often as we like; a render that started
+   on the old code finishes on the old code, once, and its result is delivered (§9).
+
+### 5.1 Non-goals
+
+* No credit pricing (parent spec §1.4). The platform that sent a job charges for it.
+* No general-purpose event bus for the products. This queue carries AI processing jobs and their events only.
+* No workflow engine. Multi-step pipelines (shot → upscale → merge) are orchestrated by the calling platform, which
+  submits each step as a job when the previous one finishes. A job may be multi-stage inside one runner.
+
+## 6. Where this fits
+
+**Goal of this section:** this layer in the whole system, and what it changes in the parent spec.
+
+**As of 2026-10-27:**
+
+* ACT3 renders run in **job_runner** on **Temporal** (TypeScript), claiming rows from appsrv's Postgres `job` table;
+  appsrv also runs **BullMQ on Redis** for TTS, project copy and small jobs (RenderEngine.mdx §2).
+* The WTC Go backend (`~/BGit/act3/AI_Coding/`) already uses **RabbitMQ** (`amqp091-go`, with `x-max-priority`
+  queues in content moderation) and **NATS JetStream** (`nats.go`, post and relay workers), and Redis.
+* The parent spec §11 proposed an HTTPS lease API where each server polls each platform's job table.
+
+**What this spec changes.** Bryan's direction is that our server runs a real task system and callers feed it. So:
+
+* The platforms **submit** jobs into our queue instead of us polling their tables. The platforms keep their own job
+  tables as the source of truth for users, billing and the Render Queue page; our queue is the transport, the
+  durable waiting room and the scheduler.
+* The parent spec's §9 (job lifecycle on a machine), §10 (owner fence, priorities, shares) and §12 (error kinds) stay
+  in force. This spec maps them onto the broker.
+* Parent spec D-001 (HTTPS lease as the contract) is **superseded** by D-Q1 here (§23). The HTTPS surface survives as
+  the **gateway** (§10.3) for callers that would rather not speak the broker's protocol.
+
+```
+   ACT3 appsrv (NestJS)        WTC backend (Go)         Owner's scripts / CLI on a machine
+        │ nats.js or HTTPS          │ nats.go or HTTPS           │ local API (parent §13)
+        ▼                           ▼                            ▼
+ ┌─────────────────── HUB (cloud VM) ─────────────────┐   ┌──────────── WORKER (every GPU/CPU box) ───────────┐
+ │ nats-server + JetStream   (OS service, rarely     │   │ nats-server leaf node  (OS service, outbound TLS  │
+ │   upgraded): streams, KV, accounts                 │◄──┤   to the hub; local domain for owner jobs §14.5)  │
+ │        ▲ client                                    │   │        ▲ client                                   │
+ │ ai_processing_server --role hub  (restarts often): │   │ ai_processing_server --role worker (restarts      │
+ │   gateway HTTPS + webhooks (§10.3)                 │   │   often): scheduler, slots, re-adopt (§9.4)       │
+ │   admission (§11), promoter (§14.4)                │   │        │ launches, detached                       │
+ └────────────────────────────────────────────────────┘   │ task hosts, one per running job, from a frozen    │
+                                                          │   code snapshot (§9.2, §9.3): runners, ComfyUI,   │
+                                                          │   Blender, ffmpeg (parent spec §8)                │
+                                                          └───────────────────────────────────────────────────┘
+   outputs go straight from the task host to S3 / IPFS through presigned URLs, never through the broker
+```
+
+## 7. Vocabulary
+
+Terms from the parent spec (server, platform, service, job, slot, owner) keep their meaning. New here:
+
+* **Caller:** anything that submits jobs: `act3`, `wtc`, `local` (this machine's owner), and later others. A
+  platform is a caller; `local` is a caller that is not a platform.
+* **Category:** a coarse kind of AI work that owners and callers reason about: `video_gen`, `image_gen`, `upscale`,
+  `transcription`, and so on (§11.1). A category contains many services.
+* **Model:** the AI that does the work, local (`wan2.2-a14b-fp8`) or a vendor API (`vendor:veo3`). Owners allow or
+  refuse models, not only categories.
+* **Band:** one of five priority lanes, `p0` (most urgent) to `p4` (bulk) (§14.2).
+* **Hub:** the one reachable place where callers submit and where durable queues live.
+* **Worker:** a machine running `ai_processing_server --role worker`, pulling jobs from the hub.
+* **Standalone:** one machine that is both hub and worker (development, a lone office box).
+* **Fencing token:** the `job_state` revision a worker holds while it owns an attempt; required to write a result
+  (§16.3).
+* **Broker:** the `nats-server` process (hub cluster, or a worker's leaf node). A separate OS service, never inside
+  our binary.
+* **Controller:** the `ai_processing_server` process itself. It restarts on every code update and keeps no state
+  that lives only in memory.
+* **Task host:** a detached process that owns one running job's process tree and outlives controller restarts (§9.3).
+* **Snapshot:** the read-only copy of a commit's task code that a job runs from, so `git pull` cannot change it (§9.2).
+* **Re-adopt:** what a freshly started controller does to the jobs its previous self left running (§9.4).
+* **Claim:** a worker's hold on a delivered job; for NATS, the delivery's ack subject plus the fencing token.
+
+## 8. Architecture
+
+**Goal of this section:** the shape of the system and why (T1, T6, T12).
+
+### 8.1 Roles
+
+The same binary runs in one of three roles, set in `this_server.yaml` `queue.role` (§17.1):
+
+| Role | Runs | Where |
+| --- | --- | --- |
+| `hub` | gateway, admission, promoter; a client of the hub `nats-server` (durable streams, KV buckets) that runs beside it as its own service; **no runners** | one small public cloud VM (2 vCPU, 4 GB RAM, 100 GB SSD is ample for phase 1) |
+| `worker` | local scheduler, slots, task hosts, re-adoption; a client of the machine's leaf `nats-server` (outbound to the hub) | every GPU/CPU machine: B5090, BPC, BMT, BMS, the laptop, Nepal, cloud GPU boxes |
+| `standalone` | hub and worker logic in one process, against one local `nats-server` with no outbound link | development; a lone machine on a LAN |
+
+A fourth mode, `--role taskhost`, is never set in config: the controller uses it to start a task host from a snapshot
+copy of the binary (§9.3).
+
+Why a hub in the cloud: ACT3 appsrv and the WTC backend run in the cloud and must reach somewhere that is always up;
+the home machines cannot accept inbound connections. The hub holds no GPU work and no customer files, only small job
+envelopes, so it is cheap and simple to secure.
+
+### 8.2 Why the broker runs outside our binary
+
+v1 of this spec embedded the NATS server inside `ai_processing_server`. Bryan's second dictation rules that out (T13):
+the broker must be a mature process that keeps running while our code is replaced. So:
+
+* `nats-server` is installed once per machine as its own OS service (launchd on macOS, systemd on Linux, a Windows
+  service), at a pinned version, by `just broker-install` (§18). It is one static binary with no runtime, so this is
+  the same small step on all three operating systems.
+* Its config files are **generated** from `this_server.yaml` and `data/queue/` by `just broker-config` and written
+  outside the repo (`~/.act3_processing/nats/`); nobody hand-edits them. Regenerating and reloading config
+  (`nats-server --signal reload`) does not drop connections or jobs.
+* Our binary only connects as a client (`nats.go`). On startup it checks the broker is reachable and at a supported
+  version; if not, it logs one clear error to `processing_server.err` and `/healthz` says `broker_missing`, naming
+  the command that fixes it. `just build` then `just run` still work on a clean checkout; they report the missing
+  broker rather than fail silently (CLAUDE.md).
+* Upgrading the broker is a deliberate, rare step (§9.6), never a side effect of pulling our code.
+
+The swap to another external broker (RabbitMQ, §3.2) changes the service that `just broker-install` sets up and the
+adapter package; nothing about the process model changes. §3.3 lists the swap cost.
+
+### 8.3 What the broker does and what we do
+
+| Concern | Broker (transport, durability) | Our Go code (coordination) |
+| --- | --- | --- |
+| Store a job until it runs; survive restarts | yes: file-backed stream | — |
+| Keep a running job's claim while our process restarts | yes: ack subjects are not tied to a connection; long ack wait | **re-adopt** from the run record (§9.4) |
+| Keep a running job alive while our process restarts | — | **detached task host, frozen snapshot** (§9.2, §9.3) |
+| Deliver each job to exactly one worker at a time; redeliver if the worker dies | yes: work-queue consumers, ack wait | — |
+| Deduplicate a re-submitted job id | yes: message id dedupe window | plus create-only `job_state` key (§16.4) |
+| Authenticate connections, isolate callers | yes: accounts, users, subject permissions | plus signed envelopes (§15.3) |
+| Decide whether a job is allowed at all | — | **admission** (§11.3) |
+| Decide which band and which machine | — | **priority and pull order** (§14) |
+| Slots, GPUs, VRAM fit, parallelism | — | **scheduler** (parent spec §9.3) |
+| Retry policy per error kind | delivery mechanics only | **policy** (§16.2) |
+| Capabilities | KV storage only | **what is advertised** (§12) |
+
+## 9. Task continuity across code updates
+
+**Goal of this section:** a code update to this repo never stops, restarts or loses a running task (T13, T14, T15).
+
+### 9.1 The problem
+
+**As of 2026-10-27.** Renders often take about 30 minutes per task, and we may update the code every 10 minutes. In the
+past each update brought the process down and took every running task with it: the work was lost, re-run from the
+start, or both. Two separate things break:
+
+1. **The process that holds the job dies.** If the task runs inside `ai_processing_server`, or as a child that dies
+   with it, restarting the binary kills the task. If the broker connection that holds the job's claim closes, the
+   broker hands the job to someone else and it runs twice.
+2. **The task's code changes under it.** `git pull` rewrites scripts, Python modules, TypeScript files, ComfyUI graph
+   templates and Blender scripts on disk. A task that loads a file later in its run (a lazy import, the next stage's
+   script) gets the new version halfway through, or crashes.
+
+The design answers both with three layers that are upgraded on different clocks:
+
+| Layer | Process | Changes | Holds |
+| --- | --- | --- | --- |
+| **Broker** | `nats-server` (hub cluster; one leaf node per worker), an OS service | rarely, deliberately (§9.6) | queued jobs, claims, KV state |
+| **Controller** | `ai_processing_server`, our Go binary | often: every `git pull` | nothing that lives only in memory; it can die at any moment |
+| **Task host** | one detached process per running job, started from a frozen code snapshot | never during its job | the job's process tree and its progress |
+
+### 9.2 Frozen code snapshots
+
+When a job starts, the controller runs it from a **snapshot**, never from the working tree:
+
+* A snapshot is a read-only copy of everything a task loads from this repo: the runner scripts (Python, TypeScript,
+  shell), `data/services/` and the catalogs a runner reads, ComfyUI graph templates, Blender scripts, and a copy of
+  the `ai_processing_server` binary itself (used as the task host shim, §9.3).
+* Snapshots are keyed by commit: `data/git_ignore/snapshots/<git_sha>[-<dirty_hash>]/`. The first job after a pull
+  builds it (a copy of a few megabytes plus the binary); every later job on the same commit reuses it.
+* TypeScript tasks are **bundled into one file** at snapshot time (esbuild, pinned version), so the task reads its whole
+  program into memory when it starts and never touches `node_modules` or the source tree again. Python tasks run with
+  the snapshot as their only path into this repo, so a lazy import still finds the old code.
+* The job records its snapshot id in `job_state` and in its `succeeded` or `failed` event (`code_version`), so we always
+  know which code produced an output.
+* Not snapshotted: engines and models (ComfyUI installs, Blender, model weights, CUDA). They are installed outside the
+  repo and changed only by a drain (§9.6).
+* A snapshot is deleted when no running or recent job uses it and it is not among the last 5 (`continuity.keep_snapshots`).
+
+### 9.3 Detached task hosts
+
+Each running job lives in its own **task host**: a small shim process that owns the job's whole process tree.
+
+* The controller starts it from the snapshot (`snapshots/<sha>/ai_processing_server --role taskhost --run <job_id>`)
+  **detached**: its own session and process group on macOS and Linux (`setsid`), and on Windows a new process group
+  with `DETACHED_PROCESS`, outside any job object that kills children on close. When the controller exits or is
+  killed, the task host and its children keep running. This is the same pattern containerd uses with its shims.
+* The task host launches the runner (Python, TypeScript on Node, Blender, ComfyUI client, ffmpeg) from the snapshot,
+  writes progress and stage changes to an append-only `events.jsonl`, the result to `result.json`, and its exit code
+  to `exit.json`, all in `data/git_ignore/runs/<job_id>/`. It heartbeats `heartbeat.json` every 5 s.
+* The task host itself does **not** need the network in the default mode; the controller turns its files into broker
+  events. In **self-claim mode** (`continuity.taskhost_claims: true`) the task host also renews the job's claim on the
+  local leaf node and publishes its own events, so a controller that stays down longer than the ack wait still loses
+  nothing. Self-claim mode is also how a TypeScript task host written against `nats.js` can run with no Go shim.
+* **Tasks may be written in TypeScript.** A TypeScript runner is a bundled `.mjs` in the snapshot, started by the task
+  host with a pinned Node (or Bun) and the job envelope on stdin. It follows the same file contract as every other
+  runner, so the controller does not care which language a task is in.
+* Cancel reaches a task host through `cancel` in its run directory (written by the controller when `job_control`
+  changes) or, in self-claim mode, through its own watch. The parent spec's cancel checkpoints apply.
+
+### 9.4 Re-adopting running jobs after a restart
+
+The controller keeps one record per running job in `data/git_ignore/runs/<job_id>/run.json`, written before the task
+host starts and updated with every state change:
+
+```json
+{
+  "job_id": "7c0e6f0a-…", "service": "act3.video_gen_open_source", "snapshot": "3f2a9c1",
+  "ack_subject": "$JS.ACK.WORK.w_p2_act3_video_gen_open_source.1.4412.97.1761584400000000000.0",
+  "fence_rev": 118, "attempt": 1, "slot": "gpu0",
+  "taskhost": { "pid": 48211, "started_at": "2026-10-27T17:00:04.112Z" },
+  "events_sent": 37
+}
+```
+
+On startup, before it pulls any new work, the controller:
+
+1. Scans `runs/` for records without `exit.json` handled.
+2. Checks each task host is still the same process: the pid is alive **and** its start time matches `started_at`
+   (pids get reused).
+3. Re-occupies the job's slot and GPU in the scheduler, so it never over-commits a machine that is still rendering.
+4. Sends "in progress" to the stored `ack_subject` at once, then every 20 s. A JetStream ack subject is not tied to the
+   connection that received the job, so the broker sees one continuous claim.
+5. Resumes publishing from `events.jsonl` after `events_sent`. Callers already dedupe events by `(job_id, seq)`.
+6. If the task host already finished while the controller was down, it reads `result.json`, does the fencing check
+   (§16.3), publishes the final event, and acks.
+7. If the task host died (machine reboot, crash), the job goes through the normal retry policy (§16.2) as `infra`.
+
+The broker's ack wait for each work consumer (`continuity.ack_wait`, default 5 minutes) must be longer than the
+slowest controller restart. A normal update restarts in seconds; self-claim mode removes the limit.
+
+### 9.5 The update procedure
+
+`just update` (and `just restart` without the pull) on a worker:
+
+1. `git pull` and `just build`. On Windows the running `ai_processing_server.exe` is renamed aside first (Windows lets a
+   running file be renamed, not overwritten), so the build never fails because the controller is running.
+2. The old controller gets a stop signal. It stops pulling new work, flushes `run.json` files, closes its broker
+   connection **without** nacking held jobs, and exits. It never signals its task hosts.
+3. The new controller starts, re-adopts every running job (§9.4), builds the new snapshot on the first new job, and
+   resumes pulling.
+
+Running jobs finish on the code they started with. New jobs start on the new code. The hub works the same way: the
+hub controller (admission, gateway, promoter) restarts freely while `nats-server` keeps every submission; NATS-native
+callers never notice, and gateway callers retry the few seconds of HTTPS downtime.
+
+### 9.6 What continuity does not cover
+
+* **Broker upgrades.** `nats-server` is upgraded rarely, on purpose. A hub cluster upgrades one node at a time; a
+  worker's leaf node restarts in about a second and its claims survive (the ack subject lives on the hub).
+* **Engine and model upgrades** (ComfyUI, Blender, CUDA, model weights). Those use a **drain**: the machine stops taking
+  new jobs for the service, waits for running ones to finish, upgrades, and resumes (parent spec `drain`).
+* **A machine reboot or power loss** kills task hosts; their jobs are redelivered after the ack wait and re-run.
+* **A bug in the task host shim itself** is fixed by the next job's snapshot; running jobs keep the old shim.
+* **Breaking changes to the run directory contract** (`run.json`, `events.jsonl`, `result.json`) must stay readable by
+  the next controller version: the contract carries `run_version`, and a controller reads the current and previous
+  versions.
+
+## 10. Callers and how they submit
+
+**Goal of this section:** who calls in and through which door (T2).
+
+### 10.1 The callers
+
+| Caller id | Who | Submits | Typical work |
+| --- | --- | --- | --- |
+| `act3` | ACT3 appsrv and job_runner during migration | through NATS (`nats.js` client) or the HTTPS gateway | shot video, image, upscale, merges, Blender, TTS |
+| `wtc` | We The Citizens Go backend | through NATS (`nats.go`, already a dependency of AI_Coding) | transcription, AI descriptions, OCR, transcodes, moderation assists |
+| `local` | the owner of one machine, through the local API (parent spec §13) or CLI | into that machine's own local queue | the owner's batches: marketing videos, voice memo transcription, tests |
+| (future) | another product or a partner | the HTTPS gateway only, until trusted | anything the owner allows |
+
+Every caller is declared in `data/queue/callers.yaml` (checked in: id, display name, public signing keys, default
+band ceiling) and switched on or off per machine in `this_server.yaml` (§17). A caller not declared there cannot
+submit anywhere.
+
+### 10.2 Native submission (NATS)
+
+A caller publishes the job envelope (§13.2) to `submit.<caller>.<category>` with headers (§13.3). JetStream answers with
+a publish ack once the job is durably stored. The caller then follows the job on `evt.<caller>.<job_id>` (§13.5).
+
+### 10.3 The HTTPS gateway
+
+For callers that prefer plain HTTPS (and for any future third party), the hub serves:
+
+| Method and path | Does |
+| --- | --- |
+| `POST /v1/jobs` | submit one envelope (or `{ "jobs": [...] }`, up to 500); returns `202` with job ids, or `4xx` with the admission reason |
+| `GET /v1/jobs/{job_id}` | current state from `job_state` |
+| `DELETE /v1/jobs/{job_id}` | request cancel (sets `job_control`) |
+| `GET /v1/capabilities` | what the fleet can do now, filtered to what this caller may see (§12.3) |
+| `POST /v1/webhooks` | register a callback URL for this caller's job events (signed with HMAC-SHA256, §15.6) |
+
+The gateway is a thin translator: it authenticates, then publishes to exactly the same subjects a native caller
+would. There is one path through admission, not two.
+
+## 11. Categories, models and acceptance
+
+**Goal of this section:** how a server accepts some jobs and refuses others (T5).
+
+### 11.1 Categories
+
+Checked in at `data/queue/categories.yaml`. Each category lists its services (parent spec §8.1) and its default
+resource class.
+
+| Category | Services (initial) | Resource class |
+| --- | --- | --- |
+| `video_gen` | `act3.video_gen_open_source`, `act3.comfy_on_prem` (video graphs) | gpu_heavy |
+| `image_gen` | `act3.image_gen_open_source`, `act3.comfy_on_prem` (image graphs) | gpu |
+| `upscale` | `act3.upscale_open_source` | gpu_heavy |
+| `audio_tts` | `act3.tts_local` | cpu_or_gpu |
+| `transcription` | `wtc.transcription` | cpu_or_gpu |
+| `vision_describe` | `wtc.ai_description` | gpu or vendor |
+| `ocr` | `wtc.ocr` | cpu |
+| `transcode` | `act3.transcode`, `wtc.transcode` | cpu (hardware encoder optional) |
+| `assemble` | `act3.video_merge` | cpu |
+| `render_3d` | `act3.blender_render` | gpu |
+| `llm` | (none yet; reserved for local LLM inference) | gpu_or_unified |
+| `vendor_api` | jobs that call a hosted AI (Veo, Runway, Kling, FLUX API) and need only network, CPU and a key | network |
+| `system` | `sys.self_test` | any |
+
+A service belongs to exactly one category. A new category is a pull request to `categories.yaml` and is **off** on
+every machine until its owner turns it on (opt-in, as the parent spec §6.4 does for services).
+
+### 11.2 What each machine says yes to
+
+Three filters, all of which must pass. Each lives in `this_server.yaml` (owner-edited, never written by code):
+
+1. **Callers:** which callers this machine serves at all (`callers.<id>.enabled`).
+2. **Categories per caller:** `accept` and `deny` lists of categories. `deny` wins. An empty `accept` means none.
+3. **Models:** `models.allow` and `models.deny`, by model id or pattern (`wan2.*`, `vendor:*`). A job names its
+   model in `model` (§13.2). Uses: refuse a model whose license we have not cleared for commercial use; refuse
+   `vendor:*` on a machine that holds no vendor keys; allow only the models already downloaded on a slow-link office.
+
+Then the parent spec's service list (`services[].enabled`), hardware fit (parent §7.3) and limits apply as before.
+
+### 11.3 Where the checks run
+
+The same policy is checked at three points, so a mistake in one place never runs a refused job:
+
+| Point | Checks | On failure |
+| --- | --- | --- |
+| **Admission** on the hub, at submit time | caller authenticated and signature valid; caller may use this category and model (caller policy in `data/queue/callers.yaml` and hub overrides); envelope and params schema valid; **at least one online or recently seen worker advertises this service and model** (§12) | rejected at once with a reason (`category_not_allowed`, `model_not_allowed`, `invalid_input`, `no_capable_server`); never queued |
+| **Pull filter** on each worker | the worker only pulls from consumers for (caller, service) pairs its owner allows and its hardware offers | the job is never delivered to that machine |
+| **Runner `Check`** just before work (parent §8.4) | model files present or downloadable, engine healthy, VRAM fit now | `infra` failure, job goes back for another machine (§16.2) |
+
+`no_capable_server` is configurable per caller: reject (default for interactive ACT3 work, so the user hears at once)
+or accept and hold up to `hold_without_capacity` (default 24 h, for WTC backlogs that can wait for the Mac Studio to
+come back).
+
+## 12. Capabilities: what each server publishes
+
+**Goal of this section:** how servers "give out" their specifications (T4).
+
+### 12.1 The `servers` record
+
+Every worker writes its record to the hub's KV bucket `servers` (key = server key, TTL 90 s) every 15 s, from the same
+facts as the parent spec's heartbeat (§14.3 there):
+
+```json
+{
+  "key": "B5090",
+  "role": "worker",
+  "version": "0.3.0",
+  "state": "ONLINE",
+  "site": "bryan_office",
+  "hardware": {
+    "os": "windows", "cpu_logical": 32, "ram_gb": 128,
+    "gpus": [{ "index": 0, "name": "NVIDIA GeForce RTX 5090", "vram_gb": 32, "compute": "cuda", "compute_version": "12.0" }]
+  },
+  "accepts": {
+    "act3": { "categories": ["video_gen", "image_gen", "upscale", "assemble"], "models": ["wan2.2-*", "ltx-2.5", "flux-*"] },
+    "wtc":  { "categories": ["transcription", "transcode"], "models": ["whisper-*"] }
+  },
+  "offers": [
+    { "service": "act3.video_gen_open_source", "parallel": 1, "free": 0, "resident_models": ["wan2.2-a14b-fp8"], "reason": "ok" },
+    { "service": "act3.blender_render", "parallel": 0, "free": 0, "reason": "off in this_server.yaml" }
+  ],
+  "speed": { "act3.video_gen_open_source": { "wan2.2-a14b-fp8": { "sec_per_output_sec_720p": 41 } } },
+  "updated_at": "2026-10-27T17:02:15Z"
+}
+```
+
+* `speed` is measured, not declared: the median of the last 20 jobs per service and model, so callers can estimate
+  finish times (RenderEngine.mdx §9.4 asks for this).
+* A missing record (TTL expired) means the worker is offline. Its in-flight jobs time out of their ack wait and are
+  redelivered (§16.1).
+
+### 12.2 What is published and what is not
+
+* Published: capabilities, free capacity, models resident, measured speed, state and reason.
+* Never published: hostnames, IP addresses, file paths, credential paths, the owner's local jobs, the other caller's
+  jobs. The parent spec's isolation rule (§14.3 there) applies: ACT3 sees only that a slot is busy, not with what.
+
+### 12.3 Who can read it
+
+* Callers read a filtered view through `GET /v1/capabilities` or the KV bucket mirrored into their own account
+  (`caps.<caller>` view): only services and models that caller may submit, aggregated per service ("3 servers can run
+  `act3.video_gen_open_source` with `wan2.2-a14b-fp8`, 1 free slot now, estimated start 4 min").
+* An owner may set `advertise: summary` in `this_server.yaml` to publish only aggregate capacity, not the per-GPU
+  hardware block, for a machine whose specs they would rather not share with a caller.
+* Hub admins (the ACT3 admin Server page, bryan_servers.mdx §10.3) read the full record.
+
+## 13. The standard task contract
+
+**Goal of this section:** one way every task interacts with the queue, whatever its type (T9).
+
+### 13.1 Subjects, streams and buckets
+
+| Name | Kind | Holds | Retention |
+| --- | --- | --- | --- |
+| `submit.<caller>.<category>` | subjects in stream `SUBMIT` | raw submissions before admission | work queue; removed once admitted or rejected |
+| `work.<band>.<caller>.<service>` | subjects in stream `WORK` | admitted jobs waiting for a worker | work queue; removed on final ack |
+| `evt.<caller>.<job_id>` | subjects in stream `EVENTS` | lifecycle events and results | limits: 7 days, then gone |
+| `dead.<caller>.<service>` | subjects in stream `DEAD` | jobs that exhausted their deliveries | limits: 30 days |
+| `audit.>` | stream `AUDIT` | admission decisions, overrides, cancels | limits: 90 days |
+| `servers` | KV | capability records (§12) | TTL 90 s per key |
+| `job_state` | KV | current state, attempt, owner worker, fencing revision | 30 days |
+| `job_control` | KV | `cancel`, `pause` flags per job | 7 days |
+| `overrides` | KV | platform directives: service weights, paused services, drain (parent §10.4) | until replaced |
+| `depth` | KV | pending count per work consumer, written by the hub each second | TTL 10 s |
+
+Work consumers are **shared durable pull consumers**, one per `(band, caller, service)`, created by the hub from the
+catalogs. All workers that offer a service pull from the same consumer, which is how the broker guarantees that one job
+goes to one worker. (Work-queue streams require consumer filters not to overlap; one consumer per exact subject meets
+that.)
+
+### 13.2 The envelope
+
+Version 1, schema `data/schemas/task_envelope.v1.schema.json`. It is the parent spec's job envelope (§9.1 there) plus
+the fields a queue needs:
+
+```json
+{
+  "envelope_version": 1,
+  "job_id": "7c0e6f0a-3f0b-4d5f-9f0e-0b8d7f6b3c21",
+  "caller": "act3",
+  "category": "video_gen",
+  "service": "act3.video_gen_open_source",
+  "model": "wan2.2-a14b-fp8",
+  "caller_job_type": "SHOT_VIDEO_GENERATION_WAN_LOCAL",
+  "priority": 50,
+  "issued_at": "2026-10-27T17:00:00Z",
+  "expires_at": "2026-10-28T17:00:00Z",
+  "deadline": "2026-10-27T18:00:00Z",
+  "trace_id": "b81f…",
+  "tenant": { "org_id": "…", "project_id": "…" },
+  "estimate": { "output_seconds": 5, "resolution": "1280x720" },
+  "inputs": [{ "name": "first_frame", "url": "https://…presigned…", "sha256": "…", "bytes": 2211234 }],
+  "params": { "prompt_ref": "…", "fps": 24 },
+  "outputs": [{ "name": "video", "content_type": "video/mp4", "upload": { "method": "PUT", "url": "https://…presigned…" } }],
+  "data_rules": { "customer_data": true, "retain_after_upload": false },
+  "reply": { "events": "evt.act3.7c0e6f0a-…", "webhook": null }
+}
+```
+
+Rules:
+
+* **Small.** Envelopes are capped at 256 KB (the broker allows 1 MB). Media never rides on the bus: inputs and
+  outputs are URLs. Big params (a ComfyUI graph) are stored by the caller and passed by URL with a sha256.
+* `job_id` is the caller's id, globally unique (UUID). Re-submitting the same `job_id` is a no-op (§16.4).
+* `expires_at` at most 7 days after `issued_at`. An expired envelope is dropped with event `expired`.
+* `priority` is the caller's number on the shared 0..300 scale (parent §10.2), clamped by the caller's ceiling (§14.3).
+
+### 13.3 Headers
+
+Every message carries: `Nats-Msg-Id` (= `job_id`, for broker dedupe), `X-Caller`, `X-Category`, `X-Service`,
+`X-Model`, `X-Priority`, `X-Trace-Id`, `X-Envelope-Version`, and `X-Signature` (§15.3). Admission copies them onto the
+`work.` message and adds `X-Band` and `X-Admitted-At`.
+
+### 13.4 Lifecycle as seen by the caller
+
+```
+SUBMITTED ─► ADMITTED ─► QUEUED(band) ─► CLAIMED(server) ─► STAGING ─► RUNNING ─► UPLOADING ─► SUCCEEDED
+     │            │            │                │               │           │            │
+     └► REJECTED  └────────────┴────────────────┴───────────────┴───────────┴────────────┴─► FAILED(kind)
+                                                                                         └─► CANCELLED
+                                                                                         └─► EXPIRED
+```
+
+`CLAIMED` through `UPLOADING` are the parent spec's server states (§9.2 there). A job that fails with a retryable kind
+goes back to `QUEUED` with `attempt` incremented; the caller sees `requeued` events, not a failure.
+
+### 13.5 Events
+
+Each event on `evt.<caller>.<job_id>` is a small JSON object:
+
+```json
+{ "job_id": "…", "seq": 7, "type": "progress", "state": "RUNNING", "attempt": 1, "server": "B5090",
+  "stage": "render", "progress": 0.42, "note": "frame 101/240", "at": "2026-10-27T17:03:10Z" }
+```
+
+| `type` | When | Extra fields |
+| --- | --- | --- |
+| `admitted` / `rejected` | after admission | `band`, or `reason` |
+| `claimed` | a worker took it | `server`, `attempt`, `estimated_finish` |
+| `stage` | stage change | `stage` |
+| `progress` | at most every 5 s | `progress`, `note` |
+| `requeued` | retryable failure, going back | `kind`, `message`, `next_attempt_after` |
+| `succeeded` | outputs uploaded and verified | `outputs[]` (name, bytes, sha256, content type, media facts), `timings` |
+| `failed` | final failure | `kind`, `message`, `stage`, `detail` (redacted log tail) |
+| `cancelled` / `expired` | final | `by` |
+
+Callers must treat events as **at least once** and idempotent by `(job_id, seq)`. The final event is written before
+the work message is acked (§16.3), so a crash can repeat a final event but never lose one.
+
+### 13.6 Errors
+
+The error kinds are the parent spec's (§12.2 there): `invalid_input`, `content_policy`, `transient`, `timeout`,
+`infra`, `internal`. Admission adds `category_not_allowed`, `model_not_allowed`, `caller_not_allowed`,
+`no_capable_server`, `rate_limited`, `bad_signature`, `expired`. Every error has a sentence a person can act on.
+
+### 13.7 The Go interface (the broker seam)
+
+Everything above the broker uses this interface; only `code/internal/queue/natsq/` knows NATS exists.
+
+```go
+// code/internal/queue/queue.go
+package queue
+
+// Queue is the only door between our code and the task system.
+type Queue interface {
+	// Submit is used by the gateway and by local callers. It returns after the job is durably stored.
+	Submit(ctx context.Context, env *Envelope) (SubmitAck, error)
+
+	// Pull fetches at most one job from the first consumer in order that has work, without blocking longer than wait.
+	// The scheduler passes the consumer order it computed (§14.4); the queue never decides priority.
+	Pull(ctx context.Context, order []ConsumerRef, wait time.Duration) (*Delivery, error)
+
+	// Publish writes an event for the caller. Final events are written before Ack.
+	Publish(ctx context.Context, ev *Event) error
+
+	// State reads and compare-and-sets job_state; the revision is the fencing token (§16.3).
+	State(ctx context.Context, jobID string) (JobState, uint64, error)
+	CASState(ctx context.Context, jobID string, s JobState, rev uint64) (uint64, error)
+
+	// Control watches cancel and pause flags for live jobs.
+	WatchControl(ctx context.Context, jobIDs []string) (<-chan ControlChange, error)
+
+	// Capabilities writes this server's record and reads the fleet's.
+	PutServer(ctx context.Context, rec ServerRecord) error
+	Servers(ctx context.Context) ([]ServerRecord, error)
+
+	// Resume rebuilds a Delivery from the handle a previous controller saved in run.json, so a restarted
+	// controller keeps the same claim without redelivery (§9.4).
+	Resume(ctx context.Context, handle ClaimHandle) (Delivery, error)
+}
+
+// ClaimHandle is everything needed to keep holding a job after a restart: for NATS, the ack subject and
+// the fencing revision. It is stored on disk, never only in memory.
+type ClaimHandle struct {
+	JobID      string
+	AckSubject string
+	FenceRev   uint64
+	Attempt    int
+}
+
+// Delivery is one job held by this worker. Exactly one of Ack, Requeue, Dead must be called.
+type Delivery interface {
+	Envelope() *Envelope
+	Attempt() int
+	InProgress(ctx context.Context) error                    // extends the ack wait; called every 20 s
+	Ack(ctx context.Context) error                           // done (succeeded, failed for good, or cancelled)
+	Requeue(ctx context.Context, delay time.Duration) error  // let another worker try after delay
+	Dead(ctx context.Context, reason string) error           // stop delivering; copy to DEAD
+	Handle() ClaimHandle                                     // saved to run.json before the task host starts
+}
+```
+
+The parent spec's `broker.Source` (§11.2 there) becomes an adapter over `Queue`, so the scheduler and runners do not
+change.
+
+## 14. Prioritization
+
+**Goal of this section:** what runs first, fairly, across callers and across the fleet (T3, T8).
+
+### 14.1 Who sets what
+
+The parent spec's rule stands: **the owner sets the fence, the callers set the order inside it.** Here it is extended
+to the queue:
+
+| Decision | Who | Where |
+| --- | --- | --- |
+| Job priority (0..300) | the caller | envelope `priority` |
+| Highest band a caller may use | hub admin | `data/queue/callers.yaml` `max_band`, hub override |
+| Service weights, paused services, drain | the platform that owns the service | `overrides` KV (parent §10.4) |
+| Share of a machine between callers | machine owner | `this_server.yaml` `callers.<id>.share` |
+| How the owner's own jobs rank | machine owner | `this_server.yaml` `callers.local` (§14.5) |
+
+### 14.2 Bands
+
+Admission maps `priority` to a band. Bands keep ordering cheap on the broker (five lanes, not 300) while the exact
+number still orders jobs inside a machine (parent §10.3).
+
+| Band | Priority | Meant for |
+| --- | --- | --- |
+| `p0` | 150 and above | a paying user watching a render; first-shot boosts (ACT3 +100) |
+| `p1` | 75 to 149 | ACT3 CRITICAL; WTC time-sensitive moderation assists |
+| `p2` | 50 to 74 | HIGH: interactive regenerations |
+| `p3` | 25 to 49 | NORMAL: most work |
+| `p4` | under 25 | LOW and bulk: backfills, re-transcription, marketing batches |
+
+### 14.3 Caller ceilings and quotas
+
+* Each caller has `max_band` (ACT3: `p0`, WTC: `p1`, unknown third parties: `p3`). A higher request is clamped and
+  the `admitted` event says so.
+* Each caller has queue quotas per band (`max_queued`), so a flood of 50,000 WTC transcriptions cannot crowd out
+  anything: excess is rejected with `rate_limited` and a `retry_after`.
+
+### 14.4 Pull order on a worker (starvation-free)
+
+When a slot frees, the worker's scheduler builds the list of consumers it may pull from (allowed callers × offered
+services × five bands), drops those the `depth` KV shows empty, and orders them:
+
+1. **Band credit.** Weighted deficit round robin over bands with weights 16, 8, 4, 2, 1 (`p0` to `p4`): `p0` is served
+   first almost always, but `p4` still gets about 1 pull in 31 when every band is full.
+2. **Caller share.** Within the chosen band, deficit round robin over callers by `callers.<id>.share`, charged in
+   GPU-seconds or core-seconds actually used (parent §10.5).
+3. **Service weight.** Within the caller, order services by the platform's `service_weights` plus the owner's
+   `local_bias` (parent §10.3), then by a resident-model bonus (a job for the model already loaded goes first, which
+   saves minutes of load time on the B5090).
+4. Fetch from the first consumer with work. The job is then admitted to a slot by the parent spec's §9.3.
+
+**Aging.** The hub's promoter moves a job up one band after it has waited longer than its band's `max_wait` (`p4`: 6 h,
+`p3`: 1 h, `p2`: 15 min, `p1`: 5 min). It republishes under a new message id (`<job_id>#a1`) and acks the old copy,
+so the job is never in two places. A job is promoted at most twice.
+
+**Pull, not push.** A worker only takes a job when it has a free slot for it (prefetch of one per free slot), so a
+busy machine never hoards work an idle machine could start now. This replaces the parent spec's "lease at most free
+slots + 1".
+
+### 14.5 The local computer's priority
+
+Bryan asked that config say how to prioritize "our local computer". Each worker has its own small JetStream domain
+for the `local` caller (the owner's jobs submitted through the local API), and `this_server.yaml` says how it ranks:
+
+```yaml
+callers:
+  local:
+    enabled: true
+    mode: first            # first | share | idle_only
+    share: 0               # used only when mode is share
+    reserve_slots: 0       # slots kept free for local work even when platforms have a backlog
+    yield_to_interactive: true
+```
+
+* `first`: local jobs are pulled before any platform job, in every band. Right for the laptop and BMT.
+* `share`: local is one more caller in the deficit round robin with its share. Right for B5090 when Bryan runs
+  marketing batches but ACT3 customers must still be served.
+* `idle_only`: local jobs run only when no platform work is waiting. Right for a machine dedicated to customers.
+* `reserve_slots` keeps capacity for the owner even under a platform backlog.
+* `yield_to_interactive` (from the parent spec's `bmt` and laptop profiles): on a workstation where the owner is
+  active (non-server CPU over 70%, on battery, or display awake and in use), the machine pulls only `p0` platform work
+  and local work.
+
+Local jobs never leave the machine and never appear in its public `servers` record.
+
+## 15. Security
+
+**Goal of this section:** what protects the fleet, the callers and the data (T7). This section must agree with
+`pm/security.mdx` (referenced by `.gitignore`, not yet written); where they differ, `security.mdx` wins once it
+exists.
+
+### 15.1 Threats we design for
+
+| Threat | Defense |
+| --- | --- |
+| A stolen caller credential submits work | per-caller accounts and permissions (§15.2), signed envelopes (§15.3), quotas (§14.3), revocation within one minute (§15.7) |
+| One caller reads or cancels another caller's jobs | separate broker accounts; subjects never shared; events only in the caller's account |
+| A malicious envelope tries to make a worker run code or reach internal hosts | no caller code ever runs; params schemas; URL allow-lists; argv-only process launch (§15.4) |
+| A stolen worker credential pulls customer jobs | worker credentials per machine, pull-only on its allowed consumers, revocable; customer data rules (§15.5) |
+| A replayed old submission | `issued_at`, `expires_at`, dedupe on `job_id`, create-only `job_state` |
+| A flood that fills the hub | per-account storage limits, per-band queue quotas, gateway rate limits |
+| The hub is compromised | it holds no media, no vendor keys, no customer files; envelopes carry presigned URLs that expire; signing keys for callers are not on the hub (only their public halves) |
+
+### 15.2 Transport and authentication
+
+* **TLS 1.2+ (prefer 1.3) on every connection.** Client port 4222, leaf-node port 7422, gateway 443. Public
+  certificates on the hub (Let's Encrypt). No plaintext listener outside loopback.
+* **Decentralized auth with NKeys and JWTs** (the broker's operator mode). One operator (`ACT3_PROCESSING`), accounts
+  `ACT3`, `WTC`, `WORK`, `SYS`, plus one `LOCAL_<key>` account per worker's local domain. Users are per process and
+  per machine: `act3-appsrv`, `act3-jobrunner`, `wtc-backend`, `worker-B5090`, `hub-admission`.
+* **Least privilege by subject.** `act3-appsrv` may publish `submit.act3.>` and read `evt.act3.>` and the
+  `caps.act3` view, nothing else. `worker-B5090` may pull from the work consumers its owner allows, write
+  `evt.*.*` events only for jobs it holds (checked by the fencing token), and write its own `servers.B5090` key.
+* Credentials files live in `~/BGit/act3/act3ai-credentials/processing_servers/` and `~/.credentials/`, referenced by
+  path from `this_server.yaml` (parent §6.5), never in `data/`, never in logs.
+* The operator and account signing keys are kept off the hub, on an admin machine; the hub has only the JWTs.
+
+### 15.3 Signed envelopes
+
+Broker auth proves which connection sent a message; a signature proves which caller wrote the job, end to end, even
+through the gateway, a bridge, or a promotion.
+
+* Each caller signs the canonical envelope (JSON Canonicalization Scheme, RFC 8785) with Ed25519 and sends the
+  signature in `X-Signature` as `kid:base64url(sig)`.
+* Public keys are checked in at `data/queue/callers.yaml` (public keys are safe to commit). Rotation: add the new
+  `kid`, switch the caller, remove the old one in a later release.
+* Admission verifies; workers verify again before running. A bad signature is `bad_signature` at admission and an
+  `internal` alert at a worker (it means something inside our system changed a job).
+
+### 15.4 Input safety
+
+* Input and output URLs must be `https://` and match the caller's host allow-list (its S3 buckets, `ipfs.io`,
+  `*.ipfs.dweb.link`). Never `127.0.0.1`, private ranges or link-local addresses; DNS is re-checked after resolution
+  to stop rebinding.
+* Sizes are checked against the envelope's declared `bytes` and the service's maximum before download completes.
+* Media is probed with `ffprobe` and decoders only; inputs are never executed. Scripts that run (Python, Blender,
+  ComfyUI graphs) are the ones checked into this repo or whitelisted graph templates; a caller's ComfyUI graph is
+  accepted only for callers with `allow_custom_graphs: true` and only node types on the allow-list.
+* Processes launch with argument arrays, never a shell string (parent §8.4 `procs.Run`).
+
+### 15.5 Customer data and isolation
+
+* Parent spec §16.3 applies unchanged: sites with `customer_data_allowed: false` never pull jobs with
+  `data_rules.customer_data: true` (their consumers filter them out by a `-cd` subject suffix).
+* A worker's events for an ACT3 job go only to the ACT3 account. WTC never sees them and the reverse.
+* The `local` domain never connects its streams to the hub.
+
+### 15.6 Webhooks
+
+Gateway webhooks carry `X-Signature-256: sha256=<hmac>` over the body with the caller's webhook secret, a timestamp
+header, and are retried with backoff for 24 h. Callers must reject a timestamp more than 5 minutes old.
+
+### 15.7 Revocation and audit
+
+* Revoking a user JWT (stolen laptop, retired machine) takes effect on the hub within one minute; the worker's
+  in-flight jobs time out and are redelivered elsewhere.
+* Every admission decision, override, cancel and revocation is written to the `AUDIT` stream and to
+  `~/_act3_logs/processing_server.info` with caller, user, job id, decision and reason.
+
+## 16. Reliability
+
+**Goal of this section:** jobs are never lost, rarely duplicated, and never produce two results.
+
+### 16.1 Long jobs on a work queue
+
+A Wan 2.2 render can run 20 to 30 minutes; a Blender scene longer. The ack wait is 5 minutes (`continuity.ack_wait`)
+and the controller (or the task host, in self-claim mode) extends it with `InProgress` every 20 s while the job runs.
+The ack wait is long enough to cover a controller restart (§9.4) and short enough that a dead machine's job moves on
+within minutes: if the worker dies or loses its link for longer than the ack wait, the broker redelivers the job to
+another worker. Ack wait, extension interval and max deliveries can be set per service in `data/services/*.yaml`, but
+never below `continuity.ack_wait`.
+
+### 16.2 Retry policy per error kind
+
+| Kind | Worker does | Delivery action |
+| --- | --- | --- |
+| `invalid_input`, `content_policy`, `bad_signature` | final `failed` event | `Ack` (never retried) |
+| `transient` | retried inside the stage first (parent §12.1), then `requeued` event | `Requeue` with backoff 30 s, 2 min, 10 min |
+| `infra` (OOM, engine down, disk full) | `requeued` event; mark the service `DEGRADED` locally | `Requeue` at once so another machine takes it |
+| `timeout` | `requeued` once, then `failed` | `Requeue` then `Ack` |
+| `internal` | final `failed` event, alert | `Ack` |
+| max deliveries reached (default 3) | — | `Dead`: copied to `DEAD`, `failed` event with kind `infra` and "gave up after 3 attempts on B5090, BPC, B5090" |
+
+### 16.3 Exactly one result: the fencing token
+
+Redelivery after a network split can leave two workers running the same job. The broker cannot stop the first from
+finishing, so we fence:
+
+1. On claim, the worker compare-and-sets `job_state` to `CLAIMED by B5090, attempt 2` and keeps the KV revision as its
+   token.
+2. Before upload and before writing the final event, it compare-and-sets again with that revision. If the revision
+   moved (another worker claimed attempt 3), the write fails and this worker discards its outputs and acks nothing.
+3. Final event first, then `Ack`. A crash between them repeats the final event, which callers already dedupe.
+
+Double work is acceptable; double results are not (parent §9.4).
+
+### 16.4 Idempotent submission
+
+`Nats-Msg-Id = job_id` drops duplicates inside the broker's dedupe window (set to 2 h), and admission creates the
+`job_state` key with create-only semantics, so a submit retried days later is answered with the existing state, not a
+second job.
+
+### 16.5 Cancellation
+
+The caller sets `job_control.<job_id>.cancel = true` (or `DELETE /v1/jobs/{job_id}`). A queued job is removed by the
+hub and acked with event `cancelled`. A running job's worker sees the change through its watch and cancels the job's
+context; the parent spec's cancel checkpoints (§9.2 there) apply and nothing is uploaded after cancel.
+
+### 16.6 When the hub is down
+
+* Workers keep running the jobs they hold, buffer events locally (their leaf `nats-server`, a separate process,
+  stores and forwards), and finish. Uploads go straight to storage and do not need the hub. Claim renewals that cannot
+  reach the hub are retried; the 5-minute ack wait rides out short outages.
+* A restart of the hub **controller** (admission, gateway, promoter) is not a hub outage: the hub `nats-server` keeps
+  accepting and storing submissions, and admission catches up when the controller is back (§9.5).
+* No new platform work arrives until the hub returns; local jobs continue.
+* Phase 1 runs a single hub with file storage and a snapshot every 6 hours to object storage. Phase 6 runs three
+  hub nodes with replication factor 3 (§22).
+
+## 17. Configuration
+
+**Goal of this section:** every knob, and which file holds it.
+
+### 17.1 Additions to `this_server.yaml`
+
+`init` writes these sections when it creates the file; it still never rewrites an existing file (parent §6.1). For
+machines that already have one, `just reinit` produces `this_server.yaml.new` with the new sections to merge.
+
+```yaml
+queue:
+  role: worker                       # worker | hub | standalone
+  broker_url: "nats://127.0.0.1:4222"   # this machine's own nats-server service (leaf node, or the hub's server)
+  hub_url: "tls://queue.act3ai.com:7422" # used only by `just broker-config` to write the leaf node's remote
+  credentials_file: "~/BGit/act3/act3ai-credentials/processing_servers/B5090.creds"
+  broker_version: "2.12.x"               # supported nats-server line; the controller warns on any other
+  store_dir: "~/.act3_processing/nats/jetstream"  # written into the broker's config; outside the repo
+  store_max_gb: 20
+  advertise: full                    # full | summary (§12.3)
+
+continuity:                          # §9
+  ack_wait: 5m                       # must exceed the slowest controller restart
+  heartbeat: 20s                     # InProgress interval
+  taskhost_claims: false             # true: task hosts renew their own claim (self-claim mode, §9.3)
+  keep_snapshots: 5                  # code snapshots kept besides those in use
+  node: "~/.act3_processing/node/v22/bin/node"  # pinned Node for TypeScript task hosts
+
+callers:
+  act3:
+    enabled: true
+    share: 70
+    accept: [video_gen, image_gen, upscale, assemble, transcode, render_3d, audio_tts, system]
+    deny: []
+  wtc:
+    enabled: true
+    share: 30
+    accept: [transcription, transcode, ocr, vision_describe, system]
+    deny: [video_gen]
+  local:
+    enabled: true
+    mode: share                      # first | share | idle_only (§14.5)
+    share: 20
+    reserve_slots: 0
+    yield_to_interactive: false
+
+models:
+  allow: ["wan2.2-*", "ltx-2.5*", "hunyuan-1.5*", "flux-*", "sdxl-*", "seedvr2-*", "flashvsr-*", "whisper-*", "kokoro-*"]
+  deny:  ["vendor:*"]                # this machine holds no vendor API keys
+```
+
+`callers.*.share` here replaces `platforms.*.share` in the parent spec §6.5; the loader accepts both during migration
+and warns on the old name.
+
+### 17.2 Checked-in files under `data/queue/`
+
+| File | Holds | Changed by |
+| --- | --- | --- |
+| `data/queue/callers.yaml` | caller ids, display names, Ed25519 public keys with `kid`, `max_band`, quotas, URL host allow-lists, `no_capable_server` behavior, `allow_custom_graphs` | admins, by pull request |
+| `data/queue/categories.yaml` | categories, their services, resource class | engineers |
+| `data/queue/bands.yaml` | band thresholds, DRR weights, `max_wait` for aging, promotion limit | engineers |
+| `data/queue/streams.yaml` | stream and KV definitions: retention, max age, max bytes, dedupe window, replicas | engineers |
+| `data/schemas/task_envelope.v1.schema.json` | the envelope (§13.2) | engineers |
+| `data/schemas/task_event.v1.schema.json` | events (§13.5) | engineers |
+| `data/queue/nats/hub.conf.tmpl`, `leaf.conf.tmpl`, `standalone.conf.tmpl` | templates `just broker-config` fills to write the broker's config outside the repo (§8.2) | engineers |
+| `data/queue/broker.yaml` | pinned `nats-server` version and download checksums per OS and architecture | engineers |
+| `data/schemas/run_record.v1.schema.json` | the run directory contract: `run.json`, `events.jsonl`, `result.json`, `exit.json` (§9.3, §9.4) | engineers |
+
+Per-service queue settings (ack wait, extension interval, max deliveries, backoff) go into each service's catalog
+file in `data/services/` (parent §8.2), under `queue:`.
+
+## 18. Operations
+
+**Goal of this section:** how the queue is run and watched day to day.
+
+| Recipe | Does |
+| --- | --- |
+| `just queue-status` | bands × callers × services depth, oldest waiting job, workers online, from the hub |
+| `just queue-dead` | list `DEAD` jobs with reasons; `just queue-dead retry <job_id>` re-admits one |
+| `just queue-creds` | admin machine only: create or revoke caller and worker credentials with the operator key |
+| `just broker-install` | once per machine: download the pinned `nats-server` (checksum from `data/queue/broker.yaml`) and install it as an OS service (launchd, systemd, Windows service) |
+| `just broker-config` | regenerate the broker config from `this_server.yaml` and `data/queue/nats/`, then reload it without dropping connections |
+| `just broker-status` | is the broker service up, which version, JetStream usage, leaf link to the hub |
+| `just update` | `git pull`, `just build`, restart the controller; running jobs are re-adopted, not stopped (§9.5) |
+| `just restart` | restart the controller only, same re-adoption |
+| `just runs` | list running task hosts: job, service, snapshot, pid, age, last heartbeat |
+| `just hub-run` | run this checkout as the hub (`queue.role: hub`) |
+| `just hub-snapshot` | snapshot hub streams to object storage now |
+
+* `/metrics` (parent §13) adds queue depth per band and caller, wait time percentiles, admission rejects by reason,
+  redeliveries, dead letters, and per-caller share actually delivered.
+* The NATS `nats` CLI works against the hub for deep inspection by admins; it is a tool, not a dependency.
+* Alerts: `p0` oldest wait over 2 minutes; `DEAD` growth; no worker online for a service with queued jobs; hub disk
+  over 70%; a broker service down on any machine; a re-adoption that found a task host gone (`readopt_lost`), which
+  should only happen after a reboot.
+
+## 19. Code layout
+
+**Goal of this section:** where the queue code lives, extending the parent spec §15.
+
+```
+code/internal/
+├── queue/             # Queue and Delivery interfaces, Envelope, Event, JobState (§13)
+│   ├── natsq/         # the NATS JetStream adapter: client of the local nats-server; streams, consumers, KV, Resume
+│   └── queuetest/     # an in-memory Queue for unit tests of the scheduler and admission
+├── brokerctl/         # broker-install, broker-config (templates → config outside the repo), version check (§8.2)
+├── snapshot/          # frozen per-commit code snapshots, TypeScript bundling, garbage collection (§9.2)
+├── taskhost/          # the --role taskhost shim: detached launch per OS, run directory files, self-claim mode (§9.3)
+├── runs/              # run.json records and re-adoption on controller start (§9.4)
+├── admission/         # hub: signature check, caller policy, category and model rules, schema, capability check (§11)
+├── gateway/           # hub: HTTPS API and webhooks (§10.3)
+├── promoter/          # hub: aging between bands (§14.4)
+├── priority/          # band mapping, DRR over bands and callers, pull order (§14)
+├── signing/           # Ed25519 over RFC 8785 canonical JSON (§15.3)
+└── broker/            # parent spec's Source, now an adapter over queue.Queue
+```
+
+## 20. Migration
+
+**Goal of this section:** how ACT3 and WTC move onto the queue without a big bang.
+
+* **ACT3.** Strangler, one job type at a time (parent §21). For a moved type, appsrv (or job_runner's master, during
+  transition) submits to `submit.act3.<category>` instead of starting a Temporal child workflow, listens to
+  `evt.act3.>`, and updates the `job` row from events. The Render Queue page keeps reading the `job` table. First
+  candidates: `act3.video_merge` (CPU, low risk), then `comfy_generation_on_prem`. BullMQ jobs (TTS, copy) follow
+  later or stay where they are; they are appsrv-internal.
+* **WTC.** The Go backend already has `nats.go`. Its transcription, OCR and description producers submit to
+  `submit.wtc.*` directly. Where WTC work is already on RabbitMQ queues, a small bridge in the WTC backend consumes
+  them and submits envelopes, until each producer is switched.
+* **Local.** The owner's scripts (voice memo transcription on the Mac Studio today) move to the local API in phase 2,
+  with `callers.local` rules.
+
+## 21. Tests and acceptance
+
+**Goal of this section:** how we know each requirement works.
+
+### 21.1 Unit tests
+
+* `priority`: band mapping at every threshold; DRR proportions over 10,000 simulated pulls within 2% of weights;
+  `p4` never starves; aging promotes at most twice.
+* `admission`: every rejection reason; caller ceiling clamp; `deny` beats `accept`; model patterns; `no_capable_server`
+  reject versus hold.
+* `signing`: canonicalization round trips; tampered field fails; key rotation with two `kid`s.
+* `queue/queuetest` drives the scheduler: one job to one worker, fencing rejects a stale result.
+* `runs`: re-adoption skips a reused pid (start time differs); a finished task host found at startup is acked once;
+  a `run.json` of the previous `run_version` still loads.
+* `snapshot`: same commit reuses one snapshot; a dirty tree gets its own; garbage collection never deletes one in use.
+
+### 21.2 Integration tests (a test `nats-server` process, a hub controller and two worker controllers)
+
+The tests start a real `nats-server` binary as its own process, as production does; they never embed it.
+
+* Submit through NATS and through the gateway: identical events.
+* Kill a worker mid-job: redelivered after the ack wait to the other; the first worker's late result is fenced off.
+* **Restart storm:** a 30-minute test job (a sleeper task host that writes progress) runs while the worker controller
+  is restarted every 2 minutes, by stop signal and by `kill -9`. The job finishes once, on its first attempt, with no
+  redelivery and no gap in events.
+* **Code changes under a running task:** start a TypeScript test task and a Python test task, then rewrite their
+  source files and `git checkout` another commit. Both finish on their original code (their `code_version` is the old
+  commit); the next job runs on the new code.
+* **Self-claim mode:** stop the controller for 10 minutes (twice the ack wait); with `taskhost_claims: true` the job
+  survives, without it the job is redelivered.
+* **Broker restart:** restart the worker's leaf `nats-server` mid-job; the claim survives and the job finishes.
+* ACT3 credentials cannot publish `submit.wtc.>` or read `evt.wtc.>`.
+* A worker with `wtc.deny: [video_gen]` never receives a WTC `video_gen` job.
+* Hub restart: no acknowledged submission lost.
+* Leaf link cut for 2 minutes: running jobs finish; events arrive after reconnect.
+
+### 21.3 Acceptance
+
+| # | Check | Requirement |
+| --- | --- | --- |
+| Q1 | After a one-time `just broker-install`, `just build` and `just run` work on B5090 (Windows), BMS (macOS), a Linux VM; without it, `just run` reports `broker_missing` and the fix | T1, T13 |
+| Q2 | ACT3 and WTC each submit 100 jobs; each sees only its own events | T2, T7 |
+| Q3 | Laptop with `local.mode: first` runs a local job ahead of a waiting ACT3 `p2` job | T3 |
+| Q4 | `GET /v1/capabilities` as WTC shows only WTC-allowed services, with free capacity | T4 |
+| Q5 | Turning `video_gen` off for ACT3 on BMS stops BMS pulling those jobs within one heartbeat | T5 |
+| Q6 | With 1,000 `p4` and a steady stream of `p1`, `p4` jobs still complete | T8 |
+| Q7 | A new service is added with a catalog file and a runner, no queue code change | T9, Goal 5 |
+| Q8 | `queue.Queue` has a second, in-memory implementation that passes the same contract tests | Goal 6 |
+| Q9 | On B5090, a real 30-minute Wan render survives three `just update` runs during it, and is delivered once | T14, Goal 7 |
+| Q10 | A render keeps its original scripts after `git pull` changes them mid-run; its `code_version` names the old commit | T15 |
+| Q11 | A TypeScript runner (`sys.self_test` in TypeScript) runs through a task host on all three operating systems | T15 |
+
+## 22. Build plan
+
+| Phase | Delivers | Done when |
+| --- | --- | --- |
+| **Q0. Decide** | Bryan confirms D-Q1 (NATS JetStream as a separate service) and the hub location (§24 Q2) | decision in `pm/Decisions.yaml` |
+| **Q1. Standalone queue with continuity** | `just broker-install`/`broker-config`, `queue/natsq` as a client, streams and KV from `streams.yaml`, envelope and events, local API submits; snapshots, task hosts and re-adoption (§9) from the start, because they shape every runner | a `sys.self_test` job runs through the queue on the laptop and survives a restart storm (§21.2) |
+| **Q2. Priority and policy** | bands, DRR, aging, callers, categories, models, admission | Q3, Q5, Q6 pass in standalone |
+| **Q3. Hub and workers** | hub role, leaf nodes, operator/accounts/users, signed envelopes, gateway | Q1, Q2 pass across a cloud hub and B5090 |
+| **Q4. ACT3 first type** | appsrv submits `act3.video_merge`; job rows updated from events | flash merges in production through the queue |
+| **Q5. WTC first types** | WTC submits transcription and transcode | WTC backlog drains on BMS and BMT with shares honored |
+| **Q6. Hardening** | three-node hub cluster (replicas 3), snapshots, alerts, credential rotation runbook | hub node loss causes no job loss |
+
+## 23. Decisions
+
+To be copied into `pm/Decisions.yaml`.
+
+| Id | Decision | Status |
+| --- | --- | --- |
+| D-Q1 | Task system: NATS JetStream, run as its own `nats-server` service (hub cluster, leaf node per worker), never embedded; Temporal second on points, RabbitMQ the practical fallback (§1, §3). Supersedes parent D-001 and this spec's v1 (embedded). | **proposed**, Bryan to confirm |
+| D-Q2 | Topology: one cloud hub, workers connect outbound as leaf nodes; standalone for development (§8.1) | proposed |
+| D-Q3 | Priority is ours: five bands plus DRR pull order and aging, not broker priority (§14) | proposed |
+| D-Q4 | Callers sign envelopes with Ed25519; public keys checked in (§15.3) | proposed |
+| D-Q5 | Owner fence checked three times: admission, pull filter, runner check (§11.3) | proposed |
+| D-Q6 | Exactly one result through a `job_state` fencing token (§16.3) | proposed |
+| D-Q7 | Vendor criteria v2 and weights as in §2 (continuity 16, external broker 12, security 12, TypeScript 8), re-scored when a trigger in §3.3 fires | proposed |
+| D-Q8 | Three layers on three clocks: broker (rare, deliberate), controller (every pull), task host (never during its job) (§9.1) | proposed |
+| D-Q9 | Every job runs in a detached task host from a frozen per-commit code snapshot; a restarted controller re-adopts running jobs from `run.json` (§9.2 to §9.4) | proposed |
+| D-Q10 | Runners may be TypeScript (bundled into the snapshot, pinned Node) as well as Python and Go; all follow the run directory contract (§9.3) | proposed |
+
+## 24. Open questions for Bryan
+
+1. **Q1. "Wispr Flow" in the dictation:** this spec reads it as We The Citizens. If you meant a separate caller (for
+   example a voice pipeline), it is one more entry in `data/queue/callers.yaml`.
+2. **Q2. Where the hub runs:** a small cloud VM (recommended; ACT3 and WTC are in the cloud) or one of the home
+   machines with a tunnel? Which provider and DNS name (`queue.act3ai.com`)?
+3. **Q3. Local priority defaults:** `first` on the laptop and BMT, `share` on B5090 and BPC, `idle_only` on cloud
+   boxes. Correct?
+4. **Q4. Caller ceilings:** may WTC use `p0`, or is `p0` reserved for ACT3 users watching a render?
+5. **Q5. Vendor API jobs** (`vendor_api` category): should our servers call Veo, Runway and the rest at all, or do those
+   stay in job_runner and appsrv? If ours, which machines may hold vendor keys?
+6. **Q6. Custom ComfyUI graphs from ACT3:** allowed (with a node allow-list) or only our checked-in graph templates?
+7. **Q7. Criteria weights:** do the v2 weights in §2.2 match your priorities? Task continuity 16, external broker 12
+   and security 12 are the biggest today; TypeScript is 8.
+8. **Q8. Self-claim mode by default?** Off by default keeps task hosts simple (no network). On means a controller can
+   stay down longer than 5 minutes without losing a claim. Recommended: off, turn on per machine if restarts ever
+   take that long.
+9. **Q9. Default runner language for new tasks:** TypeScript (your preference, one bundled file per snapshot) or
+   Python (where most AI tooling lives)? The spec allows both; this only sets the template `just new-runner` makes.
+10. **Q10. ACT3 job_runner today:** the same detached task host pattern would fix render teardown in job_runner on
+   Temporal before migration (activities finished by async completion). Worth doing there first, or wait for §20?
+
+## 25. Source code map and upgrade log
+
+### 25.1 Planned source map
+
+The broker seam (Queue and Delivery interfaces) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/queue/queue.go` — `Queue`, `Delivery`
+
+The NATS client adapter (streams, consumers, KV, resuming a saved claim) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/queue/natsq/` — `Open`, `natsQueue`, `natsQueue.Resume`
+
+Installing, configuring and version-checking the external `nats-server` service is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/brokerctl/` — `Install`, `WriteConfig`, `CheckVersion`
+
+Frozen per-commit code snapshots and TypeScript bundling are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/snapshot/` — `Ensure`, `GC`
+
+Detached task hosts (launch per OS, run directory files, self-claim) are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/taskhost/` — `Launch`, `Host.Run`
+
+Re-adopting running jobs after a controller restart is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/runs/` — `Registry.Readopt`
+
+Admission (signature, caller policy, categories, models, capability check) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/admission/admit.go` — `Admitter.Admit`
+
+Band mapping, DRR pull order and aging are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/priority/` — `BandFor`, `PullOrder`; `code/internal/promoter/` — `Promoter.Run`
+
+Envelope signing and verification are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/signing/ed25519.go` — `Sign`, `Verify`
+
+The HTTPS gateway and webhooks are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/gateway/` — `NewRouter`
+
+### 25.2 Upgrade log
+
+* 2026-10-27: spec written. Criteria v1 (§2), 15 contenders scored (§1). No code yet.
+* 2026-10-27 (revision): Bryan's second dictation (§4). Vendor ranking (§1), criteria (§2) and recommendation (§3)
+  moved to the top. Criteria v2: added C1 task continuity across code updates (16), C2 external long-lived broker (12)
+  and C4 TypeScript task hosts (8); dropped v1's one-binary fit (was 12); reweighted the rest (security 14 → 12,
+  cross-platform 6 → 2, network 10 → 6, others 10 → 8 or 6 → 4). All 15 re-scored. NATS stays first but as a
+  separate `nats-server` service instead of embedded (85.6 → 88.8); Temporal 79.8 → 86.4; RabbitMQ 78.4 → 80.8;
+  BullMQ rises 12th → 8th, River falls 6th → 10th, Asynq 9th → 14th. New §9: frozen code snapshots, detached task
+  hosts, re-adoption, update procedure. §8, §13.7, §16, §17, §18, §19, §21, §22, §23, §24 updated to match.

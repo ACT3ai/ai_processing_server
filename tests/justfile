@@ -1,0 +1,25 @@
+# Black-box tests for ai_processing_server. Run `just` in this directory to build (if needed) and run everything.
+# Each test class starts its own server on a free port with its own temp state dir (see README.md).
+
+# Build if needed, then run every suite
+default: all
+
+# Every suite: api compute render queue lifecycle stress
+all:
+    python3 run_tests.py
+
+# One or more suites by directory name, e.g. `just suite queue render`
+suite +names:
+    python3 run_tests.py {{names}}
+
+# Only tests whose id contains TEXT, e.g. `just only cancel`
+only text:
+    python3 run_tests.py -k {{text}}
+
+# Everything except the stress burst (quick check)
+quick:
+    python3 run_tests.py api compute render queue lifecycle
+
+# Show the last run's results
+results:
+    @cat Test_Results/latest.md

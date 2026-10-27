@@ -1,0 +1,874 @@
+---
+title: "ai_processing_server: security specification"
+description: "CTO security spec for the processing and render-queue servers: one Ed25519 key pair per server, the private key kept only on the machine, the public key published in servers/{Server}/ (checked in) or enrolled through the platform (not checked in), signed HTTPS requests with RFC 9421 HTTP Message Signatures, signed platform responses, authorization, rotation and revocation, transport, customer data, the local API, machine hardening, supply chain, audit, incident response and tests."
+---
+
+{/* Written 2026-10-27 by the CTO pass from Bryan's dictation of the same day. Companion to pm/apis.mdx (the wire
+contract) and pm/ai_processing_server.mdx (the whole server). This file supersedes ai_processing_server.mdx §14.1 and
+extends §16. No code exists yet. */}
+
+# ai_processing_server: security specification
+
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** specified, not built
+· **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
+· **Companions:** [apis.mdx](./apis.mdx) (every endpoint, header and signature on the wire) ·
+[ai_processing_server.mdx](./ai_processing_server.mdx) (the server as a whole) ·
+`~/BGit/all/film/pm/subp/render_queue/bryan_servers.mdx` §13 (fleet security today)
+
+## Summary
+
+* **Identity is a key pair.** Every server generates its own **Ed25519** key pair the first time it is built. The
+  **private key never leaves the machine**: it lives in `data/git_ignore/keys/` (mode `0600`, git-ignored). The
+  **public key** is published as a JWK Set in `servers/{Server}/keys/server_identity.jwks.json` when the server is
+  checked into this repo, or sent to the platform through a one-time **enrollment code** when it is not.
+* **Every request is signed, no shared secrets.** The server signs each HTTPS call with **RFC 9421 HTTP Message
+  Signatures** over the method, path, a `Content-Digest` of the body (RFC 9530), the server key, a timestamp and a
+  nonce. The platform holds only the public key, so nothing stored on the platform can be stolen and replayed to
+  impersonate a server.
+* **The platform signs back.** Lease responses (job envelopes), renewals (cancel) and heartbeat responses
+  (directives) are signed with the platform's key, which every server pins in `data/platforms/`. A proxy, a CDN or a
+  DNS hijack cannot hand a server a forged job.
+* **Outbound only.** Render servers sit behind home and office firewalls. They open no inbound port; they call out
+  over TLS 1.3 and receive work and commands in the responses (long-poll), see [apis.mdx](./apis.mdx) §2.
+* **Approval by a human.** A new key is `PENDING_APPROVAL` until an admin approves it, after comparing the key's
+  fingerprint with what the machine printed. A merged pull request that adds a key to `servers/` is the approval path
+  for checked-in servers.
+* **Open standards only:** TLS 1.3 (RFC 8446), RFC 9421, RFC 9530, JWK and JWK Set (RFC 7517), Ed25519 in JOSE
+  (RFC 8037), JWK thumbprints (RFC 7638), Problem Details (RFC 9457), PKCS #8 (RFC 5958), Ed25519 (RFC 8032).
+
+## 0. The request, verbatim in intent
+
+**Goal of this section:** pin what Bryan asked for, so every later section answers a numbered item.
+
+Bryan's dictation (2026-10-27), cleaned of transcription noise:
+
+> The goal here is to create the security. We like the conceptual idea of a public key and a private key generated.
+> We have the private key stored locally only. The public keys can be added to the server: for the computer it is
+> running on, it will have a directory under `servers/`, and it can add the key there. Sometimes the server we run
+> won't be checked into the main repo, but sometimes it will be.
+>
+> Think about how to design the APIs. What's the best API design between servers? Since the render server will be
+> behind a firewall, how do you go back and forth on calls? What's the best protocol for APIs? Ideally REST or
+> something like it, but how do you deal with a public key and a private key? The server will know the public key but
+> not the private key. Pick the best industry standard for that. We have to stay secure, the APIs have to work very
+> well, and we prefer open standards.
+
+Requirements derived from it (each answered later and tested in §19):
+
+* **S1. Key pair per server.** Generated on the machine. §3, §4.
+* **S2. Private key stored locally only.** Never in git, never sent, never logged. §4.
+* **S3. Public key in `servers/{Server}/`** when the server is checked in. §5.1.
+* **S4. Servers that are not checked in** can still join, safely. §5.2.
+* **S5. The platform knows only the public key.** No shared secret it could leak. §3, §7.
+* **S6. Works behind a firewall,** both directions of control. §11 here, [apis.mdx](./apis.mdx) §2.
+* **S7. Industry standard, open standards.** §3.
+* **S8. Stay secure:** threat model, authorization, rotation, revocation, data, audit. §2, §9 to §18.
+
+Vocabulary (same as [ai_processing_server.mdx](./ai_processing_server.mdx) §0): **server** (one machine running the
+binary, key such as `B5090`), **platform** (ACT3 appsrv or WTC backend), **owner** (the person who runs the machine),
+**admin** (a platform staff member who approves servers). New here:
+
+* **Server identity key:** the server's Ed25519 key pair. **Private key** on the machine only; **public key** on the
+  platform and, for checked-in servers, in `servers/`.
+* **kid:** the key id, the RFC 7638 SHA-256 JWK thumbprint of the public key, base64url. It names the key in every
+  signature.
+* **Fingerprint:** the human form of the kid, `SHA256:` plus the first 16 characters in groups of four
+  (`SHA256:q3Fv-8sLk-2mPw-Zt9c`), printed by the server and shown on the admin page for comparison.
+* **Platform signing key:** each platform's own key pair, used to sign responses. Its public JWK Set is pinned in this
+  repo under `data/platforms/`.
+
+## 1. Security goals and non-goals
+
+**Goal of this section:** what "secure" means here, in testable terms.
+
+### 1.1 Goals
+
+1. **Only approved servers get work.** A machine without an approved private key cannot lease a job, read an
+   envelope, see a presigned URL or report a result.
+2. **Only the real platform gives orders.** A server runs only jobs and directives signed by a platform key it pins.
+3. **A stolen platform database does not let anyone impersonate a server.** The platform stores public keys only.
+4. **A stolen or lost server is cut off in one heartbeat** (15 s) after an admin revokes its key.
+5. **Customer data stays on the job.** Inputs and outputs live in the job's work dir, are deleted after upload, never
+   go to the other platform, and never land on a site that does not allow customer data.
+6. **A job cannot attack the machine it runs on.** Envelopes are validated, inputs are never executed, URLs are
+   checked against an allow-list, and child processes get a clean environment.
+7. **Every security event is visible:** enrollments, approvals, rotations, revocations and every rejected request
+   are logged on both sides and shown on the admin Server page.
+
+### 1.2 Non-goals
+
+* No user logins on the server. People use the ACT3 or WTC web app; the server has no user accounts. The owner reaches
+  the local API on loopback only (§13).
+* No inbound internet API on the server, ever. If remote control of the local API is needed, it goes through the
+  platform (directives) or a private overlay network the owner sets up (§13.3), not an open port.
+* No custom cryptography. We compose standard primitives through standard libraries (§3.4).
+* Not a defense against a malicious **machine owner**. The owner controls the hardware and can read anything on it.
+  What we guarantee is that the owner's server cannot reach beyond its own leased jobs (§9).
+
+## 2. Threat model
+
+**Goal of this section:** what we protect, from whom, and where the trust boundaries are.
+
+### 2.1 Assets
+
+| Asset | Where | Why it matters |
+| --- | --- | --- |
+| Server private key | `data/git_ignore/keys/` on each machine | whoever holds it is that server |
+| Platform private signing key | the platform's secret manager | whoever holds it can command every server |
+| Customer inputs and outputs (images, prompts, scripts, video, voices) | job work dirs, presigned URLs, object storage | customer trust, contracts, privacy law |
+| Job envelopes and presigned URLs | in memory and in the journal | a URL is a bearer capability to one object |
+| Fleet facts (names, IPs, sites, hardware) | heartbeats, platform registry | staff-only; reveals homes and offices |
+| The GPUs themselves | each machine | free compute is a target (crypto mining, abuse) |
+
+### 2.2 Actors
+
+| Actor | Can | Wants |
+| --- | --- | --- |
+| Internet attacker | send any request to the platform; scan IPs | free GPU time, customer data, a foothold |
+| Network attacker (coffee shop Wi-Fi, ISP, hijacked DNS, compromised CDN edge) | read and change traffic it can see | forge jobs, steal URLs, replay requests |
+| Thief of a laptop or disk | read files at rest | the private key, cached customer data |
+| Malicious or buggy job (bad params, hostile input files, a compromised platform account) | put anything in an envelope | SSRF to `127.0.0.1:8188` or cloud metadata, code execution, path traversal |
+| Compromised dependency (Go module, ComfyUI custom node, model file) | run code in our process or a runner | everything on the machine |
+| Rogue server (someone who cloned the repo) | run the binary with its own key | get approved, receive customer jobs |
+| Insider with platform DB read access | read every row | impersonate servers (prevented: public keys only) |
+
+### 2.3 Trust boundaries
+
+```
+ ┌──────────────── machine (owner's trust) ────────────────┐        ┌──────── platform (ACT3 / WTC) ────────┐
+ │  private key (0600)                                     │        │  registry: kid, public JWK, status    │
+ │  ai_processing_server ── signs ──► TLS 1.3 ─────────────┼──(1)──►│  verify signature, nonce, lease       │
+ │      ▲ verifies platform signature ◄────────────────────┼──(2)───│  sign response with platform key      │
+ │      │                                                  │        │  (key in secret manager / KMS)        │
+ │  runners (clean env, own process group) ──(3)──► local  │        └───────────────┬───────────────────────┘
+ │  engines on 127.0.0.1 (ComfyUI, Ollama)                 │                        │ presigned URLs
+ │  work dir per job, deleted after upload                 │──(4) HTTPS PUT/GET ───►  S3 / object storage / IPFS
+ └─────────────────────────────────────────────────────────┘
+```
+
+Boundary (1): the platform trusts nothing from a server that is not signed by an approved key, and nothing beyond that
+server's own leases. Boundary (2): the server trusts nothing from the network that is not signed by a pinned platform
+key. Boundary (3): runners and local engines are less trusted than the server process; they get no keys and no
+tokens. Boundary (4): storage is reached only through short-lived presigned URLs scoped to one object.
+
+## 3. The decision: how a key pair authenticates an API
+
+**Goal of this section:** pick the industry standard for "the client holds the private key, the server knows only the
+public key", with the reasons (S5, S7).
+
+### 3.1 The options we weighed
+
+| Option | How it works | For | Against | Verdict |
+| --- | --- | --- | --- | --- |
+| **A. RFC 9421 HTTP Message Signatures** (Ed25519) with RFC 9530 `Content-Digest` | each request carries `Signature-Input` and `Signature` headers over the method, authority, path, query, body digest, time and nonce | the IETF standard (2024) for exactly this; signs every request including its body; survives TLS-terminating proxies and CDNs; no token server; no bearer secret to leak; same mechanism signs responses; raw public keys, no CA | newer than JWT, fewer libraries (Go: `github.com/yaronf/httpsign`; Node: `http-message-signatures`); canonicalization must be tested against the RFC's test vectors | **chosen** |
+| B. Mutual TLS with client certificates | the server presents a certificate during the TLS handshake | very strong, standard, widely understood | breaks at every TLS-terminating proxy (Cloudflare, AWS ALB) unless forwarded as a header, which the backend must then trust; needs a CA and certificate lifecycle on Windows and macOS; does not sign the body end to end | rejected for the platform API; allowed later for server-to-server LAN links (§11.4) |
+| C. OAuth 2.0 client credentials with `private_key_jwt` (RFC 7523) plus DPoP (RFC 9449) | server signs a JWT assertion, exchanges it for a short access token, then proves possession on each call with a DPoP JWT | very common in identity products; OpenAuthFederated (our OIDC library) can issue such tokens | two moving parts (token endpoint plus per-request proof); bearer tokens appear in more places; DPoP does not cover the request body | **fallback** if a platform's gateway can only accept bearer tokens |
+| D. Static bearer token per server (today's design, bryan_servers.mdx §13 and ai_processing_server.mdx §14.1) | a random secret in a credentials file, hashed on the platform | simplest | it is a shared secret: it sits on disk, travels on every request, can be copied from a log or a proxy, and gives no body integrity or replay protection | **replaced** by A |
+| E. SSH certificate or SSH signatures (`ssh-keygen -Y sign`) | sign payloads with an SSH key | familiar key format | not an HTTP standard; no request canonicalization; every platform would invent its own wire format | rejected |
+| F. Signed JWT per request (a self-signed JWS as `Authorization: Bearer`) | the server mints a 60-second JWT signed by its key | simple, many libraries | the JWT does not cover the method, path or body unless we add custom claims (a homemade RFC 9421); replayable within its lifetime | rejected; A is the standardized form of this idea |
+
+### 3.2 The choice
+
+* **Request authentication:** RFC 9421 HTTP Message Signatures, algorithm **`ed25519`**, with an RFC 9530
+  `Content-Digest: sha-256=` header on every request that has a body. The exact profile (covered components,
+  parameters, the tag) is in [apis.mdx](./apis.mdx) §5.
+* **Response authentication:** the platform signs every response that carries a job, a directive or a cancel, with
+  RFC 9421 over the status, the body digest **and the request's own signature** (the `;req` component), so a response
+  cannot be replayed to a different request.
+* **Key format:** public keys as JWK Sets (RFC 7517, `"kty":"OKP","crv":"Ed25519"` per RFC 8037); private keys as
+  PKCS #8 PEM (RFC 5958). The kid is the RFC 7638 thumbprint, so a kid cannot be chosen to collide with another key.
+* **Transport:** TLS 1.3 to the platform, always (§11).
+* **Algorithm agility, on purpose and only this much:** the profile allows exactly two algorithms. `ed25519`
+  (default, file key) and `ecdsa-p256-sha256` (for keys held in hardware that cannot do Ed25519: Apple Secure
+  Enclave, TPM 2.0, some cloud KMS). The platform rejects every other `alg`. No `hmac-*`, no RSA, no `none`.
+
+### 3.3 Why this is the right shape for a render fleet
+
+* **Firewalls:** signatures ride inside ordinary outbound HTTPS, so a home or office NAT, Cloudflare and AWS ALB all
+  pass them untouched. mTLS would not survive the proxy.
+* **Big bodies:** heartbeats and completion reports carry kilobytes of JSON. `Content-Digest` binds the body to the
+  signature, so even a proxy that terminates TLS cannot change a result or a progress report.
+* **No secret on the platform:** the registry row holds a public key. A database dump, a backup leak or a curious
+  insider cannot become a server.
+* **Two platforms, one key:** the same public key is registered with ACT3 and with WTC separately. Each approves on
+  its own; revoking at one does not affect the other.
+
+### 3.4 Libraries
+
+| Side | Library | Use |
+| --- | --- | --- |
+| Server (Go) | `crypto/ed25519`, `crypto/ecdsa`, `crypto/x509` (PKCS #8), `crypto/rand`, `crypto/sha256` | keys and digests: standard library only |
+| Server (Go) | `github.com/yaronf/httpsign` (RFC 9421, includes `Content-Digest`) | sign requests, verify responses. If it falls behind, we keep a small in-repo implementation tested against RFC 9421 Appendix B vectors |
+| Server (Go) | `github.com/go-jose/go-jose/v4` | read and write JWK and JWK Set, compute RFC 7638 thumbprints |
+| ACT3 appsrv (NestJS) | `http-message-signatures` (npm), Node `crypto` | verify requests in a `ProcessingSignatureGuard`, sign responses |
+| WTC backend (Go) | the same Go packages as the server, imported from a shared module | middleware `processing.VerifySignature` |
+
+Each new module gets a line in `pm/Decisions.yaml` with the reason (ai_processing_server.mdx §3.3).
+
+## 4. Key generation and local storage (the private key)
+
+**Goal of this section:** how the private key is made, where it lives, and how it is kept from ever leaving (S1, S2).
+
+### 4.1 When the key is made
+
+* `just build` runs `./ai_processing_server init` (ai_processing_server.mdx §6.1). `init` now also runs **`keys
+  init`**:
+  * **No key in `data/git_ignore/keys/`:** generate one with `crypto/rand`, write it atomically (temp file in the
+    same directory, `fsync`, rename) with mode `0600` in a directory with mode `0700`, then write the public JWK Set
+    (§5) and print the fingerprint.
+  * **A key exists:** **do not touch it.** Validate that it parses, that the public key derived from it matches the
+    published `server_identity.jwks.json` (when present), and print the fingerprint. The same never-overwrite rule as
+    `this_server.yaml`.
+* Nothing else in the binary creates, rewrites or deletes a private key, except the explicit `keys rotate` and
+  `keys destroy` commands (§10). A unit test enforces it.
+
+### 4.2 Where it lives
+
+```
+data/git_ignore/keys/                       # 0700, git-ignored (/data/git_ignore/ in .gitignore)
+├── server_identity.ed25519.pem             # 0600, PKCS #8 PEM, the PRIVATE key. Never leaves this machine.
+├── server_identity.jwks.json               # 0644, the PUBLIC JWK Set (a copy, for servers not checked in)
+├── server_identity.next.ed25519.pem        # 0600, only during a rotation (§10.1)
+└── platform_overrides/                     # nothing secret; reserved for future per-platform key choices
+```
+
+* **Path override:** `security.key_dir` in `this_server.yaml`, for a machine that keeps keys on an encrypted volume.
+  Default `data/git_ignore/keys/`.
+* **Windows:** POSIX modes do not exist; `keys init` sets an ACL that grants access to the current user and SYSTEM
+  only, removes inherited entries, and verifies it by reading the ACL back. A key file readable by `Users` or
+  `Everyone` makes `run` refuse to start.
+* **macOS and Linux:** `run` refuses to start if the key file is readable by group or others, or not owned by the
+  user running the server (the same rule OpenSSH applies to `~/.ssh/id_*`).
+
+### 4.3 Hardware-backed keys (phase 2, optional per machine)
+
+* `security.key_store: file` (default) · `macos_keychain` · `secure_enclave` · `windows_cng` · `tpm`.
+* Secure Enclave and TPM 2.0 do not support Ed25519 for general signing; those stores use **ECDSA P-256**
+  (`ecdsa-p256-sha256` in RFC 9421), which the profile allows (§3.2). The key is generated inside the hardware and can
+  never be exported, so a copied disk image is useless.
+* Laptops (Bryan_Laptop) are the first candidates: they are the machines most likely to be lost.
+
+### 4.4 Rules that keep the private key local
+
+1. `/data/git_ignore/` is in `.gitignore` (added 2026-10-27), plus belt-and-braces patterns `*.key`,
+   `*.private.pem`, `*.private.jwk`, `*_private.jwk`.
+2. A CI check (and `just test`) fails if any tracked file contains `-----BEGIN PRIVATE KEY-----`,
+   `-----BEGIN OPENSSH PRIVATE KEY-----`, or a JWK with a `"d"` member.
+3. The key is read once at boot into memory. It is never passed to a runner, never put in an environment variable,
+   never written to a log, a heartbeat, a crash dump, the journal or the local API.
+4. `keys show` prints the public JWK and the fingerprint only. There is no command that prints the private key.
+5. Backups: the private key is **not** backed up. A lost key is replaced by rotation and re-approval (§10.3), which is
+   cheaper and safer than a key in a backup set. Machine backup tools should exclude `data/git_ignore/keys/`.
+6. One key per server, per checkout. Copying `data/git_ignore/` to another machine is caught by the
+   `server.bound_to` check (ai_processing_server.mdx §6.5) and, on the platform side, by one kid heartbeating from
+   two public IPs at once (§17.2).
+
+## 5. Publishing the public key
+
+**Goal of this section:** how a platform learns a server's public key, both for servers checked into this repo and for
+servers that are not (S3, S4).
+
+### 5.1 Servers checked into this repo: `servers/{Server}/`
+
+The repo already has one directory per known machine (`servers/Bryan_5090/`, `servers/Bryan_Laptop/`,
+`servers/Bryan_Mac_Studio/`), each holding a `server.yaml`. Keys go beside it:
+
+```
+servers/Bryan_5090/
+├── server.yaml                         # identity and capabilities (exists)
+└── keys/
+    ├── server_identity.jwks.json       # PUBLIC keys only. Checked in.
+    └── README.md                       # optional: who approved, when, fingerprint (human record)
+```
+
+`server_identity.jwks.json`:
+
+```json
+{
+  "keys": [
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+      "kid": "q3Fv8sLk2mPwZt9cR1aYJ0uXhN4eB6dKs7TgVfWmQpE",
+      "use": "sig",
+      "alg": "EdDSA",
+      "act3:server_key": "B5090",
+      "act3:created_at": "2026-10-27T09:14:03-07:00",
+      "act3:status": "current"
+    }
+  ]
+}
+```
+
+* A JWK **Set**, so a rotation can list the current and the next key side by side (§10.1). `act3:status` is
+  `current`, `next` or `retired`.
+* How `keys init` knows the directory: `this_server.yaml` gets `server.servers_dir: Bryan_5090` at creation, filled
+  from the matching `servers/*/server.yaml` (`server.name` equal to the directory name, or the hostname match in
+  `data/servers/known_servers.yaml`). If `servers/{dir}/` exists, the public JWK Set is written there; otherwise only
+  to `data/git_ignore/keys/` and the server is treated as not checked in (§5.2).
+* **The owner commits and opens a pull request** with the new `keys/server_identity.jwks.json`. The private key is
+  never in that directory, by construction and by the CI check in §4.4.
+* **Approval through git:** merging that PR to `main` is the human approval for a checked-in server. A GitHub Action
+  on `main` (`.github/workflows/register_server_keys.yml`, to write in phase 3) calls each platform's admin
+  registration endpoint ([apis.mdx](./apis.mdx) §7.10) with the platform's deploy credential, registering every
+  changed key as `APPROVED` and every `retired` key as revoked. Branch protection on `main` (review required, no force
+  push) is what makes this safe; it must be on before the Action is enabled.
+* **Git is the record, the platform is the runtime truth.** The platform never reads the repo at request time; it
+  verifies against its own registry. A key in `servers/` that the Action has not yet registered does nothing.
+
+### 5.2 Servers that are not checked in: enrollment
+
+For machines we do not want in the main repo (a partner's GPU box, a Nepal office machine, a short-lived cloud
+instance, a staff member's personal machine), the public key goes straight to the platform:
+
+1. **Admin** opens the platform's admin Fleet page, clicks **Add server**, enters the server key (`NPL1`), display
+   name, family and site, and gets a **one-time enrollment code** (128 bits, shown as `ENR-7KQ2-…`, valid 24 hours,
+   single use, stored on the platform only as a SHA-256 hash).
+2. **Owner** runs `./ai_processing_server enroll --platform act3 --code ENR-7KQ2-…`. The server sends
+   `POST /processing/v1/enroll` ([apis.mdx](./apis.mdx) §7.1) with its public JWK, identity, hardware, and the code,
+   **signed with the new private key**. That signature is the proof of possession: the platform learns the key from
+   a request the key itself signed.
+3. The platform checks the code (hash match, not expired, not used, bound to that server key) and stores the key as
+   `PENDING_APPROVAL`. The code is burned whether the request succeeds or fails after the code check.
+4. **Owner** reads the fingerprint printed by `enroll` to the admin through a separate channel (phone, Slack, in
+   person). **Admin** compares it with the fingerprint on the Server page and clicks **Approve**. Only then does the
+   server receive work.
+5. An enrollment code entered for the wrong server key, five failed codes from one IP in an hour, or a code used after
+   expiry are logged as security events (§17).
+
+Self-registration without a code (a server simply calling `register` with a new key) is allowed only to create a
+`PENDING_APPROVAL` row with a red **unverified** badge; it never becomes `APPROVED` without the fingerprint
+comparison. This keeps "someone cloned the repo and ran it" visible and harmless.
+
+### 5.3 Which path to use
+
+| Machine | Path | Why |
+| --- | --- | --- |
+| The Bryan 4 (B5090, BPC, BMT, BMS) and Bryan_Laptop | §5.1, checked in | we want their hardware and keys reviewed in git |
+| Office machines we own (Nepal) | §5.1 if staff may see the hardware facts, else §5.2 | either works |
+| Partner or contractor machines | §5.2 | their facts stay out of our repo |
+| Cloud and autoscaled instances | §5.2 with a **fleet enrollment code** (§5.4) | instances are born and die too fast for PRs |
+
+### 5.4 Cloud instances (phase 6)
+
+Autoscaled cloud servers cannot wait for a human. For them the admin issues a **fleet enrollment code** scoped to one
+family (`cloud`), a site, an expiry (at most 30 days) and a maximum count. Instances enroll with it and are approved
+automatically, but only for services the admin listed, and they are marked `ephemeral` so they are revoked
+automatically one hour after their last heartbeat. Where the cloud offers instance identity documents (AWS IMDSv2
+signed identity document, GCP instance identity token), the enroll request also carries that document and the
+platform verifies it, binding the key to a real instance in our account.
+
+## 6. The platform's trust store and approval
+
+**Goal of this section:** what the platform stores and how a key's status changes.
+
+### 6.1 The registry
+
+ACT3 extends `render_server` (bryan_servers.mdx §6.1) with a child table; WTC adds the same shape.
+
+| Table / column | Type | Notes |
+| --- | --- | --- |
+| `processing_server_key.kid` | text, primary key | RFC 7638 thumbprint |
+| `server_key` | text, FK to `render_server.key` | one server can have several keys during rotation |
+| `public_jwk` | jsonb | the public key exactly as received; never a private member (`d`) — the platform rejects a JWK with `d` |
+| `alg` | text | `ed25519` or `ecdsa-p256-sha256` |
+| `status` | enum | `PENDING_APPROVAL` · `APPROVED` · `NEXT` · `RETIRED` · `REVOKED` |
+| `source` | enum | `git` (§5.1) · `enrollment_code` (§5.2) · `fleet_code` (§5.4) · `self_registered` |
+| `created_at`, `approved_at`, `approved_by`, `revoked_at`, `revoked_by`, `revoke_reason` | | audit |
+| `last_used_at`, `last_ip` | | updated at most once a minute |
+
+### 6.2 Status rules
+
+```
+            enroll / git / self-register
+                      │
+                      ▼
+             PENDING_APPROVAL ──admin rejects──► REVOKED
+                      │ admin approves (fingerprint compared) or git merge
+                      ▼
+ rotation starts ─► APPROVED ◄── promote ── NEXT (signed by the current key, §10.1)
+                      │
+                      ├── rotation completes ──► RETIRED (refused after a 24 h grace)
+                      └── admin revokes / compromise ──► REVOKED (refused immediately)
+```
+
+* A request signed by a `PENDING_APPROVAL` key may call only `register`, `heartbeat` and `GET /time`. Every other
+  endpoint answers `403 server_not_approved`. The heartbeat makes a pending server visible on the Fleet page.
+* `REVOKED` is final. A revoked kid is never approved again; the machine needs a new key.
+* Only admins with the `fleet.approve` permission approve, reject or revoke, and every action is audited with who,
+  when and why.
+
+## 7. Request authentication (server → platform)
+
+**Goal of this section:** how the platform knows a request came from an approved server, in short. The byte-level
+profile is [apis.mdx](./apis.mdx) §5.
+
+1. The server builds the request, computes `Content-Digest: sha-256=:<base64>:` over the exact body bytes, and adds
+   `X-Server-Key: B5090`.
+2. It signs with RFC 9421 over `"@method" "@authority" "@path" "@query" "content-digest" "content-type"
+   "x-server-key"` (plus `"idempotency-key"` when present), with parameters `created`, `expires` (created + 60 s),
+   a 128-bit random `nonce`, `keyid` (the kid), `alg` and `tag="act3-processing-v1"`.
+3. The platform verifies, in this order, and stops at the first failure: the `tag` and `alg` are allowed; `created`
+   is within ±60 s of its clock and `expires` is in the future; the kid exists and is `APPROVED` (or `NEXT`, or
+   `RETIRED` inside its grace period); the kid belongs to the `X-Server-Key`; the signature is valid; the
+   `Content-Digest` matches the body it received; the `(kid, nonce)` pair has not been seen in the last 5 minutes
+   (then it records it); `@authority` equals the platform's configured **public** hostname (not the internal host a
+   proxy rewrote to).
+4. Only after all of that does it parse the JSON body.
+
+Clock skew is the most likely operational failure. The server checks the platform's clock at boot and every hour
+(`GET /processing/v1/time`, [apis.mdx](./apis.mdx) §7.11) and goes `DEGRADED` with reason "clock off by 74 s; fix
+NTP" when the skew passes 30 s, before the platform starts refusing it.
+
+## 8. Platform authentication (platform → server)
+
+**Goal of this section:** how a server knows a job, a cancel or a directive really came from ACT3 or WTC.
+
+### 8.1 Pinned platform keys
+
+```
+data/platforms/                          # checked in: public keys and public settings only
+├── act3.yaml                            # base_url, public authority, allowed storage hosts, key file
+├── act3.jwks.json                       # ACT3's public signing keys (current + next)
+├── wtc.yaml
+└── wtc.jwks.json
+```
+
+`data/platforms/act3.yaml`:
+
+```yaml
+schema_version: 1
+platform: act3
+base_url: "https://api.act3ai.com/processing/v1"
+authority: "api.act3ai.com"             # the @authority the server signs and expects back
+jwks_file: "act3.jwks.json"             # pinned; the server never fetches keys it then trusts on its own
+allowed_storage_hosts:                  # input and output URLs must be https and on one of these (§12.3)
+  - "act3-prod-media.s3.us-west-2.amazonaws.com"
+  - "*.r2.cloudflarestorage.com"
+allowed_ipfs_gateways: ["ipfs.io", "dweb.link"]
+```
+
+The values above are placeholders until appsrv's real hostnames are confirmed (§21 Q3). `this_server.yaml`
+`platforms.*` keeps only the switch, the share and the key choice; URLs come from `data/platforms/` so they are
+reviewed in git.
+
+### 8.2 What is signed
+
+* Every response from `lease`, `renew`, `heartbeat`, `upload-urls`, `complete` and `fail` is signed by the platform
+  over `"@status" "content-digest" "content-type"` and `"signature";req` (the server's own request signature), with
+  `created`, `keyid` and `tag="act3-processing-v1-resp"`.
+* The server verifies against `data/platforms/{platform}.jwks.json` before it reads the body. An unsigned or badly
+  signed response is discarded, logged as a security event, and treated as a network error (retry with backoff). It
+  is never acted on: no job is run, no cancel is obeyed, no directive is applied.
+* Binding the response to the request's signature means an attacker cannot replay yesterday's lease response (with
+  yesterday's job) in answer to today's lease request.
+
+### 8.3 Rotating a platform key
+
+* The platform publishes the next key in its JWK Set as `next` at least 14 days before it starts signing with it. The
+  change to `data/platforms/act3.jwks.json` is a reviewed PR, and servers pick it up on `git pull` + `just build`.
+* A server that sees a response signed with an unknown kid logs "ACT3 is signing with a key this build does not pin;
+  update the repo" and goes `DEGRADED` for that platform. It does **not** fetch the key from the network: that would
+  let whoever controls the network choose the key.
+* Optional convenience (phase 4): the platform serves `GET /processing/v1/jwks`, and the server accepts a new key
+  from it only if that JWK Set is itself signed by a key the server already pins. This is how a fleet rotates without
+  a git pull on every machine.
+
+### 8.4 Where the platform's private key lives
+
+In the platform's secret manager, never in a repo or an environment file in git. Preferred: a cloud KMS that signs
+without releasing the key (AWS KMS supports ECDSA P-256 everywhere; if Ed25519 is not available in the platform's KMS
+region, the platform key uses `ecdsa-p256-sha256`, which the profile allows). Access to sign is limited to the
+processing API service role, and every KMS signing call is in the cloud audit log.
+
+## 9. Authorization (what an authenticated server may do)
+
+**Goal of this section:** authentication says who; authorization says what. A valid signature is necessary, not
+sufficient.
+
+| Rule | Enforced by |
+| --- | --- |
+| A server acts only as itself: `X-Server-Key` must equal the key's `server_key` | platform guard |
+| A server touches only jobs it holds: every `/jobs/{id}/…` call must carry the `lease_id` of a live lease owned by this server | platform, in the same transaction as the update |
+| A server leases only services the platform approved for it (admin list on the Server page), intersected with what it offers | platform `lease` |
+| A server leases customer jobs only if `customerWork` is true for it **and** its site allows customer data | platform `lease` (and the server again, §12.1) |
+| A server sees only its platform's data: ACT3 never sends WTC anything about ACT3 jobs, and the reverse | both platforms (ai_processing_server.mdx §14.3) |
+| Directives from ACT3 apply only to `act3.*` services; from WTC only to `wtc.*` | the server's scheduler |
+| A platform can never turn on a service the owner turned off in `this_server.yaml` | the server (the owner's fence, ai_processing_server.mdx §10.1) |
+| Rate limits per kid: heartbeat 1 per 10 s, lease 1 long-poll in flight per platform, events 10 per minute | platform, `429` with `Retry-After` |
+| Presigned URLs are scoped to one object, one method, and expire (downloads 15 min, uploads 60 min) | platform when it issues them |
+
+## 10. Rotation, revocation and compromise
+
+**Goal of this section:** keys change; this is how without downtime, and how fast when it is an emergency.
+
+### 10.1 Planned rotation (every 12 months, or on demand)
+
+1. `./ai_processing_server keys rotate` generates `server_identity.next.ed25519.pem` and adds it to the JWK Set as
+   `next`.
+2. The server calls `POST /processing/v1/keys/rotate` ([apis.mdx](./apis.mdx) §7.9) with the new public JWK,
+   **signed by the current key**, and inside the body a second signature over the same payload by the **new** key
+   (proof of possession of both). The platform stores it as `NEXT`. No human approval is needed: the current key
+   vouches for the next.
+3. For checked-in servers the owner commits the updated `servers/{Server}/keys/server_identity.jwks.json`.
+4. The server switches to signing with the new key once the platform answers `NEXT` accepted. On the first verified
+   request with the new kid, the platform promotes it to `APPROVED` and marks the old one `RETIRED`, accepted for
+   24 hours (in-flight requests) and then refused.
+5. The old private key file is overwritten and deleted. `keys rotate` prints both fingerprints.
+
+The platform shows a key age on the Server page and warns at 11 months.
+
+### 10.2 Revocation
+
+* An admin clicks **Revoke key** on the Server page (or a retired key passes its grace). The platform refuses the kid
+  at once. The server's next heartbeat (at most 15 s later) gets `401 key_revoked`; the server stops leasing, lets
+  nothing new start, cancels running jobs as `infra` "key revoked", deletes their work dirs, and logs an ERROR.
+* Leases held by a revoked server are expired immediately and re-queued on other servers. Outputs it tries to report
+  afterwards are refused.
+* Presigned URLs already issued to it cannot be recalled; they are short-lived (§9). For a confirmed compromise the
+  platform also rotates the storage credentials that signed those URLs if the exposure window matters.
+
+### 10.3 Lost, stolen or compromised machine: the playbook
+
+1. **Revoke** the key on every platform the server was enrolled with (ACT3 and WTC). Time to cut-off: one
+   heartbeat.
+2. **Expire** its leases (automatic on revoke) and check its last 7 days of jobs on the Server page.
+3. **Assess** customer data exposure: which jobs had `customer_data: true` and whether their work dirs were still on
+   disk (journal, sweeper logs). Disk encryption (§15) decides whether a stolen disk is an exposure.
+4. **Rotate** anything else that machine held: the local API token, any engine API keys in `~/.credentials/` on that
+   machine.
+5. **Re-enroll** the replacement machine with a new key (§5). Never re-approve the old kid.
+6. **Write** the incident into `pm/security_incidents/YYYY_MM_DD_{server}.md` (what happened, timeline, exposure,
+   fixes).
+
+### 10.4 Lost key, machine fine
+
+Delete `data/git_ignore/keys/`, run `just build` (makes a new key), and enroll or PR again. The admin revokes the old
+kid. There is no recovery path for a private key by design.
+
+## 11. Transport security
+
+**Goal of this section:** the network layer under the signatures (S6).
+
+### 11.1 Outbound only
+
+* The server opens **no listening socket on any interface except loopback** (the local API, §13). The OS firewall on
+  every server should block all unsolicited inbound traffic (§15).
+* Everything the platform needs to tell a server arrives in the response to a request the server made: the long-poll
+  `lease`, the 20 s `renew`, the 15 s `heartbeat`. Cancel reaches a running job within 20 s; a new job reaches an idle
+  server within the time it takes to answer the open long-poll (usually under a second). [apis.mdx](./apis.mdx) §2
+  explains why this beats webhooks, tunnels and VPNs for this fleet.
+
+### 11.2 TLS
+
+* TLS 1.3 required to the platform (`tls.Config{MinVersion: tls.VersionTLS13}`). If a platform edge cannot do 1.3,
+  1.2 with AEAD suites only is the documented exception, recorded in `Decisions.yaml`.
+* Certificates verified against the OS trust store, always. `InsecureSkipVerify` is forbidden; a `go vet`-style lint
+  in `just test` fails the build if it appears outside `_test.go`.
+* No certificate pinning: CDNs rotate certificates and intermediates, and pinning causes outages. The pinned platform
+  **signing key** (§8) gives end-to-end authenticity instead, independent of who holds the TLS certificate.
+* HTTPS only for every URL the server fetches or uploads to: the platform, presigned storage URLs, model downloads.
+  `http://` is refused except for loopback engines (ComfyUI at `127.0.0.1:8188`).
+* HTTP/2 is used where the platform offers it (Go does this by default); nothing depends on it.
+
+### 11.3 DNS and proxies
+
+* Signatures cover `@authority`, and the platform compares it with its configured public hostname, so a request
+  signed for `api.act3ai.com` cannot be replayed to a staging host, and the reverse.
+* The platform's processing endpoints must not be cached by the CDN (`Cache-Control: no-store` on every response,
+  and a CDN rule that bypasses cache for `/processing/*`).
+
+### 11.4 Server-to-server traffic
+
+Not in v1: servers never talk to each other. Files move through object storage via presigned URLs, and coordination
+goes through the platform. If a later phase adds LAN transfers (for example BMS fetching a 40 GB model from B5090 on
+the office network), those links use **mutual TLS with certificates issued from the servers' identity keys** by a
+small fleet CA the platform runs, authorized by the platform per transfer. That design is deferred until there is a
+measured need.
+
+## 12. Job and customer-data security
+
+**Goal of this section:** a job is untrusted input even when it is correctly signed: a platform bug or a compromised
+platform account must not become an attack on the machine.
+
+### 12.1 Before any download
+
+* Envelope validated against `data/schemas/job_envelope.schema.json` and the service's `params_schema`
+  (ai_processing_server.mdx §8.2). Unknown top-level fields are rejected, not ignored.
+* Customer-data gate: an envelope with `data_rules.customer_data: true` on a site with `customer_data_allowed: false`,
+  or a server profile with `customer_work: false`, is refused with `invalid_input` "site does not allow customer
+  data" before anything is fetched. The platform should never send it (§9); the server checks anyway.
+
+### 12.2 Paths
+
+* Output and input names are matched against `^[a-z0-9][a-z0-9_.-]{0,63}$`. All file paths are built with
+  `filepath.Join(workDir, name)` and then checked to still be inside `workDir` after `filepath.Clean` and symlink
+  resolution. No `..`, no absolute paths, no drive letters, no symlinks followed out of the work dir.
+* Archives (zip, tar) in inputs are extracted with the same check per entry and a total size cap (zip-bomb guard).
+
+### 12.3 URLs (SSRF guard)
+
+Every URL in an envelope must:
+
+1. be `https://`;
+2. have a host in `allowed_storage_hosts` or `allowed_ipfs_gateways` of that platform (§8.1);
+3. resolve only to public addresses: the dialer refuses loopback (`127.0.0.0/8`, `::1`), private (RFC 1918, `fc00::/7`),
+   link-local (`169.254.0.0/16`, `fe80::/10`, which includes cloud metadata at `169.254.169.254`), CGNAT
+   (`100.64.0.0/10`) and multicast. The check runs on the resolved IP at dial time (a custom `net.Dialer.Control`),
+   so DNS rebinding cannot bypass it;
+4. follow at most 3 redirects, each re-checked against the same rules.
+
+This stops an envelope from pointing the server at ComfyUI's unauthenticated API on `127.0.0.1:8188`, at the home
+router's admin page, or at a cloud metadata endpoint.
+
+### 12.4 Runners
+
+* Inputs are data, never code. No runner executes a file from an envelope. Python, Blender and ComfyUI workflows run
+  are the ones checked into this repo (or installed engines), selected by name; a workflow graph in params is
+  validated against an allow-list of node types per service.
+* **Model files:** downloaded only from catalog entries with a sha256 (ai_processing_server.mdx §8.3), verified
+  before use. `.safetensors` and GGUF preferred; pickle formats (`.ckpt`, `.pt`, `.bin` with pickle) are refused unless
+  the catalog entry sets `allow_pickle: true` with a reviewer's name, because loading a pickle runs code.
+* **ComfyUI custom nodes** are code. Only nodes pinned by git commit in `data/engines/comfyui_nodes.yaml` (to write)
+  may be installed on a server that takes customer jobs; the server reports any other node it finds as drift.
+* Children get a cleaned environment (PATH, HOME, locale, GPU pin, and the variables the service catalog lists). No
+  platform URL, key path or token is passed down.
+* On shared machines (an owner's daily workstation), the recommended setup runs the server as a dedicated OS user
+  (`act3svc`) so runner processes cannot read the owner's home directory. Phase 4 adds an optional per-job sandbox
+  (macOS `sandbox-exec` profile, Windows AppContainer or job object limits, Linux namespaces through `bwrap`).
+
+### 12.5 After the job
+
+* Work dir deleted after `DONE`, `FAILED` or `CANCELLED` (ai_processing_server.mdx §9.6). Deletion failures are
+  logged as ERROR and retried by the sweeper.
+* Outputs uploaded with a checksum the storage enforces (S3 `x-amz-checksum-sha256`), so a corrupted or swapped file
+  is rejected by storage, not discovered later.
+* The per-job log is uploaded with redaction applied (§14).
+
+## 13. Local API security
+
+**Goal of this section:** the owner's control surface on `127.0.0.1:9440` (ai_processing_server.mdx §13).
+
+### 13.1 Default: loopback with a bearer token
+
+* Bound to `127.0.0.1` only. Every route except `GET /v1/health` requires `Authorization: Bearer <token>` from
+  `local_api.token_file` (32 random bytes, base64url, mode `0600`, created by `init`). Token compared in constant
+  time.
+* A bearer token is acceptable here, unlike for the platform API, because it never leaves the machine and anyone who
+  can read the token file already controls the user account.
+* **Browser attacks:** any web page the owner visits can send requests to `127.0.0.1`. So the local API refuses any
+  request with an `Origin` header that is not exactly `http://127.0.0.1:9440` or `http://localhost:9440`, refuses a
+  `Host` header other than those (DNS-rebinding guard), never answers CORS preflight with permission, and requires
+  `Content-Type: application/json` on every `POST` (which forces a preflight from browsers). The status page at `/`
+  uses a cookie set by `GET /login?token=…` with `SameSite=Strict; HttpOnly`.
+
+### 13.2 LAN binding
+
+Binding to a LAN address is deliberate (`local_api.listen: "192.168.50.20:9440"`), logs a WARN at every boot, and then
+requires the token on every route including `/` and `/metrics`. Because there is no TLS on the local API, LAN mode is
+allowed only on a wired office network the owner controls, and never on a laptop.
+
+### 13.3 Remote administration
+
+Not through an open port. Admins control servers through the platform (directives, [apis.mdx](./apis.mdx) §8). An
+owner who wants to reach a server's local API from elsewhere uses a private overlay network they control (Tailscale,
+WireGuard) with access limited to their own devices, documented per machine in `servers/{Server}/server.yaml`
+`constraints`.
+
+### 13.4 Direct mode
+
+`POST /v1/jobs` (direct jobs without a platform) is off by default (`local_api.allow_direct_jobs: false`). When on,
+direct jobs never receive customer data, never use a platform's presigned URLs, and write outputs only under
+`data/git_ignore/direct_out/`.
+
+## 14. Secrets handling and log redaction
+
+**Goal of this section:** nothing secret is ever written where it can leak.
+
+* **What counts as secret:** the private key, the local API token, enrollment codes, presigned URL query strings,
+  engine API keys, anything under `~/.credentials/` or `~/BGit/act3/act3ai-credentials/`.
+* `this_server.yaml` references secrets by path, never inline (ai_processing_server.mdx §6.5). With signed requests
+  there is no platform token at all: `platforms.*.credentials_file` is retired; the key is found through
+  `security.key_dir`.
+* The logger redacts any attribute whose key matches `token|secret|password|passwd|key|authorization|signature|cookie`
+  (except the public `kid`, `server_key` and `fingerprint`), any URL query parameter named `X-Amz-Signature`,
+  `X-Amz-Credential`, `sig`, `token` or `code`, and any value that looks like a PEM block or an enrollment code.
+* `Signature` and `Signature-Input` headers are never logged in full; logs carry the kid and the nonce only.
+* Crash output: the panic handler writes the stack, never the request bodies or the key material in memory. Core dumps
+  are disabled for the process (`setrlimit RLIMIT_CORE 0` on Unix).
+* Error messages sent to a platform are built from the redacted log tail (ai_processing_server.mdx §12.2).
+
+## 15. Machine hardening (what the owner must do)
+
+**Goal of this section:** the checklist that makes a machine fit to run customer jobs. The server checks what it can
+and reports the rest as drift in the heartbeat; the admin page shows a red line for each failure.
+
+| Check | macOS | Windows | Linux | Server checks it |
+| --- | --- | --- | --- | --- |
+| Full-disk encryption on | FileVault (`fdesetup status`) | BitLocker (`manage-bde -status`) | LUKS | yes; required for `customer_work: true` |
+| OS firewall on, inbound blocked | Application Firewall | Windows Defender Firewall | nftables / ufw | yes |
+| Automatic OS security updates on | Software Update | Windows Update | unattended-upgrades | best effort |
+| Server runs as a normal user, never root / Administrator | | | | yes; refuses to start as root or elevated |
+| Local engines (ComfyUI, Ollama, Kokoro) bound to `127.0.0.1` only | | | | yes; probes the LAN address and warns if the engine answers there |
+| Screen lock and a login password on machines in homes | | | | no (owner attests on the Server page) |
+| Clock synced by NTP | default | default | `chrony` / `systemd-timesyncd` | yes (§7) |
+
+Bryan_Laptop already reports FileVault on and SIP enabled (`data/git_ignore/this_server.yaml`). Its constraints (AC
+power only, low parallelism) are operational; for security it is the machine most likely to be lost, so it is the
+first candidate for a Secure Enclave key (§4.3) and should default to `customer_work: false`.
+
+## 16. Supply chain
+
+**Goal of this section:** the code that runs is the code we reviewed.
+
+* **Go modules:** `go.sum` committed; `GOFLAGS=-mod=readonly`; `GOPROXY` default with the checksum database on
+  (`GONOSUMCHECK` and `GONOSUMDB` never set). New modules need a `Decisions.yaml` line.
+* **Vulnerability scan:** `just test` runs `govulncheck ./...`; a known-exploitable vulnerability fails the build.
+* **Builds:** `-trimpath`, version stamp with the git SHA (ai_processing_server.mdx §3.2). The SHA is in every
+  heartbeat, so the platform can refuse servers running a commit older than a minimum it sets
+  (`426 upgrade_required`, [apis.mdx](./apis.mdx) §6).
+* **The repo:** branch protection on `main` (review required, no force push, no deletion) before the key-registration
+  Action is enabled (§5.1). Signed commits recommended for anyone who changes `servers/*/keys/` or
+  `data/platforms/*.jwks.json`; a CODEOWNERS rule requires CTO review for those paths.
+* **Engines and models:** pinned versions and sha256 in `data/` catalogs; ComfyUI custom nodes pinned by commit
+  (§12.4).
+
+## 17. Audit, monitoring and alerts
+
+**Goal of this section:** we see attacks and mistakes when they happen, not after.
+
+### 17.1 On the server
+
+Security events go to `~/_act3_logs/processing_server.err` with context `security`, one line each:
+
+`[2026-10-27T09:20:11-07:00] [WARN] [security] response signature invalid platform=act3 kid=… path=/lease action=discarded`
+
+Events: key created, key loaded (fingerprint), rotation started and finished, platform response unsigned or invalid,
+unknown platform kid, clock skew, envelope refused (with reason), SSRF block, path traversal block, local API auth
+failure, key file permission problem, revoked by platform. They are also sent in the next `events` batch to the
+platform ([apis.mdx](./apis.mdx) §7.8), except local API failures, which stay local.
+
+### 17.2 On the platform
+
+* Every verification failure logged with kid, server key, reason code, IP and path (never the signature bytes).
+* Alerts to the admin channel: 10 or more failures for one kid in 5 minutes; one kid heartbeating from two public IPs
+  within 2 minutes (a copied key); a pending self-registration; an enrollment code brute force (§5.2); a revoked kid
+  still calling after 1 hour; a server reporting `customer_work` with disk encryption off.
+* The Server page's security panel: current kid and fingerprint, key age, source (git or enrollment), approver, last
+  10 security events, hardening checklist (§15).
+
+## 18. Incident response
+
+**Goal of this section:** who does what in the first hour.
+
+| Situation | First action | Who |
+| --- | --- | --- |
+| Server lost, stolen or suspected compromised | revoke its key on every platform (§10.3) | admin, within 15 minutes of the report |
+| Private key committed to git by mistake | revoke the kid, rotate, then purge history and force-push only with the CTO's approval; treat as compromised regardless | CTO |
+| Platform signing key suspected exposed | publish a new key, ship `data/platforms/*.jwks.json` with the old key removed, every server `git pull` + `just build`; until then servers stop leasing from that platform | CTO + platform on-call |
+| Forged or unsigned responses seen by many servers | assume network attack on the platform edge; servers already refuse to act; investigate CDN / DNS | platform on-call |
+| A job tried SSRF or traversal | treat the platform account that created the job as suspect; preserve the envelope from the server's journal | platform security |
+
+Every incident gets a file in `pm/security_incidents/` (§10.3).
+
+## 19. Tests and acceptance
+
+**Goal of this section:** how we prove each S-requirement.
+
+### 19.1 Unit tests
+
+* `keys init` creates a key with mode `0600` (ACL on Windows) and never overwrites: run twice, the bytes and mtime are
+  unchanged (S1, S2).
+* No code path other than `keys init` / `keys rotate` / `keys destroy` opens the private key file for writing.
+* Signing and verifying with RFC 9421 Appendix B test vectors (Ed25519 and ECDSA P-256), and `Content-Digest` per
+  RFC 9530 examples.
+* Verification rejects: wrong alg, `hmac-sha256`, missing `created`, `created` 61 s old, `expires` past, replayed
+  nonce, kid of another server, a changed byte in the body, a changed path, `@authority` of staging, a JWK with `d`.
+* Response verification: unsigned, wrong key, signature not bound to this request (`;req` mismatch), unknown kid.
+* SSRF guard: each blocked range, DNS rebinding (first lookup public, second private), redirect to a private IP.
+* Path guard: `../x`, `/etc/passwd`, `C:\x`, a symlink out of the work dir, a zip entry with `..`.
+* Redaction: a log line with a presigned URL, a PEM block, an enrollment code and a bearer token comes out clean.
+
+### 19.2 Integration tests (fake platform, `httptest`)
+
+* Enrollment with a code: pending, then approved, then the first lease works; the code cannot be reused.
+* Rotation end to end with no failed request during the switch.
+* Revocation: within one heartbeat the server stops, cancels and cleans up.
+* A man-in-the-middle proxy that rewrites a job's params: the server refuses the response.
+* Clock skew of 45 s: the server goes `DEGRADED` with the NTP reason before the platform rejects it.
+
+### 19.3 Acceptance on real machines
+
+| # | Check | Requirement |
+| --- | --- | --- |
+| SA1 | Fresh clone on each Bryan machine: `just build` makes a key, writes `servers/{Server}/keys/server_identity.jwks.json`, prints the fingerprint | S1, S3 |
+| SA2 | `git status` never shows a private key; `git ls-files | xargs grep -l "PRIVATE KEY"` finds nothing | S2 |
+| SA3 | A machine outside the repo joins through an enrollment code and the fingerprint comparison | S4 |
+| SA4 | A dump of the platform's key table cannot be used to sign an accepted request | S5 |
+| SA5 | Behind a home NAT with no port forward, a job is leased, cancelled within 20 s, and another completes | S6 |
+| SA6 | Revoking B5090's key stops it within 15 s and its leases run elsewhere | S8 |
+
+## 20. Decisions
+
+**Goal of this section:** decisions this spec makes; to be copied into `pm/Decisions.yaml`.
+
+| Id | Decision | Status |
+| --- | --- | --- |
+| D-101 | Server identity = Ed25519 key pair generated on the machine; private key local only, never backed up | proposed |
+| D-102 | Request authentication = RFC 9421 HTTP Message Signatures + RFC 9530 Content-Digest; replaces per-server bearer tokens (ai_processing_server.mdx §14.1, bryan_servers.mdx §13) | proposed |
+| D-103 | Platforms sign responses (RFC 9421, bound to the request signature); servers pin platform keys in `data/platforms/` and never trust a key fetched unsigned | proposed |
+| D-104 | Public keys as JWK Sets in `servers/{Server}/keys/`; kid = RFC 7638 thumbprint | proposed |
+| D-105 | Two key paths: git PR (checked-in servers) and one-time enrollment code with fingerprint comparison (others) | proposed |
+| D-106 | Allowed algorithms: `ed25519` and `ecdsa-p256-sha256` only | proposed |
+| D-107 | TLS 1.3 minimum, OS trust store, no certificate pinning, no `InsecureSkipVerify` | proposed |
+| D-108 | `/data/git_ignore/` git-ignored (done 2026-10-27) | **done** |
+
+## 21. Open questions for Bryan
+
+1. **Q1. Approval through git (§5.1):** is a merged PR to `main` enough approval for the Bryan machines, or should an
+   admin still click Approve after the Action registers the key?
+2. **Q2. `servers/` naming:** the directories are `Bryan_5090`, `Bryan_Laptop`, `Bryan_Mac_Studio`, while the
+   platform keys are `B5090`, `BMS` (ai_processing_server.mdx §6.6). Keep both (directory = human name, `key` inside
+   `server.yaml`), or rename the directories to the keys? This spec assumes both, linked by `server.servers_dir`.
+3. **Q3. Platform hostnames and storage hosts** for `data/platforms/act3.yaml` and `wtc.yaml` (§8.1).
+4. **Q4. Laptop policy:** Bryan_Laptop defaults to `customer_work: false` and is the first Secure Enclave key. Agreed?
+5. **Q5. Key lifetime:** 12-month rotation proposed. Shorter (90 days, automated) is easy once rotation is automatic;
+   want that from the start?
+
+## 22. Source code map and upgrade log
+
+**Goal of this section:** where each part will be implemented, and what changed when.
+
+### 22.1 Planned source map
+
+Creating the server key once and never overwriting it is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/security/keys/keys.go` — `InitKey`, `LoadKey`
+
+Writing and reading the public JWK Set in `servers/{Server}/keys/` is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/security/keys/jwks.go` — `WritePublicJWKS`, `Thumbprint`
+
+Signing every platform request (RFC 9421 + Content-Digest) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/security/httpsig/sign.go` — `Signer.SignRequest`
+
+Verifying platform responses against pinned keys is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/security/httpsig/verify.go` — `Verifier.VerifyResponse`
+
+Enrollment and rotation commands are implemented in code:
+`~/BGit/act3/ai_processing_server/code/cmd/ai_processing_server/keys.go` — `cmdEnroll`, `cmdKeysRotate`, `cmdKeysShow`
+
+The SSRF guard for envelope URLs is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/storage/safedial.go` — `SafeDialer`, `CheckURL`
+
+Work-dir path containment is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/storage/paths.go` — `SafeJoin`
+
+Log redaction is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/logging/redact.go` — `Redact`
+
+Platform-side verification for ACT3 is implemented in code (appsrv, to write):
+`~/BGit/all/film/code/p/act3ai-appsrv/src/processing/processing-signature.guard.ts` — `ProcessingSignatureGuard.canActivate`
+
+### 22.2 Upgrade log
+
+* 2026-10-27: spec written. `/data/git_ignore/` and private-key patterns added to `.gitignore`. No code yet.

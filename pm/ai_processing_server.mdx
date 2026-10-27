@@ -1,0 +1,1361 @@
+---
+title: "ai_processing_server: engineering specification"
+description: "CTO engineering spec for the Go single-binary processing server that runs on every ACT3 GPU/CPU machine: how it detects its hardware, how this_server.yaml is created once and never overwritten, the data/ directory (checked in) and data/git_ignore/ (per machine), the service allow-list that the machine owner turns on and off, priorities set by ACT3 and We The Citizens, the job lifecycle, local scheduling and parallel slots, transport to the platforms, the local and platform APIs, logging, security, deployment, tests and the build plan."
+---
+
+{/* Written 2026-10-27 by the CTO pass from Bryan's dictation of the same day. It builds on the production specs under ~/BGit/all/film/pm/subp/render_queue/ (RenderEngine.mdx, bryan_servers.mdx, render_queue.mdx, render_q.mdx), which describe today's TypeScript job_runner. No code exists yet in ~/BGit/act3/ai_processing_server/code/. */}
+
+# ai_processing_server: engineering specification
+
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** v0.1.0 built (phases 0–2 mostly done; see §24.2)
+· **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
+· **Siblings:** `~/BGit/all/film/pm/subp/render_queue/RenderEngine.mdx` (the engine that decides which server gets a
+job) · `~/BGit/all/film/pm/subp/render_queue/bryan_servers.mdx` (the home fleet B5090, BPC, BMT, BMS and the admin
+Server page) · `~/BGit/all/film/pm/subp/render_queue/render_queue.mdx` (the Render Queue page)
+
+Every section that holds facts that can go stale carries an **As of** line. When work in a section lands, change its
+status and date and add a line to §24 (the upgrade log) rather than deleting the history.
+
+## 0. The request, verbatim in intent
+
+**Goal of this section:** pin what Bryan asked for, so every later section answers a numbered item.
+
+Bryan's dictation (2026-10-27), cleaned of transcription noise:
+
+> This is going to be in the Go programming language. We're going to have a data directory for data, and mostly that
+> data in that directory hierarchy will be checked in, with one exception: `~/BGit/act3/ai_processing_server/data/`.
+> The directory `~/BGit/act3/ai_processing_server/data/git_ignore/` and its hierarchy will not be checked in, and it
+> will be mostly per-user specific.
+>
+> It will have the file `data/git_ignore/this_server.yaml`. The justfile will build it if it doesn't exist. It won't
+> change it if it already exists. That will let us determine the name of the server and the capabilities of the
+> server, and will have a list of services that we allow to turn on and off. We The Citizens and ACT3 will allow us to
+> set the priorities.
+>
+> It will have the list of capabilities of the server: how many cores, how many video cards, what kind of video cards,
+> and so on. Then, with APIs calling this, it will be able to make this work.
+
+Requirements derived from it (each answered later and tested in §20):
+
+* **P1. Go, one binary.** All code is Go, built by `just build` into the repo root, git-ignored. §3, §17.
+* **P2. `data/` is checked in**, except **`data/git_ignore/`**, which is per machine and never committed. §5.
+* **P3. `this_server.yaml` is created by the justfile when missing and never changed once it exists.** §6.
+* **P4. `this_server.yaml` names the server** (its key and display name). §6.2.
+* **P5. `this_server.yaml` lists the server's capabilities:** CPU cores, RAM, number and kind of video cards, VRAM,
+  disks, installed engines. §6.3, §7.
+* **P6. `this_server.yaml` holds the list of services this machine allows**, each one turned on or off by the owner.
+  §6.4, §8.
+* **P7. ACT3 and We The Citizens set the priorities** of the work this server does. §10.
+* **P8. APIs make it work:** the platforms and local tools call the server, and the server calls the platforms. §13,
+  §14.
+
+Vocabulary used throughout:
+
+* **Server:** one machine running this binary. Its **key** is short and upper case (`B5090`, `BPC`, `BMT`, `BMS`,
+  `NPL1`, `AWS3`).
+* **Platform:** a product that sends work. Two today: **ACT3** (the AI filmmaking web app, appsrv) and **WTC** (We The
+  Citizens, the Go backend in `~/BGit/act3/AI_Coding/` and `~/BGit/act3/we_citizens/`).
+* **Service:** one kind of work a server can offer, with a stable id such as `act3.comfy_on_prem` or
+  `wtc.transcription`. A service is backed by one **runner** in code.
+* **Job:** one unit of work from a platform, for one service, with inputs, parameters and an output location.
+* **Slot:** a reservation of hardware (a GPU, some CPU cores, some RAM) that one running job holds.
+* **Lease:** the server's time-limited claim on a job. A lease that is not renewed returns the job to its platform.
+* **Owner:** the person who runs the machine (Bryan for the Bryan 4). The owner edits `this_server.yaml`.
+
+## 1. Goals
+
+**Goal of this section:** what success means for the business, the operators and the code.
+
+### 1.1 Business goals
+
+1. **Use the GPUs we already own.** A render on the B5090 costs electricity (about $0.17 per GPU-hour), not a vendor's
+   per-second price. Every job that can run on our own machines at acceptable quality and speed should be offered to
+   them first (RenderEngine.mdx §9.2 owns the choice; this server makes the offer honest).
+2. **One worker for both products.** ACT3 and We The Citizens both need transcription, AI descriptions, transcodes,
+   image and video generation. One binary on one machine serves both, with priorities each platform controls.
+3. **Open-source models become products.** Wan, LTX, Hunyuan, SeedVR2, FlashVSR, Kokoro, Whisper and the rest need
+   machines that say truthfully what they can run.
+
+### 1.2 Operator goals
+
+1. Put the binary on a new machine, run `just build` and `just run`, and the machine is a working server within
+   minutes, with a `this_server.yaml` that describes it correctly.
+2. The owner decides what the machine will do (services on or off) by editing one file, and that decision is never
+   overridden by a platform.
+3. Nothing about a server lives only on that server: status, hardware, current jobs and failures reach the platform
+   (the admin Server page, bryan_servers.mdx §10.3).
+
+### 1.3 Code goals
+
+1. **Our coordination logic, not a framework's.** Matching, priority, slots, leases and retries are Go code in this
+   repo, specified here. The transport underneath is replaceable (§11).
+2. **One runner interface.** Adding a service means adding one runner package and one catalog file, nothing else.
+3. **Deterministic, testable core.** Hardware detection, config loading, scheduling and the job state machine are pure
+   enough to unit test with fakes, without a GPU.
+4. **Small dependency surface.** Standard library first (`net/http`, `log/slog`, `os/exec`, `context`), plus a short
+   list of vetted modules (§3.3).
+
+### 1.4 Non-goals
+
+* No credit pricing here, ever. Prices, charges and refunds are the platform's (ACT3 appsrv owns them).
+* No user-facing UI in this binary. The human views are the admin Server page and Fleet page in the ACT3 web app
+  (bryan_servers.mdx §10) and an equivalent WTC admin page. The server only exposes a JSON API and a plain status page
+  for debugging.
+* No direct database access to a platform's Postgres. Everything goes through the platform's API.
+
+## 2. Where this fits
+
+**Goal of this section:** the server in the whole system, today and target.
+
+**As of 2026-10-27:** production ACT3 renders run in the TypeScript **job_runner** (Temporal master and slave workers,
+`~/BGit/all/film/code/p/job_runner/`). "Which server runs a job" is decided by whichever Temporal worker polls first
+(RenderEngine.mdx §5). There is no server class, no capability report and no hardware-aware placement.
+
+Target picture:
+
+```
+   ACT3 appsrv (NestJS)                        WTC backend (Go)
+   job table, priorities, credits              job table, priorities
+   dispatcher (RenderEngine.mdx §9)            dispatcher (same rules, §10)
+        ▲  │                                        ▲  │
+        │  │ HTTPS: register, heartbeat, lease,     │  │
+        │  │ progress, complete, fail (§14)         │  │
+        │  ▼                                        │  ▼
+ ┌──────┴──────────────────────────────────────────┴──────────────────┐
+ │ ai_processing_server  (one Go binary per machine)                  │
+ │  config ── this_server.yaml + data/ catalogs                       │
+ │  hardware ── detect CPU, RAM, GPUs, VRAM, disks, engines           │
+ │  capability ── services allowed × hardware → offers                │
+ │  scheduler ── slots, local queue, priority merge, leases           │
+ │  runners ── comfy, ffmpeg, blender, whisper, tts, upscale, ...     │
+ │  report ── progress, logs, outputs, telemetry                      │
+ │  local API ── 127.0.0.1:9440 (§13)                                 │
+ └────────────────────────────────────────────────────────────────────┘
+        │ outputs: presigned uploads to S3 / IPFS pinning, never through the platform process
+```
+
+* All connections are **outbound from the server**. The Bryan 4 are on a home network and a Nepal machine sits behind
+  an office NAT; neither can accept inbound calls. Control (pause, cancel, priority changes) rides on the heartbeat and
+  lease responses (§14.4).
+* The server is a **peer of job_runner during migration**, not a replacement on day one. §21 lists the strangler order.
+
+## 3. Language, toolchain and build
+
+**Goal of this section:** the exact technical base.
+
+### 3.1 Go
+
+* Go, current stable at build time (1.25 or newer). Module root `code/go.mod`, module path
+  `github.com/ACT3ai/ai_processing_server`.
+* One binary, `ai_processing_server` (`ai_processing_server.exe` on Windows), built into the repo root, ignored by
+  `.gitignore` (already in place: `/ai_processing_server`, `/ai_processing_server.exe`).
+* Targets: `darwin/arm64` (BMT, BMS), `windows/amd64` (B5090, BPC), `linux/amd64` and `linux/arm64` (cloud). Each
+  machine builds its own binary; cross-compiling is allowed for CI but never committed.
+* `CGO_ENABLED=0` by default so the build needs no C toolchain. GPU facts come from vendor command-line tools
+  (`nvidia-smi`, `system_profiler`), not from linking NVML. If NVML through cgo is ever needed for precision, it goes
+  behind a build tag `nvml` and the default build stays pure Go.
+
+### 3.2 Version stamp
+
+`just build` passes `-ldflags "-X main.version=… -X main.gitSHA=… -X main.buildTime=…"`. The version is reported in
+`/v1/health`, in every heartbeat, in the first log line at boot, and in the `created_by` line of a newly created
+`this_server.yaml`.
+
+### 3.3 Allowed third-party modules
+
+| Module | Why | Note |
+| --- | --- | --- |
+| `gopkg.in/yaml.v3` (or its maintained fork `go.yaml.in/yaml/v3`) | parse `this_server.yaml` and catalogs, keep comments on the template | pick one at scaffold, record in Decisions.yaml |
+| `github.com/shirou/gopsutil/v4` | CPU, RAM, disk, process facts on all three OSes | pure Go |
+| `golang.org/x/sys` | Windows service, process groups, `statfs` | official |
+| `github.com/prometheus/client_golang` | `/metrics` | optional, can be added in phase 3 |
+
+Anything else needs a line in `pm/Decisions.yaml` with the reason. No web framework: Go's `net/http` method-and-path
+routing (Go 1.22+) is enough.
+
+### 3.4 Code style rules
+
+* `context.Context` is the first argument of anything that does I/O or can be cancelled. Cancelling a job cancels its
+  context; every runner must honor it.
+* Errors are wrapped with `%w` and classified once into a `jobs.ErrorKind` (§12.2) at the runner boundary.
+* `log/slog` everywhere, with the attributes `job_id`, `service`, `platform`, `trace_id`, `server` when known.
+* No package-level mutable state except the logger. Everything is passed in through constructors, so tests build a
+  whole server with fakes.
+
+## 4. Repository layout
+
+**Goal of this section:** where everything lives.
+
+```
+ai_processing_server/
+├── CLAUDE.md
+├── README.md
+├── justfile                       # §17
+├── .gitignore                     # binary, local build output, /data/git_ignore/
+├── ai_processing_server           # built locally, NEVER committed
+├── pm/                            # specs only (this file, Goal.md, TO_DO.md, Decisions.yaml, docs/)
+├── data/                          # checked in, except git_ignore/ (§5)
+│   ├── templates/this_server.template.yaml
+│   ├── services/                  # one YAML per service: requirements, defaults, runner (§8.2)
+│   ├── models/                    # model catalog: VRAM, RAM, disk, files, checksums (§8.3)
+│   ├── servers/known_servers.yaml # presets for the Bryan 4 and other known machines (§6.6)
+│   ├── sites/sites.yaml           # bryan_office, nepal_office, cloud regions (bryan_servers.mdx §6.3)
+│   ├── schemas/                   # JSON Schemas for every YAML above and for the job envelope
+│   └── git_ignore/                # NOT checked in: per machine (§5.2)
+├── code/                          # all Go source (§15)
+└── tests/                         # integration, stress data, results (PROJECT layout)
+    ├── Stress_Test_Data/
+    ├── Test_Results/
+    ├── Unit_Test/                 # notes only; Go unit tests live next to the code as *_test.go
+    └── Test_cases.csv
+```
+
+## 5. The data directory
+
+**Goal of this section:** what is checked in, what is per machine, and the rules for each (P2).
+
+### 5.1 `data/` (checked in)
+
+Everything here is shared by every machine and reviewed in pull requests like code. It is **declarative**: catalogs,
+templates, schemas, presets. The binary reads it at boot and on `SIGHUP` / `POST /v1/reload`.
+
+| Path | Holds | Changed by |
+| --- | --- | --- |
+| `data/templates/this_server.template.yaml` | the commented template that `init` fills in (§6) | engineers |
+| `data/services/*.yaml` | the service catalog: one file per service id (§8.2) | engineers, with the runner code |
+| `data/models/*.yaml` | model catalog: name, version, VRAM need by precision, RAM, disk, download source, sha256 | engineers |
+| `data/servers/known_servers.yaml` | presets keyed by hostname or machine id: key, display name, profile, site, family | admins |
+| `data/sites/sites.yaml` | sites: timezone, country, expected networks, quiet hours, upload bandwidth, customer data allowed | admins |
+| `data/schemas/*.schema.json` | JSON Schema for every YAML above, for the job envelope and the heartbeat body | engineers |
+
+Rules:
+
+* No secrets in `data/`, ever. Not tokens, not API keys, not URLs with credentials in them. A CI check greps for
+  likely secrets and fails the build.
+* No machine-specific facts in `data/` except the presets in `known_servers.yaml`, which are identity hints, not
+  hardware truth (detection is truth, §7).
+* Every file has `schema_version` at the top. The binary refuses a file whose major version it does not know, with an
+  error naming the file and the version.
+
+### 5.2 `data/git_ignore/` (never checked in)
+
+One line in `.gitignore`: `/data/git_ignore/`. Everything under it belongs to this machine (and, on a shared machine,
+this user). The binary creates the subdirectories it needs at boot with mode `0700`.
+
+```
+data/git_ignore/
+├── this_server.yaml          # owner-edited; created once, never rewritten (§6)
+├── this_server.yaml.new      # written only by `just reinit` for the owner to compare and merge (§6.7)
+├── state/                    # machine-written; safe to delete when the server is stopped
+│   ├── detected_hardware.yaml   # rewritten at every boot and every 10 minutes (§7.5)
+│   ├── platform_overrides.yaml  # priorities and pauses received from ACT3 / WTC (§10.4)
+│   ├── server.pid               # for `just stop` / `just status`
+│   └── journal/                 # one JSON file per live job, for crash recovery (§9.5)
+├── work/<job_id>/            # scratch per job: inputs, temp files, outputs before upload; deleted after (§9.6)
+├── cache/                    # model files and reusable downloads, size-capped (§8.3)
+└── logs/jobs/<job_id>.log    # full per-job log, uploaded with the result, kept 7 days
+```
+
+Why "per user": on a machine where two people run the server (a shared office PC), each checkout has its own
+`git_ignore/`, so each has its own identity file and work area. Two servers on one machine must have different keys and
+different local API ports; `init` warns when another `server.pid` for the same hardware is alive.
+
+Large or slow paths (`work/`, `cache/`) may point at another disk with `paths.work_dir` and `paths.cache_dir` in
+`this_server.yaml` (the B5090 keeps model files on its fast NVMe). The defaults stay under `data/git_ignore/`.
+
+## 6. `this_server.yaml`
+
+**Goal of this section:** the file that makes a machine a server (P3 to P6).
+
+### 6.1 Who writes it, and when
+
+* `just build` compiles the binary, then runs `./ai_processing_server init`.
+* `init` checks `data/git_ignore/this_server.yaml`:
+  * **missing:** detect hardware (§7), match the machine against `data/servers/known_servers.yaml` (§6.6), fill the
+    template, propose a service list from what the hardware can run (§6.4), write the file atomically (write to a temp
+    file in the same directory, `fsync`, rename), mode `0600`, and print what it wrote and what the owner should check.
+  * **present:** **do not touch it.** Not a byte, not a reformat, not a timestamp. `init` only validates it and prints
+    a one-line verdict ("this_server.yaml OK: B5090, 6 services on") or the validation errors. A file that fails
+    validation still is not rewritten; `just run` refuses to start until the owner fixes it.
+* Nothing else in the binary ever writes `this_server.yaml`. Machine-written facts go to `state/` (§5.2). A unit test
+  asserts that no code path other than `init`'s create branch opens the file for writing (§20).
+
+### 6.2 Identity (P4)
+
+```yaml
+schema_version: 1
+created_at: "2026-10-27T09:14:03-07:00"
+created_by: "ai_processing_server init 0.1.0 (git 5f1ead1)"
+
+server:
+  key: B5090                    # upper case, A-Z 0-9, at most 12 characters, unique across the fleet
+  display_name: "Bryan 5090"
+  profile: b5090                # which Go profile to load: generic | b5090 | bpc | bmt | bms | cloud (§15.3)
+  family: bryan                 # bryan | office | cloud | runpod (bryan_servers.mdx §6.1)
+  site: bryan_office            # key in data/sites/sites.yaml
+  bound_to:                     # detected at creation; a mismatch at boot means the file was copied (§6.5)
+    hostname: "DESKTOP-B5090"
+    machine_id: "9f1c…"         # IOPlatformUUID on macOS, MachineGuid on Windows, /etc/machine-id on Linux
+```
+
+The key is the same key the platforms use in their registries (`render_server.key` in ACT3, bryan_servers.mdx §6.1).
+The platform is the authority on whether a key is known: an unknown key registers as `PENDING_APPROVAL` and receives
+no work until an admin approves it (§16.2).
+
+### 6.3 Capabilities snapshot (P5)
+
+`init` writes what it detected so the owner can read the machine in one place. Example (the B5090):
+
+```yaml
+hardware:                       # snapshot at creation. You may LOWER numbers to offer less; raising them has no effect (§7.4)
+  os: windows                   # darwin | windows | linux
+  arch: amd64
+  cpu:
+    model: "AMD Ryzen 9 9950X"
+    physical_cores: 16
+    logical_cores: 32
+  ram_gb: 128
+  disks:
+    - path: "D:/act3_work"
+      total_gb: 3726
+      free_gb: 2900
+      kind: nvme                # nvme | ssd | hdd | network | unknown
+  gpus:
+    - index: 0
+      vendor: nvidia            # nvidia | apple | amd | intel
+      name: "NVIDIA GeForce RTX 5090"
+      uuid: "GPU-3c5e…"
+      vram_gb: 32
+      compute: cuda             # cuda | metal | rocm | none
+      compute_version: "12.0"   # CUDA compute capability; Metal family on Apple
+      driver: "581.57"
+      encoders: [nvenc_h264, nvenc_hevc, nvenc_av1]
+  engines:                      # found on PATH or at configured paths, with version
+    ffmpeg:  { path: "C:/tools/ffmpeg/bin/ffmpeg.exe", version: "7.1" }
+    blender: { path: "C:/Program Files/Blender Foundation/Blender 4.5/blender.exe", version: "4.5.3" }
+    comfyui: { url: "http://127.0.0.1:8188", version: "0.3.60" }
+    python:  { path: "C:/Python312/python.exe", version: "3.12.7" }
+    docker:  null               # not found
+```
+
+On a Mac Studio the GPU entry is `vendor: apple`, `compute: metal`, and `vram_gb` is replaced by `unified_memory_gb`
+(the whole RAM, of which the scheduler offers only `ram_gb - limits.ram_reserve_gb`, §9.2).
+
+### 6.4 Services the owner allows (P6)
+
+```yaml
+services:                       # the owner's allow-list. A platform can never turn on a service that is off here.
+  - id: act3.comfy_on_prem
+    enabled: true
+    max_parallel: 1             # at most this many at once, whatever the hardware could do
+    gpus: [0]                   # which GPU indexes it may use; omitted = any GPU that fits
+    local_bias: 0               # -50..50, the owner's thumb on the scale (§10.3)
+  - id: act3.video_gen_open_source     # Wan 2.2, LTX 2.5, Hunyuan 1.5
+    enabled: true
+    max_parallel: 1
+  - id: act3.upscale_open_source       # SeedVR2, FlashVSR
+    enabled: true
+  - id: act3.video_merge
+    enabled: true
+    max_parallel: 2
+  - id: act3.blender_render
+    enabled: false              # proposed by init; the owner turned it off
+  - id: wtc.transcription
+    enabled: true
+  - id: wtc.ai_description
+    enabled: false
+```
+
+How `init` proposes the list: every service in `data/services/` whose hard requirements this hardware meets (§8.2) is
+listed. It is written `enabled: true` only if the service's catalog file says `default_enabled: true` **and** the
+known-server preset does not turn it off; otherwise `enabled: false`. Services the hardware cannot run are written as
+comments (`# act3.video_gen_open_source: needs 24 GB VRAM, this machine has 8`) so the owner sees why they are absent.
+
+A service id that appears in `this_server.yaml` but not in `data/services/` (renamed, removed) is a **warning**, not a
+fatal error: it is ignored and reported in the heartbeat. A service in `data/services/` that is absent from
+`this_server.yaml` is **off** (new services are opt-in on existing machines).
+
+### 6.5 Platforms, limits, paths and the local API
+
+```yaml
+platforms:
+  act3:
+    enabled: true
+    base_url: "https://api.act3ai.com"
+    credentials_file: "~/BGit/act3/act3ai-credentials/processing_servers/B5090.yaml"
+    share: 70                   # weight when both platforms have waiting work (§10.5)
+  wtc:
+    enabled: true
+    base_url: "https://api.wethecitizens.io"
+    credentials_file: "~/.credentials/wethecitizens_processing_B5090.json"
+    share: 30
+
+limits:
+  max_parallel_jobs: 4          # whole machine
+  cpu_reserve_pct: 20           # never offered to jobs (the owner uses this machine)
+  ram_reserve_gb: 16
+  vram_headroom_gb: 1.5         # per GPU, kept free for the driver and the desktop
+  disk_min_free_gb: 100         # below this, stop taking jobs that write locally
+  gpu_temp_max_c: 85            # above this for 2 minutes: DEGRADED, no new GPU work (§12.4)
+  quiet_hours: null             # e.g. { from: "23:00", to: "07:00", allow: [cpu_light] } in the site's timezone
+
+paths:
+  work_dir: "D:/act3_work"      # default data/git_ignore/work
+  cache_dir: "D:/act3_models"   # default data/git_ignore/cache
+  cache_max_gb: 800
+
+local_api:
+  listen: "127.0.0.1:9440"      # loopback by default; LAN only on purpose (§16.4)
+  token_file: "~/.credentials/ai_processing_server_local.token"
+```
+
+Paths may start with `~`; the loader expands it. Credentials are **referenced, never inlined**: the file holds paths to
+files under `~/BGit/act3/act3ai-credentials/` or `~/.credentials/`, and `init` writes those paths with a comment telling
+the owner to create the file if it does not exist.
+
+`bound_to` check at boot: if hostname **and** machine id both differ from the file, the server refuses to start ("This
+this_server.yaml was created on DESKTOP-B5090; this machine is BPC-OFFICE. Run `just reinit` or fix server.bound_to.").
+If only the hostname differs (renamed machine), it warns and continues.
+
+### 6.6 Known-server presets
+
+`data/servers/known_servers.yaml` lets `init` name the Bryan 4 correctly without the owner typing anything:
+
+```yaml
+schema_version: 1
+servers:
+  - key: B5090
+    display_name: "Bryan 5090"
+    match: { hostname: ["DESKTOP-B5090"], gpu_name_contains: "RTX 5090" }
+    profile: b5090
+    family: bryan
+    site: bryan_office
+  - key: BPC
+    display_name: "Bryan PC"
+    match: { hostname: ["BRYAN-PC"], gpu_count_min: 2 }
+    profile: bpc
+    family: bryan
+    site: bryan_office
+  - key: BMT
+    display_name: "Bryan Mac Tower"
+    profile: bmt
+    family: bryan
+    site: bryan_office
+  - key: BMS
+    display_name: "Bryan Mac Studio"
+    profile: bms
+    family: bryan
+    site: bryan_office
+    services_off: [act3.video_gen_open_source]   # OpenClaw is the tenant here (bryan_servers.mdx §7.3.4)
+```
+
+Matching: hostname first, then hardware hints. No match: `init` writes `key: CHANGE_ME`, `profile: generic`, and the
+server refuses to `run` until the key is set. That is deliberate: a guessed key would collide in the fleet registry.
+The hostname values above are placeholders until Bryan confirms the real names (§23 Q2).
+
+### 6.7 Changing the file later
+
+* The owner edits it by hand. The server picks up changes on restart, `SIGHUP` (macOS/Linux), or
+  `POST /v1/reload`. Reload is all-or-nothing: an invalid edit is rejected and the running config stays.
+* `just reinit` runs `init --write-new`: it writes `this_server.yaml.new` with fresh detection and the current catalog,
+  keeping the existing identity, and prints a short diff. The owner merges what they want. `.new` is never read by
+  `run`.
+* Turning a service off while it has running jobs: running jobs finish; no new ones are taken.
+
+## 7. Hardware detection and capabilities
+
+**Goal of this section:** how the server knows what it is, on each OS (P5).
+
+### 7.1 What is detected
+
+| Fact | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| OS, arch | `runtime.GOOS/GOARCH`, `sw_vers` | `runtime`, `RtlGetVersion` via x/sys | `runtime`, `/etc/os-release` |
+| CPU model, physical and logical cores | `sysctl machdep.cpu.brand_string hw.physicalcpu hw.logicalcpu` | gopsutil (`Win32_Processor`) | gopsutil (`/proc/cpuinfo`) |
+| Apple performance / efficiency cores | `sysctl hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu` | n/a | n/a |
+| RAM | `sysctl hw.memsize` | gopsutil | gopsutil |
+| Disks, free space, kind | `statfs`, `diskutil info -plist` | `GetDiskFreeSpaceEx`, PowerShell `Get-PhysicalDisk` | `statfs`, `/sys/block/*/queue/rotational` |
+| NVIDIA GPUs | n/a | `nvidia-smi --query-gpu=index,uuid,name,memory.total,driver_version,compute_cap --format=csv,noheader,nounits` | same |
+| NVIDIA load | n/a | `nvidia-smi --query-gpu=index,utilization.gpu,memory.used,temperature.gpu,power.draw --format=csv,noheader,nounits` | same |
+| Apple GPU | `system_profiler SPDisplaysDataType -json` (chip, cores, Metal family) | n/a | n/a |
+| AMD GPUs | n/a | PowerShell `Get-CimInstance Win32_VideoController` (name, no VRAM truth) | `rocm-smi --showmeminfo vram --json` |
+| Encoders | `ffmpeg -hide_banner -encoders` (videotoolbox) | `ffmpeg -encoders` (nvenc, qsv, amf) | same |
+| Engines | probe each catalog engine: run `--version`, or call its health URL with a 2 s timeout | same | same |
+| Machine id | `ioreg -rd1 -c IOPlatformExpertDevice` (IOPlatformUUID) | registry `MachineGuid` | `/etc/machine-id` |
+
+Every probe has a timeout (5 s for commands, 2 s for URLs), runs with an empty stdin, and never needs admin or root
+rights. A failing probe records `error` on that fact and the rest continue: a broken `nvidia-smi` must not stop a
+CPU-only service from running.
+
+### 7.2 Engines catalog
+
+Engines are listed in `data/services/_engines.yaml`: ffmpeg, ffprobe, blender, ComfyUI, python with named packages,
+whisper.cpp, docker, OpenClaw gateway, Kokoro. Each entry says how to find it (PATH names, common install paths per OS,
+an override key in `this_server.yaml` under `engines:`) and how to read its version. A service declares which engines,
+at what minimum version, it needs (§8.2).
+
+### 7.3 From hardware to offers
+
+The **capability** package turns facts into a list of **offers**: for each enabled service, can this machine run it,
+on which devices, how many at once.
+
+```
+offer(service) =
+  if not service enabled in this_server.yaml        → none, reason "off in this_server.yaml"
+  if any required engine missing or too old          → none, reason "needs blender >= 4.2, found none"
+  if the service needs a GPU:
+      candidate GPUs = gpus allowed by services[].gpus whose
+                       vram_gb - vram_headroom_gb >= service.min_vram_gb
+                       and compute in service.compute
+      if none                                         → none, reason "needs 24 GB VRAM; best GPU has 16"
+      parallel = sum over candidates of floor(usable_vram / per_job_vram), at least 1 per GPU if it fits once
+  else:
+      parallel = floor((logical_cores × (1 - cpu_reserve_pct)) / service.cpu_cores_per_job)
+  parallel = min(parallel, services[].max_parallel, service.max_parallel_default, limits.max_parallel_jobs)
+```
+
+Offers carry their reason either way and are sent in every full heartbeat, so the platform's dispatcher and the admin
+Server page can answer "why does B5090 not offer Blender?" without reading a log.
+
+### 7.4 Detected versus declared
+
+* **Detection is truth for what exists.** If `this_server.yaml` says two GPUs and detection finds one, the server uses
+  one and logs an ERROR ("GPU 1 (RTX 4090) missing: declared in this_server.yaml, not detected"), and the heartbeat
+  carries the drift. Services pinned only to the missing GPU go to `UNAVAILABLE` until it returns.
+* **The file is truth for what is offered.** The owner can lower numbers (say `ram_gb: 64` on a 128 GB machine to keep
+  half for themselves). If detection finds more than the file declares (a new GPU was installed), the server keeps
+  the file's view and logs an INFO telling the owner to run `just reinit`. Hardware is never offered without the owner
+  seeing it in the file.
+* Effective value for every number = `min(detected, declared)`. Missing declared value = detected.
+
+### 7.5 Refresh
+
+* Full detection at boot, every 10 minutes, and on `POST /v1/hardware/refresh`. Result written to
+  `state/detected_hardware.yaml` (machine-owned, may be rewritten freely).
+* Load telemetry (CPU %, RAM used, per-GPU utilization, VRAM used, temperature, power, disk free) every 5 seconds into
+  memory, sent with each heartbeat (§14.3), never written to the yaml.
+
+## 8. Services, runners and models
+
+**Goal of this section:** what work the server can do and how each kind is defined.
+
+### 8.1 The initial service list
+
+| Service id | Platform | Runner | Hardware | Notes |
+| --- | --- | --- | --- | --- |
+| `act3.comfy_on_prem` | ACT3 | `comfy` | NVIDIA GPU, 16 GB+ | replaces job_runner queue `comfy_generation_on_prem` |
+| `act3.video_gen_open_source` | ACT3 | `comfy` or `python` | NVIDIA 24 GB+ or Apple 96 GB+ unified | Wan 2.2 A14B, LTX 2.5, Hunyuan 1.5 (RenderEngine.mdx §11.2) |
+| `act3.image_gen_open_source` | ACT3 | `comfy` | GPU 12 GB+ | FLUX, SDXL |
+| `act3.upscale_open_source` | ACT3 | `python` | NVIDIA 24 GB+ | SeedVR2, FlashVSR |
+| `act3.video_merge` | ACT3 | `ffmpeg` | CPU, NVENC or VideoToolbox optional | scene and episode flash merges |
+| `act3.transcode` | ACT3 | `ffmpeg` | CPU | export formats, social exports |
+| `act3.blender_render` | ACT3 | `blender` | GPU preferred | shot video, set renders |
+| `act3.tts_local` | ACT3 | `python` | CPU or Apple | Kokoro voice lines |
+| `wtc.transcription` | WTC | `whisper` | Apple or NVIDIA, CPU fallback | video and audio to text |
+| `wtc.ai_description` | WTC | `python` / vendor | GPU or vendor API | visual descriptions of images and video |
+| `wtc.ocr` | WTC | `python` | CPU | text in images |
+| `wtc.transcode` | WTC | `ffmpeg` | CPU | H.264 + AAC + yuv420p for X compatibility, never AV1 for X |
+| `sys.self_test` | both | `selftest` | any | a tiny known job used by acceptance tests and the admin "Test this server" button |
+
+Service ids are `platform.name`, lower case, stable forever. A renamed service gets a new id and the old one is listed
+under `replaced_by` in its catalog file for one release.
+
+### 8.2 A service catalog file
+
+`data/services/act3.video_merge.yaml`:
+
+```yaml
+schema_version: 1
+id: act3.video_merge
+platform: act3
+title: "Scene and episode video merge"
+runner: ffmpeg
+default_enabled: true
+requires:
+  engines: { ffmpeg: ">=6.0", ffprobe: ">=6.0" }
+  gpu: optional                  # none | optional | required
+  compute: [cuda, metal, none]   # what may accelerate it
+resources_per_job:
+  cpu_cores: 4
+  ram_gb: 4
+  vram_gb: 0
+  disk_gb_per_output_minute: 2
+max_parallel_default: 3
+timeouts:
+  stage_inputs: 10m
+  run: 60m
+  upload: 20m
+retry:
+  max_attempts: 2
+  retry_on: [transient, infra]
+cancel: graceful_then_kill       # SIGINT, wait 10 s, then kill the process group
+params_schema: "../schemas/params/act3.video_merge.schema.json"
+platform_job_types: [SCENE_VIDEO_GENERATION_FLASH, EPISODE_VIDEO_GENERATION_FLASH]  # names in appsrv's JobType
+```
+
+The `params_schema` is enforced on every job before any work starts. A job whose params fail it fails at once with
+`invalid_input` and the schema error, so a platform bug never wastes a GPU.
+
+### 8.3 Models and the cache
+
+* `data/models/*.yaml` lists each model: id (`wan2.2-a14b-fp8`), files with URLs and sha256, VRAM need per precision,
+  RAM need, disk size, license note.
+* A service that needs a model declares it per job (`params.model`) or by default. Before running, the runner asks the
+  **model cache** for the files: present and verified → use; absent → download into `cache_dir`, verify sha256, then
+  use. Download time counts against the `stage_inputs` timeout and is reported as its own progress stage.
+* The cache is capped by `paths.cache_max_gb`, evicted least recently used, never evicting a model a running job uses.
+* **Resident models.** For GPU services where loading is slow, the runner may keep one model loaded between jobs
+  (ComfyUI does this itself). The server reports `resident_models` in the heartbeat so the dispatcher can send
+  same-model jobs back to back (RenderEngine.mdx §9.2, "Model already resident").
+
+### 8.4 The runner interface
+
+```go
+// code/internal/runners/runner.go
+package runners
+
+// Runner does one kind of work. One implementation per runner name in the service catalog.
+type Runner interface {
+	// Name is the catalog's runner field: "ffmpeg", "comfy", "blender", "python", "whisper", "selftest".
+	Name() string
+
+	// Check validates params and the local environment for this job without doing work.
+	// It returns an error of kind invalid_input or infra with a sentence a human can act on.
+	Check(ctx context.Context, job *jobs.Job, env Env) error
+
+	// Run does the work. It must honor ctx cancellation, report progress through rep,
+	// write outputs only under env.WorkDir, and return the list of produced files.
+	Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) ([]jobs.Output, error)
+}
+
+type Env struct {
+	WorkDir   string            // data/git_ignore/work/<job_id>/
+	Slot      scheduler.Slot    // the GPU index, cores and RAM granted
+	Engines   hardware.Engines  // resolved engine paths
+	Models    models.Cache
+	Logger    *slog.Logger      // already carries job_id, service, platform
+}
+
+type Reporter interface {
+	Stage(name string)                  // "download_inputs", "load_model", "render", "encode"
+	Progress(fraction float64, note string)
+	Log(line string)                    // goes to the per-job log and, throttled, to the platform
+}
+```
+
+Runner rules:
+
+* External processes run through one helper, `procs.Run`, which starts them in their own process group (Unix) or job
+  object (Windows), pipes stdout/stderr to the per-job log, sets `CUDA_VISIBLE_DEVICES` from the slot, and kills the
+  whole tree on cancel. No runner calls `exec.Command` directly.
+* Runners never upload and never call a platform. The job lifecycle (§9) does staging, upload and reporting, so every
+  runner gets the same retry, cancel and cleanup behavior for free.
+* A runner that talks to a long-lived local engine (ComfyUI on `127.0.0.1:8188`) checks its health in `Check` and
+  returns `infra` if it is down, so the job goes back to the platform for another server instead of failing for the
+  user.
+
+## 9. The job lifecycle
+
+**Goal of this section:** what happens to one job on this server, from lease to cleanup.
+
+### 9.1 The job envelope
+
+What a platform sends in a lease response (JSON, schema `data/schemas/job_envelope.schema.json`):
+
+```json
+{
+  "job_id": "7c0e6f0a-3f0b-4d5f-9f0e-0b8d7f6b3c21",
+  "platform": "act3",
+  "service": "act3.video_merge",
+  "platform_job_type": "SCENE_VIDEO_GENERATION_FLASH",
+  "priority": 50,
+  "attempt": 1,
+  "trace_id": "b81f…",
+  "tenant": { "org_id": "…", "project_id": "…" },
+  "lease": { "lease_id": "…", "expires_at": "2026-10-27T17:02:30Z", "renew_every_s": 20 },
+  "deadline": "2026-10-27T18:00:00Z",
+  "inputs": [
+    { "name": "shot_01", "url": "https://…presigned…", "sha256": "…", "bytes": 48211234 }
+  ],
+  "params": { "fps": 24, "resolution": "1920x1080", "loudness_lufs": -16 },
+  "outputs": [
+    { "name": "scene", "content_type": "video/mp4", "upload": { "method": "PUT", "url": "https://…presigned…" } }
+  ],
+  "data_rules": { "customer_data": true, "retain_after_upload": false }
+}
+```
+
+* The server never needs platform database ids beyond `job_id` and `tenant` (for logs). It never guesses storage
+  paths: outputs go where the envelope says.
+* If presigned URLs might expire before the job ends (long renders), the server asks for fresh ones at upload time
+  (`POST /jobs/{job_id}/upload-urls`, §14.2).
+
+### 9.2 States on the server
+
+```
+LEASED ──► STAGING ──► RUNNING ──► UPLOADING ──► REPORTING ──► DONE
+   │          │           │            │              │
+   └──────────┴───────────┴────────────┴──────────────┴──► FAILED (kind, message)
+   └──────────┴───────────┴────────────┴─────────────────► CANCELLED (by platform or drain-timeout)
+```
+
+| Server state | Meaning | Platform status it reports (ACT3 `JobStatus`) |
+| --- | --- | --- |
+| `LEASED` | accepted, waiting for its slot | `INQUEUE` |
+| `STAGING` | downloading inputs and models | `PROGRESS` |
+| `RUNNING` | runner working | `PROGRESS` |
+| `UPLOADING` | outputs going to storage | `PROGRESS` |
+| `REPORTING` | telling the platform it is done | `PROGRESS` |
+| `DONE` | platform acknowledged | `COMPLETED` (set by the platform) |
+| `FAILED` | gave up on this server | `ERROR`, or back to waiting if the platform retries elsewhere |
+| `CANCELLED` | stopped on request | `CANCELLED` (set by the platform) |
+
+The ACT3 cancel rules in render_queue.mdx §10.2 apply exactly: the server re-reads the cancel flag before the first
+provider or GPU call, every renewal (20 s), before upload and before reporting, and a cancelled job uploads nothing.
+
+### 9.3 Admission: from waiting to running
+
+A leased job starts when the scheduler can grant a **slot**: the service's `resources_per_job` fit in what is free
+(after reserves), the service is under its `max_parallel`, the machine is under `max_parallel_jobs`, and no
+`DEGRADED` or quiet-hours rule blocks it (§12.4). GPU jobs get a specific GPU: the one with the model already resident
+if any, else the one with the most free VRAM that fits. On BPC each card is its own slot: two 16 GB cards are never
+treated as one 32 GB card (bryan_servers.mdx §7.3.2).
+
+### 9.4 Leases
+
+* The server only leases what it can start soon: at most `free slots + 1` jobs per service waiting locally, so it never
+  hoards work another server could start now.
+* It renews each lease every `renew_every_s` (default 20 s, lease length 60 s) with progress attached. A renewal
+  response can carry `cancel: true`.
+* If renewals fail for longer than the lease (network down), the server **keeps running** the job but treats the lease
+  as possibly lost: at the end it asks the platform before uploading (`POST /jobs/{job_id}/complete` with
+  `dry_run: true`). If the platform says the job was re-assigned, it discards its outputs. Double work is acceptable;
+  double results are not.
+
+### 9.5 The journal and crash recovery
+
+* Every state change writes `state/journal/<job_id>.json` (state, attempt, lease id, slot, started time, work dir)
+  atomically before acting on it.
+* At boot, every journal entry not in a final state is reported to its platform as `FAILED` with kind `infra` and
+  message "server restarted during STAGE", its work dir is deleted, and the entry is removed. The platform decides
+  whether to retry (normally yes, on any server).
+* A job whose platform cannot be reached at boot stays in the journal and is reported when the platform answers.
+
+### 9.6 Cleanup
+
+* After `DONE`, `FAILED` or `CANCELLED`, the work dir is deleted unless `data_rules.retain_after_upload` is true or the
+  owner set `debug.keep_work_dirs: true` (then kept 24 hours, never for customer data on a site with
+  `customer_data_allowed: false`).
+* A sweeper deletes any work dir older than 48 hours with no live journal entry, and per-job logs older than 7 days.
+
+### 9.7 Outputs
+
+* Uploads stream from disk (no whole file in memory), with sha256 computed on the way, retried 3 times with backoff
+  for 5xx and network errors, resumable by multipart for files over 1 GB.
+* The completion report lists each output: name, bytes, sha256, content type, duration and resolution for media (read
+  with `ffprobe`), and storage key.
+* IPFS outputs (WTC, Large File Bridge style workflows) are pinned through the platform's pinning service. URLs the
+  server reports are always public gateway URLs (`https://ipfs.io/ipfs/…`), never `127.0.0.1`.
+
+## 10. Priorities: ACT3 and We The Citizens set them
+
+**Goal of this section:** who decides what runs first, and how the decisions combine (P7).
+
+### 10.1 Who owns what
+
+| Decision | Owner | Where it lives |
+| --- | --- | --- |
+| Is this service allowed on this machine at all | **machine owner** | `this_server.yaml` `services[].enabled` |
+| Most this service may run at once here | machine owner (cap), hardware (truth) | `this_server.yaml`, detection |
+| Priority of a job | **its platform** (ACT3 or WTC) | the job's `priority` in the envelope |
+| Weight of a service on this server (e.g. "B5090 is for open-source video first") | **its platform** | sent in heartbeat responses, stored in `state/platform_overrides.yaml` |
+| Pause a service on this server, or drain the server | its platform (admins) or the owner | heartbeat response / local API |
+| Share of the machine between ACT3 and WTC when both have work | machine owner | `this_server.yaml` `platforms.*.share` |
+| A small local bias | machine owner | `this_server.yaml` `services[].local_bias` |
+
+The rule in one line: **the owner sets the fence, the platforms set the order inside it.** A platform can raise, lower,
+pause and drain, but can never turn on a service the owner turned off, and never exceed the owner's caps.
+
+### 10.2 Priority scale
+
+Priorities from both platforms are integers on ACT3's scale (RenderEngine.mdx §3, §4): LOW 1 · NORMAL 25 · HIGH 50 ·
+CRITICAL 75, plus trait bonuses up to about 200 (for example ACT3 adds +100 for a tenant's first two shots). WTC maps
+its own levels onto the same scale in its dispatcher, so the server compares numbers without knowing which product
+made them. The server clamps to 0..300.
+
+### 10.3 Effective local priority
+
+When several leased jobs wait for slots on this machine, the server orders them by:
+
+```
+effective = job.priority
+          + platform_service_weight[service]      // -100..100, from the platform, default 0
+          + local_bias[service]                   // -50..50, from this_server.yaml, default 0
+          + min(waiting_minutes, 60)              // aging: one point a minute, capped
+```
+
+Ties go to the older lease. This ordering only matters locally (a few jobs); the big ordering across the fleet is the
+platform dispatcher's, which uses the same priorities to decide which server gets which job.
+
+### 10.4 How a platform changes priorities
+
+* In the heartbeat response (§14.4): `directives.service_weights`, `directives.paused_services`,
+  `directives.drain`. The server applies them immediately and writes them to `state/platform_overrides.yaml` with the
+  platform, time and admin who set them, so they survive a restart. They expire after 7 days unless re-sent (the
+  platform re-sends current values on every heartbeat, so in practice they never expire while connected).
+* Each platform's directives only apply to its own services: ACT3 cannot pause `wtc.*` and WTC cannot weight `act3.*`.
+* Through the local API (§13), the owner can do the same things by hand; a local pause wins over a platform resume.
+
+### 10.5 Sharing the machine between ACT3 and WTC
+
+When both platforms have work that fits the same free slot, the server picks the platform by **weighted deficit
+round robin** over `platforms.*.share` (default 50/50): each platform earns credit in proportion to its share, spends
+it by GPU-seconds (or core-seconds for CPU work) actually used, and the one with the most credit goes next. When only
+one platform has work, it gets the whole machine. This prevents a 500-file WTC transcription backlog from starving ACT3
+renders, and the reverse, without hard partitions that waste idle time.
+
+## 11. Transport: how jobs reach the server
+
+**Goal of this section:** the broker decision (open in CLAUDE.md), with a recommendation.
+
+**Superseded 2026-10-27:** the transport and queueing layer is now specified in [task_queue.mdx](./task_queue.mdx)
+(NATS JetStream run as its own `nats-server` service, with detached task hosts that survive code updates; proposed
+decision D-Q1 there, which replaces D-001 below). This section is kept for history.
+
+### 11.1 Options
+
+| Option | How | For | Against |
+| --- | --- | --- | --- |
+| **A. HTTPS lease API** (recommended) | server polls `POST /processing/lease` on each platform; long-poll up to 25 s | outbound only, works behind any NAT; no new infrastructure; the platform's Postgres `FOR UPDATE SKIP LOCKED` claim already exists in job_runner; easy to test with a fake HTTP server | the platform must add the endpoints (§14); polling load (small: one long-poll per server per platform) |
+| B. Temporal Go worker | server registers activities on job_runner's task queues (`<type>@<serverKey>`, RenderEngine.mdx §9.1) | drop-in alongside today's TypeScript slaves; Temporal is language neutral | ties coordination to Temporal's rules (Bryan wants ours); WTC does not run Temporal |
+| C. RabbitMQ | per-service queues, server consumes with prefetch = free slots | mature, push-based, low latency | new infrastructure to run and secure; the home and Nepal machines need an outbound AMQP connection kept alive; priorities across queues are awkward |
+
+### 11.2 Recommendation
+
+**A as the contract, B as a migration adapter.** The server's `broker` package defines one interface, and the
+scheduler never knows which transport is underneath:
+
+```go
+// code/internal/broker/broker.go
+type Source interface {
+	Platform() string                                                    // "act3", "wtc"
+	Lease(ctx context.Context, req LeaseRequest) ([]*jobs.Job, error)     // free capacity in, jobs out
+	Renew(ctx context.Context, jobID, leaseID string, p Progress) (RenewResult, error) // RenewResult.Cancel
+	Complete(ctx context.Context, jobID string, r Result) error
+	Fail(ctx context.Context, jobID string, f Failure) error
+	Heartbeat(ctx context.Context, hb Heartbeat) (Directives, error)
+}
+```
+
+* `broker/httplease` implements A for both platforms (phase 1).
+* `broker/temporal` implements B only if ACT3 wants Go servers to take jobs from job_runner before appsrv has the
+  lease endpoints (phase 2, optional).
+* `broker/rabbitmq` is not built unless a measured need appears (latency under 1 s matters for some service).
+
+Bryan decides; the decision is recorded in `pm/Decisions.yaml` as `D-001 transport` (§22).
+
+## 12. Errors, retries and health
+
+**Goal of this section:** one failure policy, the same one RenderEngine.mdx §10 specifies for the platform side.
+
+### 12.1 Who retries
+
+* **The platform owns whole-job retries** (which server, how many attempts, whether to refund). The server reports
+  failures with a kind and lets the platform decide.
+* **The server retries only inside a stage**, where it is cheap and safe: a download, an upload, a health call. Never
+  the GPU work itself, which would hide a broken machine.
+
+### 12.2 Error kinds
+
+| Kind | Example on this server | Server action | Platform expected action |
+| --- | --- | --- | --- |
+| `invalid_input` | params fail the schema; input file is not a video | fail at once | fail, refund, show the sentence |
+| `content_policy` | a local safety filter refused | fail | fail, refund |
+| `transient` | upload 503; input URL timed out | retry the stage 3× (1 s, 4 s, 16 s), then fail | retry, any server |
+| `timeout` | runner exceeded `timeouts.run` | kill the process tree, fail | retry once, then fail |
+| `infra` | out of VRAM; ComfyUI down; disk full; server restarted; GPU vanished | fail, mark the service or server `DEGRADED` | retry on another server |
+| `internal` | a bug in our runner (panic) | recover the panic, fail with the stack in the job log | fail, refund, alert |
+
+Every failure carries `kind`, a one-sentence `message` a person can act on, `stage`, and `detail` (the last 50 lines of
+the job log, with secrets redacted).
+
+### 12.3 Out of memory
+
+GPU out-of-memory is detected from the runner's stderr patterns (`CUDA out of memory`, `MPS backend out of memory`)
+and from `nvidia-smi` showing the slot's GPU full. It is reported as `infra` with the needed and available VRAM, and
+the service's per-job VRAM estimate for that model is raised by 10% for 24 hours (in memory, logged), so the offer
+shrinks instead of failing again.
+
+### 12.4 Server health states
+
+| State | When | Effect |
+| --- | --- | --- |
+| `STARTING` | boot until the first successful heartbeat | no leases |
+| `ONLINE` | healthy, slots free | leases |
+| `BUSY` | healthy, no free slots | no new leases, keeps renewing |
+| `DEGRADED` | GPU over `gpu_temp_max_c` for 2 min; 3 `infra` failures in 10 min on one service; disk under `disk_min_free_gb` | no new leases for the affected services; clears itself after 10 min without the cause |
+| `PAUSED` | owner or platform paused everything | finish running jobs, no new ones |
+| `DRAINING` | `drain` requested (shutdown, deploy) | finish running jobs, then exit or stay idle |
+| `OFFLINE` | (platform's view) no heartbeat for 90 s | platform re-queues expired leases |
+
+Quiet hours from the site or `limits.quiet_hours` block services not listed in `allow` during the window and are
+shown as the reason in offers.
+
+## 13. Local API (on the server)
+
+**Goal of this section:** how local tools, the owner and operators talk to a running server (P8).
+
+* Listens on `local_api.listen`, default `127.0.0.1:9440` (no sister app uses 9440; see `~/BGit/all/app/CLAUDE.md`).
+* Every call except `GET /v1/health` needs `Authorization: Bearer <token>` from `local_api.token_file`. `init` creates
+  the token file (32 random bytes, base64url, mode `0600`) if it is missing.
+* JSON in and out, `Content-Type: application/json`, errors as `{ "error": { "code": "...", "message": "..." } }`.
+
+| Method and path | Does |
+| --- | --- |
+| `GET /v1/health` | `{ ok, state, version, git_sha, uptime_s }` (no auth; for `just status` and monitors) |
+| `GET /v1/server` | identity, site, profile, platforms connected, current state and its reason |
+| `GET /v1/hardware` | effective hardware (§7.4), detected, declared, and drift |
+| `POST /v1/hardware/refresh` | re-run detection now |
+| `GET /v1/capabilities` | the offers per service with reasons (§7.3) |
+| `GET /v1/services` | every service with: allowed by owner, platform weight, paused by whom, running, waiting |
+| `POST /v1/services/{id}/pause` · `/resume` | owner pause; a local pause wins over a platform resume |
+| `GET /v1/jobs?state=&service=` | jobs on this server now and in the last 24 h |
+| `GET /v1/jobs/{id}` | one job: envelope (inputs and params, URLs redacted), state history, slot, progress |
+| `GET /v1/jobs/{id}/log` | the per-job log (text, supports `?tail=200`) |
+| `POST /v1/jobs/{id}/cancel` | owner cancel; reported to the platform as cancelled by the machine owner |
+| `POST /v1/jobs` | **direct mode**: submit a job locally without a platform (development, `sys.self_test`, owner's own batch). Off unless `local_api.allow_direct_jobs: true` |
+| `POST /v1/drain` · `/v1/resume` | stop taking work / start again |
+| `POST /v1/reload` | reload `this_server.yaml` and `data/` (all or nothing) |
+| `GET /metrics` | Prometheus text: slots, jobs by state, durations, failures by kind, GPU telemetry |
+| `GET /` | a plain HTML status page (server-rendered, no JavaScript framework) for a quick look in a browser |
+
+The CLI subcommands (`ai_processing_server status`, `jobs`, `drain`, `cancel`) are thin clients of this API, so the
+command line and any future tool see exactly the same data.
+
+## 14. Platform API (the server calls ACT3 and WTC)
+
+**Goal of this section:** the contract each platform must implement for the server (P8). Both platforms implement the
+same paths under their own base URL; ACT3 under `/processing/`, WTC under `/api/processing/`.
+
+### 14.1 Authentication
+
+> **Superseded 2026-10-27** by [security.mdx](./security.mdx) §3 and §7 and [apis.mdx](./apis.mdx) §5: servers sign
+> every request with their own Ed25519 private key (RFC 9421 HTTP Message Signatures); the platform holds only public
+> keys, and paths move to `/processing/v1/`. The bearer-token text below is kept for history.
+
+* Each server has its own secret per platform (in its `credentials_file`), issued when an admin approves the server.
+  Sent as `Authorization: Bearer <server token>` plus `X-Server-Key: B5090`.
+* The platform checks the token against its registry row (ACT3 `render_server`, bryan_servers.mdx §13) and rejects a
+  token used with a different key. Tokens can be rotated by the platform; the server reloads the credentials file on
+  401 once before giving up and going `DEGRADED` for that platform.
+
+### 14.2 Endpoints
+
+| Method and path | Body in | Body out | Notes |
+| --- | --- | --- | --- |
+| `POST /processing/register` | identity, version, full hardware, offers | `{ status: APPROVED or PENDING_APPROVAL, server_id }` | at boot and after any config reload |
+| `POST /processing/heartbeat` | §14.3 | `Directives` (§14.4) | every 15 s; full hardware every 10 min |
+| `POST /processing/lease` | `{ offers: [{ service, free_slots, resident_models }], wait_s: 25 }` | `{ jobs: [envelope…] }` | long-poll: returns at once if work exists, else after `wait_s` with none |
+| `POST /processing/jobs/{id}/renew` | `{ lease_id, state, stage, progress, note, log_tail }` | `{ ok, cancel, lease_expires_at }` | every 20 s per job |
+| `POST /processing/jobs/{id}/upload-urls` | `{ lease_id, outputs: [{ name, bytes, content_type }] }` | fresh presigned URLs | when the envelope's URLs may have expired |
+| `POST /processing/jobs/{id}/complete` | `{ lease_id, outputs: [...], timings, dry_run? }` | `{ ok }` or `409 lease_lost` | `dry_run` checks the lease before upload (§9.4) |
+| `POST /processing/jobs/{id}/fail` | `{ lease_id, kind, message, stage, detail }` | `{ ok, will_retry }` | |
+| `POST /processing/events` | batched server events: model loaded, degraded, drift, owner pause | `{ ok }` | for the Server page's timeline |
+
+For ACT3 the heartbeat body is the one bryan_servers.mdx §6.2 already specifies for `POST /render-servers/heartbeat`; the
+two specs must keep one shape. The ACT3 implementation of `lease` claims rows from the `job` table with the same
+`FOR UPDATE SKIP LOCKED` order job_runner uses today (`priority DESC, createdAt ASC`, dependencies complete), filtered
+to the job types the offered services map to (`platform_job_types`, §8.2), and writes `serverName` and the lease.
+
+### 14.3 Heartbeat body
+
+```json
+{
+  "key": "B5090",
+  "version": "0.3.0", "git_sha": "5f1ead1",
+  "state": "ONLINE", "state_reason": "",
+  "site": { "claimed": "bryan_office", "timezone": "America/Los_Angeles" },
+  "load": {
+    "cpu_pct": 34, "ram_used_gb": 41,
+    "gpus": [{ "index": 0, "util_pct": 97, "vram_used_gb": 29.8, "temp_c": 71, "power_w": 540 }],
+    "disk_free_gb": 2890
+  },
+  "slots": { "total": 4, "busy": 2 },
+  "active_jobs": [{ "job_id": "…", "platform": "act3", "service": "act3.comfy_on_prem", "state": "RUNNING", "progress": 0.42 }],
+  "offers": [{ "service": "act3.comfy_on_prem", "parallel": 1, "free": 0, "reason": "ok" }],
+  "resident_models": ["wan2.2-a14b-fp8"],
+  "drift": [],
+  "special": { "openclaw": { "containers": 3, "busy": true } }
+}
+```
+
+Each platform receives only its own jobs and services in `active_jobs` and `offers`, plus the machine-level facts.
+ACT3 is not told what WTC jobs contain, and the reverse; it is told only that slots are busy.
+
+### 14.4 Directives (heartbeat response)
+
+```json
+{
+  "service_weights": { "act3.video_gen_open_source": 40, "act3.video_merge": -10 },
+  "paused_services": ["act3.blender_render"],
+  "drain": false,
+  "refresh_hardware": false,
+  "message": "Weights set by bryan@ 2026-10-27 09:20"
+}
+```
+
+## 15. Code architecture
+
+**Goal of this section:** the Go packages and the main types, matching CLAUDE.md's suggested layout.
+
+### 15.1 Packages
+
+```
+code/
+├── go.mod
+├── cmd/ai_processing_server/main.go   # subcommands: init, run, status, jobs, drain, resume, cancel, detect, validate, version
+└── internal/
+    ├── config/       # load + validate this_server.yaml and data/ catalogs; template fill for init; never writes outside init
+    ├── hardware/     # probes per OS (hardware_darwin.go, hardware_windows.go, hardware_linux.go), engines, telemetry loop
+    ├── capability/   # hardware × services × limits → offers with reasons (§7.3)
+    ├── profiles/     # per-machine behavior: generic, b5090, bpc, bmt, bms, cloud (§15.3)
+    ├── jobs/         # Job, envelope parsing, state machine, ErrorKind, journal
+    ├── scheduler/    # slots, admission, local ordering (§10.3), platform sharing (§10.5), leasing loop
+    ├── broker/       # Source interface; httplease/ (phase 1); temporal/ (optional)
+    ├── runners/      # Runner interface; ffmpeg/, comfy/, blender/, python/, whisper/, selftest/
+    ├── procs/        # process-group execution, kill trees, output capture
+    ├── models/       # model catalog and cache
+    ├── storage/      # input download, output upload, checksums, multipart
+    ├── report/       # heartbeat builder, events, progress throttling
+    ├── api/          # local HTTP API (§13) and the status page
+    └── logging/      # ~/_act3_logs writers (§18)
+```
+
+Dependency direction: `cmd` → `scheduler` → (`broker`, `runners`, `capability`, `jobs`, `report`) → (`hardware`,
+`config`, `procs`, `storage`, `models`, `logging`). Nothing imports `cmd` or `api`; `api` reads from the scheduler
+through a narrow read-only interface.
+
+### 15.2 Main types
+
+```go
+// code/internal/scheduler/server.go
+type Server struct {
+	cfg       *config.Config        // this_server.yaml + data/, immutable; replaced whole on reload
+	hw        *hardware.Monitor     // effective hardware and live telemetry
+	profile   profiles.Profile
+	sources   []broker.Source       // one per enabled platform
+	runners   map[string]runners.Runner
+	slots     *SlotPool
+	journal   *jobs.Journal
+	overrides *PlatformOverrides    // state/platform_overrides.yaml
+	log       *slog.Logger
+}
+
+func (s *Server) Run(ctx context.Context) error // boot recovery, register, then the loops below until ctx ends
+
+// Loops started by Run, each its own goroutine, all stopped by ctx:
+//   heartbeatLoop   every 15 s per platform
+//   leaseLoop       per platform: long-poll while any offer has free capacity
+//   admitLoop       wakes on slot release or new lease; starts the highest effective-priority job that fits
+//   renewLoop       every 20 s for every live job
+//   telemetryLoop   every 5 s
+//   sweepLoop       every 10 min: work dirs, logs, cache cap, hardware refresh
+```
+
+```go
+// code/internal/scheduler/slots.go
+type Slot struct {
+	ID       string
+	GPU      *int     // nil for CPU-only
+	Cores    int
+	RAMGB    float64
+	VRAMGB   float64
+}
+
+type SlotPool interface {
+	TryAcquire(req Resources, service string) (Slot, bool) // never blocks; admitLoop decides order
+	Release(Slot)
+	Snapshot() PoolState
+}
+```
+
+### 15.3 Profiles (the "base class and subclasses" in Go)
+
+bryan_servers.mdx §7 asks for a server base class with a subclass per special machine. Go has no inheritance, so the
+same design is done with an interface plus an embeddable base:
+
+```go
+// code/internal/profiles/profile.go
+type Profile interface {
+	Name() string
+	// Adjust narrows offers for machine-specific reasons (OpenClaw busy, owner using the CPU).
+	Adjust(offers []capability.Offer, load hardware.Load) []capability.Offer
+	// BeforeJob / AfterJob hook the lifecycle (unload a resident model, pin a GPU).
+	BeforeJob(ctx context.Context, job *jobs.Job, slot scheduler.Slot) error
+	AfterJob(ctx context.Context, job *jobs.Job, outcome jobs.Outcome)
+	// Special returns extra heartbeat data for the machine's admin panel.
+	Special(ctx context.Context) map[string]any
+}
+
+// Base implements every method as a no-op; profiles embed it and override what they need.
+type Base struct{}
+```
+
+| Profile | Embeds | Overrides |
+| --- | --- | --- |
+| `generic` | `Base` | nothing |
+| `cuda` | `Base` | VRAM-fit checks per GPU, NVENC capability, thermal guard |
+| `b5090` | `cuda` | one heavy model resident at a time; switch-cost in offers; VRAM by process in `Special` |
+| `bpc` | `cuda` | one slot per GPU with `CUDA_VISIBLE_DEVICES`; never sums VRAM across cards |
+| `mac` | `Base` | unified-memory fit, Metal/MLX capability, `powermetrics`-free telemetry |
+| `bmt` | `mac` | CPU and ffmpeg services only; declines new work while non-server CPU use is over 70% |
+| `bms` | `mac` | OpenClaw is the tenant: declines GPU/ML work while OpenClaw containers are busy; `memory_reserve_gb` default 128 |
+| `cloud` | `Base` | no reserves, no quiet hours, drain on SIGTERM within the platform's grace period |
+
+Machine-specific behavior lives only in its profile. A code review rule: no `if key == "B5090"` anywhere else.
+
+## 16. Security
+
+**Goal of this section:** what protects customer data, the machines and the platforms.
+
+The full security design (server key pairs, `servers/{Server}/keys/`, enrollment, signed requests and responses,
+threat model, rotation, SSRF guard, hardening) is in [security.mdx](./security.mdx); the wire contract is
+[apis.mdx](./apis.mdx). This section is the short version.
+
+### 16.1 Secrets
+
+* Never in `data/`, never in logs, never in heartbeats. `this_server.yaml` holds paths to credential files, not their
+  contents. The logger redacts any value whose key matches `token|secret|password|key|authorization` and any URL query
+  string named `X-Amz-Signature` or `sig`.
+* Presigned URLs are logged as host and path only.
+
+### 16.2 Server approval
+
+A new key registers as `PENDING_APPROVAL`. An admin approves it on the platform's admin page, which issues the server
+token. A server whose token is revoked stops leasing within one heartbeat.
+
+### 16.3 Customer data
+
+* Inputs and outputs live only in the job's work dir and are deleted after upload (§9.6).
+* A site with `customer_data_allowed: false` (from `data/sites/sites.yaml`) makes the server reject envelopes with
+  `data_rules.customer_data: true` before downloading anything, with reason "site does not allow customer data".
+* The BMS profile defaults `customer_work: false` until Bryan decides (bryan_servers.mdx §18 Q1).
+* Platform isolation: a job's files, logs and details are never sent to the other platform (§14.3).
+
+### 16.4 Local API exposure
+
+Loopback by default. Binding to a LAN address needs `local_api.listen` set to it on purpose, and then the token is
+mandatory for every route including `/` and `/metrics`. Never exposed to the internet; the server has no TLS listener
+of its own.
+
+### 16.5 Running processes
+
+* The server runs as a normal user, never root or Administrator.
+* Runner processes inherit a cleaned environment: only `PATH`, `HOME`, locale, the GPU pin, and variables the service
+  catalog lists. Platform tokens are not passed to child processes.
+* Input files are never executed. Python and Blender scripts run are the ones checked into this repo or installed
+  engines, never scripts from a job's params.
+
+## 17. The justfile
+
+**Goal of this section:** the build and operations commands on every machine (P1, P3).
+
+| Recipe | Does |
+| --- | --- |
+| `just build` | `go build` from `code/` into the repo root with version ldflags, then `./ai_processing_server init` (creates `data/git_ignore/this_server.yaml` only if missing; validates it otherwise) |
+| `just run` | start in the background, write `state/server.pid`, print `Local API: http://127.0.0.1:9440/` and the log paths |
+| `just run-fg` | run in the foreground (development) |
+| `just stop` | `POST /v1/drain` with a 10 min wait, then signal the process; `just stop force` kills now |
+| `just status` | `GET /v1/health` and a short table of services and jobs |
+| `just logs` | tail `~/_act3_logs/processing_server.info` and `.err` |
+| `just init` | the init step alone |
+| `just reinit` | write `this_server.yaml.new` and print the diff (§6.7) |
+| `just detect` | print detected hardware and offers without starting the server |
+| `just test` | `go test ./...` in `code/`, plus `go vet` |
+| `just install-service` | install as launchd agent (macOS), Windows service, or systemd user unit (§19) |
+
+The justfile works on Windows: it sets `windows-shell := ["powershell.exe", "-NoLogo", "-Command"]` and uses the
+`.exe` binary name there. `just build` then `just run` must work on a clean checkout with Go installed and nothing else;
+a missing `nvidia-smi`, Blender or ComfyUI only turns services off with reasons, it never fails the build.
+
+## 18. Logging and observability
+
+**Goal of this section:** where everything is written, matching the other ACT3 components.
+
+* `~/_act3_logs/processing_server.info`: INFO and DEBUG. `~/_act3_logs/processing_server.err`: WARN and ERROR.
+  Append-only, opened with `O_APPEND`, one line per entry, format
+  `[ISO_TIMESTAMP_PST] [LEVEL] [CONTEXT] message key=value …` (the webapp's format, CLAUDE.md "ACT3 Platform Log
+  Files"). CONTEXT is the package (`scheduler`, `runner.comfy`, `broker.act3`).
+* Rotation by size (50 MB, keep 5) done by the server itself, so no external tool is needed on Windows.
+* Per-job logs in `data/git_ignore/logs/jobs/<job_id>.log`, uploaded with the result (as an output named `log`), the
+  tail included in failures.
+* Every job writes exactly one INFO line at start and one INFO (done) or ERROR (failed) line at end, with job id,
+  platform, service, slot, durations per stage, and output sizes. That pair is the fault trail an engineer greps first.
+* `/metrics` for Prometheus (job_runner already has Prometheus and Loki configs that can scrape it).
+* Heartbeats make the platform's Server page the main human view; the local status page is for when the platform is
+  unreachable.
+
+## 19. Deployment and operations
+
+**Goal of this section:** how the server runs on real machines.
+
+### 19.1 Per machine setup
+
+1. Install Go and `just`. On GPU machines: the NVIDIA driver (and CUDA only if a runner needs it outside ComfyUI), or
+   nothing extra on Apple silicon.
+2. Clone the repo, `just build`. Read what `init` printed; edit `data/git_ignore/this_server.yaml` (key if
+   `CHANGE_ME`, services, limits, credential paths).
+3. Create the credential files the yaml names (from the platform's admin page after approval).
+4. `just run`, then `just status`. Check the server shows on the ACT3 Render Queue server strip.
+5. `just install-service` so it starts at boot.
+
+Engine setup (ComfyUI, Blender, Python environments, model downloads) is documented per engine in
+`pm/docs/engines/{engine}.md` (to write). The server detects and reports what is missing; it never fails silently.
+
+### 19.2 Service managers
+
+| OS | Manager | Notes |
+| --- | --- | --- |
+| macOS | launchd user agent `~/Library/LaunchAgents/ai.act3.processing_server.plist`, `KeepAlive` | user session so Metal is available |
+| Windows | Windows service through `golang.org/x/sys/windows/svc`, or Task Scheduler at logon when GPU desktop access is needed | NVIDIA works from a service; ComfyUI is its own process |
+| Linux | systemd user unit, `Restart=on-failure` | cloud boxes |
+
+### 19.3 Updates
+
+`git pull` then `just build` then `just stop` and `just run`. `stop` drains first, so a deploy never kills a render.
+Automated fleet updates (a deployer like job_runner's) are phase 4.
+
+### 19.4 Signals
+
+`SIGINT`/`SIGTERM` (Windows: service stop or Ctrl+C): drain, wait up to `drain_timeout` (10 min, cloud: the
+platform's grace period), then cancel remaining jobs as `infra` "server shutting down" so the platform re-queues them.
+`SIGHUP`: reload config.
+
+## 20. Tests and acceptance
+
+**Goal of this section:** how we know it works, tied to the requirements.
+
+### 20.1 Unit tests (`*_test.go` next to the code)
+
+* `config`: template fill produces a valid file for each fixture machine (5090 Windows, two-GPU PC, Mac Tower, Mac
+  Studio, CPU-only Linux); invalid files give precise errors; reload is all-or-nothing.
+* **`init` never overwrites:** create a file, run `init` twice, assert the bytes and mtime are unchanged (P3).
+* **Only `init` writes `this_server.yaml`:** a test wraps the filesystem layer and fails if any other code path opens
+  it for writing.
+* `hardware`: parsers for recorded outputs of `nvidia-smi`, `system_profiler`, `sysctl`, `rocm-smi` (fixtures in
+  `code/internal/hardware/testdata/`), including a broken `nvidia-smi`.
+* `capability`: offers and reasons for each fixture machine and each service; min(detected, declared) rule.
+* `scheduler`: slot admission, BPC per-card slots, effective priority with aging, deficit round robin shares, owner
+  fence beats platform directives (P7).
+* `jobs`: every state transition, journal recovery after a simulated crash at each state.
+
+### 20.2 Integration tests (`tests/` and `code/internal/.../integration_test.go` with build tag `integration`)
+
+* A fake platform (Go `httptest` server) implementing §14: lease, renew with cancel, complete, fail, directives.
+* `sys.self_test` end to end: lease, stage a small input, run, upload to a fake bucket, complete.
+* Cancel at each stage: nothing uploaded after cancel.
+* Lease lost during a network outage: outputs discarded on `409 lease_lost`.
+* Two platforms with backlogs: shares within 10% of configured over 100 jobs.
+
+### 20.3 Acceptance on real machines
+
+| # | Check | Requirement |
+| --- | --- | --- |
+| A1 | Fresh clone on each of the Bryan 4: `just build` creates a correct `this_server.yaml` naming the machine | P3, P4, P5 |
+| A2 | Running `just build` again leaves the file byte-identical | P3 |
+| A3 | Turning a service off in the yaml and reloading stops new jobs of that kind; a platform directive cannot turn it back on | P6, P7 |
+| A4 | ACT3 raises a service weight; the next local ordering reflects it within one heartbeat | P7 |
+| A5 | B5090 runs a Comfy job and a merge in parallel; BPC runs one GPU job per card | §9.3 |
+| A6 | Pulling the network for 2 minutes mid-render: the job finishes or is cleanly re-assigned, never two results | §9.4 |
+| A7 | Killing the process mid-job: on restart the job is reported failed with `infra` and its work dir is gone | §9.5 |
+| A8 | `git status` after a day of running shows nothing under `data/git_ignore/` | P2 |
+
+## 21. Build plan
+
+**Goal of this section:** the order of work, smallest useful thing first.
+
+| Phase | Delivers | Done when |
+| --- | --- | --- |
+| **0. Specs and scaffold** | this spec; `pm/Goal.md`, `pm/TO_DO.md`, `pm/Decisions.yaml`; `.gitignore` line for `/data/git_ignore/`; `code/go.mod`, `main.go` with `version`; justfile `build`/`run` | `just build` and `just run` work on a clean checkout |
+| **1. Identity and hardware** | `config`, `hardware`, `capability`, `init`, `detect`, local API read routes, logging | A1, A2 on all four machines |
+| **2. Jobs locally** | `jobs`, `scheduler`, `procs`, `storage`, runners `selftest` and `ffmpeg`, direct mode | merges run locally through `POST /v1/jobs` |
+| **3. ACT3 connected** | `broker/httplease`; appsrv adds §14 endpoints over the `job` table; heartbeat feeds the Server page | ACT3 flash merges run on BMT through the platform; A3 to A7 |
+| **4. GPU services** | runners `comfy`, `python` (upscale, video gen), model cache, profiles `b5090`, `bpc`, `bms` | `comfy_generation_on_prem` moved from job_runner to this server on B5090 |
+| **5. WTC connected** | WTC backend implements §14; `wtc.transcription`, `wtc.transcode`, `wtc.ocr` | WTC backlog processed on BMS/BMT with shares honored |
+| **6. Fleet** | `install-service`, metrics, automated update, Nepal and cloud machines | a fifth machine joins with no code change |
+
+Strangler rule for ACT3: one job type at a time moves from job_runner to this server; job_runner stops polling that
+queue on the same day the lease endpoint starts serving it. No job type is served by both at once.
+
+## 22. Decisions
+
+**Goal of this section:** decisions this spec makes or needs; to be copied into `pm/Decisions.yaml`.
+
+| Id | Decision | Status |
+| --- | --- | --- |
+| D-001 | Transport: HTTPS lease API as the contract, Temporal adapter optional for migration, RabbitMQ not now (§11) | **proposed**, Bryan to confirm |
+| D-002 | `this_server.yaml` is written only by `init` when missing; machine-written state goes to `state/` | decided by the request |
+| D-003 | Owner allow-list is a hard fence; platforms set priority, weight, pause and drain only inside it (§10.1) | proposed |
+| D-004 | Effective hardware = min(detected, declared) (§7.4) | proposed |
+| D-005 | Pure Go build (`CGO_ENABLED=0`); GPU facts from vendor CLIs (§3.1) | proposed |
+| D-006 | Local API on `127.0.0.1:9440` with a bearer token (§13) | proposed |
+| D-007 | Priority scale shared with ACT3's `JobPriority` (§10.2) | proposed |
+
+## 23. Open questions for Bryan
+
+1. **Q1. Transport (D-001):** confirm HTTPS lease as the contract, or do you want RabbitMQ from the start?
+2. **Q2. Hostnames** of B5090, BPC, BMT and BMS for `known_servers.yaml`, so `init` names them without typing.
+3. **Q3. Default share** between ACT3 and WTC on the Bryan 4 (this spec proposes 70/30 on B5090 and BPC, 30/70 on BMS
+   where transcription fits best).
+4. **Q4. WTC's first services:** transcription, AI descriptions, OCR and transcodes are assumed from the Large File
+   Bridge work. Which come first, and does WTC already have a job table to lease from?
+5. **Q5. Quiet hours** at Bryan's office for the GPU machines (fan noise), or none?
+6. **Q6. Direct mode** (`POST /v1/jobs`) for your own batches (marketing videos, transcriptions) without going through
+   a platform: wanted on by default on the Bryan 4?
+7. **Q7. Customer work on BMS** (bryan_servers.mdx §18 Q1): still R&D and marketing only?
+
+## 24. Source code map and upgrade log
+
+**Goal of this section:** where each part is implemented, and what changed when.
+
+### 24.1 Planned source map (paths fixed now so the build lands where the spec says)
+
+Hardware detection per OS is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/hardware/` — `Monitor`, `Detect`
+
+Creating `this_server.yaml` once (never overwriting) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/config/init.go` — `InitThisServer`
+
+Loading and validating `this_server.yaml` and the `data/` catalogs is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/config/load.go` — `Load`
+
+Turning hardware and allowed services into offers is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/capability/offers.go` — `ComputeOffers`
+
+Slots, admission and the effective priority are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.admit`, `Server.effPriority` (slots in `slots.go`, `SlotPool`)
+
+Leasing from ACT3 and WTC will be implemented in code (phase 3, not built yet):
+`~/BGit/act3/ai_processing_server/code/internal/broker/httplease/` — `Source`
+
+The local API is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/api/api.go` — `NewRouter`
+
+The job lifecycle (stage, run, upload, retry, cancel) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/execute.go` — `Server.execute`, `Server.finishLocked`
+
+Crash recovery from the journal is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.recover`
+
+The black-box test suite (how it runs, what each suite proves) is documented in:
+`~/BGit/act3/ai_processing_server/tests/README.md`
+
+### 24.2 Upgrade log
+
+* 2026-10-27: spec written. No code yet.
+* 2026-10-27: v0.1.0 built. Go code under `code/`, `justfile`, `data/` catalogs (10 services, known servers,
+  template), Go unit tests, and the black-box suite in `tests/` (74 tests, Python standard library). Jobs arrive by
+  direct mode only; no platform transport yet. The job record mirrors Asynq's TaskInfo (`pm/Decisions.yaml`
+  D-008). Runners built: `compute`, `render`, `ffmpeg`. The laptop's hand-written legacy `this_server.yaml` is left
+  untouched; the server runs from a generated config and wrote `this_server.yaml.new` to merge.
+* 2026-10-27: security.mdx and apis.mdx written; §14.1 superseded (signed requests replace bearer tokens).

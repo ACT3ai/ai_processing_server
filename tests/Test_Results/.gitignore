@@ -1,0 +1,4 @@
+# Per-run results are written here by run_tests.py; they are local output, not source.
+*
+!.gitignore
+!README.md

@@ -1,0 +1,62 @@
+# this_server.yaml: what THIS machine is and what it is allowed to do (pm/ai_processing_server.mdx §6).
+# Created once by `just build` (ai_processing_server init). It is NEVER rewritten after that:
+# edit it by hand. `just reinit` writes this_server.yaml.new with fresh detection for you to compare.
+schema_version: 1
+created_at: "{{.CreatedAt}}"
+created_by: "{{.CreatedBy}}"
+
+server:
+  key: {{.ID.Key}}                    # upper case, A-Z 0-9, at most 12 characters, unique across the fleet
+  display_name: "{{.ID.DisplayName}}"
+  profile: {{.ID.Profile}}            # generic | b5090 | bpc | bmt | bms | cloud
+  family: {{.ID.Family}}              # bryan | office | cloud | runpod
+  site: {{.ID.Site}}
+  bound_to:                           # a mismatch at boot means this file was copied from another machine
+    hostname: "{{.ID.BoundTo.Hostname}}"
+    machine_id: "{{.MachineID}}"
+
+# Snapshot at creation. You may LOWER numbers to offer less; raising them has no effect (§7.4).
+hardware:
+{{.HardwareYAML}}
+
+# Engine overrides: name -> path (or URL for comfyui) when an engine is not on PATH.
+engines: {}
+
+# The owner's allow-list. A platform can never turn on a service that is off here.
+# Per service: enabled, max_parallel (cap), gpus (allowed GPU indexes), local_bias (-50..50).
+services:
+{{.ServicesYAML}}
+
+platforms:                            # connections are not built yet (phase 3); kept for the shape
+  act3:
+    enabled: false
+    base_url: "https://api.act3ai.com"
+    credentials_file: "~/BGit/act3/act3ai-credentials/processing_servers/{{.ID.Key}}.yaml"
+    share: 70
+  wtc:
+    enabled: false
+    base_url: "https://api.wethecitizens.io"
+    credentials_file: "~/.credentials/wethecitizens_processing_{{.ID.Key}}.json"
+    share: 30
+
+limits:
+  max_parallel_jobs: 4                # whole machine
+  cpu_reserve_pct: 20                 # never offered to jobs
+  ram_reserve_gb: 16
+  vram_headroom_gb: 1.5               # per GPU
+  disk_min_free_gb: 20                # below this, no new jobs that write locally
+  gpu_temp_max_c: 85
+  drain_timeout_s: 600                # on stop: wait this long for running jobs
+
+paths:
+  work_dir: ""                        # default data/git_ignore/work
+  cache_dir: ""                       # default data/git_ignore/cache
+  cache_max_gb: 200
+
+local_api:
+  listen: "127.0.0.1:9440"            # loopback; LAN only on purpose (§16.4)
+  token_file: "~/.credentials/ai_processing_server_local.token"
+  allow_direct_jobs: true             # POST /v1/jobs without a platform (development, self tests, owner batches)
+
+debug:
+  keep_work_dirs: false

@@ -1,0 +1,13 @@
+schema_version: 1
+id: wtc.transcode
+platform: wtc
+title: "We The Citizens transcode: H.264 + AAC + yuv420p for X (never AV1 for X)"
+runner: ffmpeg
+default_enabled: true
+requires:
+  engines: { ffmpeg: ">=6.0", ffprobe: ">=6.0" }
+  gpu: optional
+resources_per_job: { cpu_cores: 2, ram_gb: 2, vram_gb: 0 }
+max_parallel_default: 3
+timeouts: { stage_inputs: 10m, run: 60m, upload: 20m }
+retry: { max_attempts: 2, retry_on: [transient, infra] }

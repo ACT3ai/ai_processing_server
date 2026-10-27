@@ -1,0 +1,915 @@
+---
+title: "ai_processing_server: API engineering specification"
+description: "CTO engineering spec for every API between the processing/render servers and the ACT3 and We The Citizens platforms: why outbound-only HTTPS long-poll works behind firewalls, REST + JSON with an OpenAPI 3.1 contract, the RFC 9421 signature profile (requests and responses), common conventions (Problem Details, idempotency, tracing, retries), the full endpoint reference with bodies and status codes, the control channel, file transfer through presigned URLs, sequences, error codes, the Go and NestJS implementation and tests."
+---
+
+{/* Written 2026-10-27 by the CTO pass. Companion to pm/security.mdx (why the keys and signatures are designed this
+way) and pm/ai_processing_server.mdx (the whole server). This file is the authoritative wire contract and
+supersedes the endpoint table in ai_processing_server.mdx §14.2 (paths gain /v1, auth changes to signatures). */}
+
+# ai_processing_server: API engineering specification
+
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** specified, not built
+· **Companions:** [security.mdx](./security.mdx) (keys, trust, threat model) ·
+[ai_processing_server.mdx](./ai_processing_server.mdx) (job lifecycle, scheduler, local API) ·
+`~/BGit/all/film/pm/subp/render_queue/bryan_servers.mdx` §6.2 and §12 (fleet registry and admin APIs)
+
+## Summary
+
+* **Shape:** REST-style resources, JSON bodies, HTTPS, under `/processing/v1/` on each platform. One OpenAPI 3.1
+  document (`data/schemas/openapi/processing_v1.yaml`) is the contract both platforms implement and the server's
+  client is tested against.
+* **Direction:** the server **always calls out**; the platform never calls in. Work arrives on a **long-poll**
+  (`POST /lease`, held open up to 25 s), commands arrive in the responses to `heartbeat` (15 s) and `renew` (20 s).
+  This works behind any home or office NAT and firewall with no port forwarding, no VPN and no tunnel.
+* **Auth:** every request is signed by the server's private key with **RFC 9421 HTTP Message Signatures** (Ed25519)
+  and a body hash (`Content-Digest`, RFC 9530). Every response that carries work or orders is signed by the platform
+  and bound to the request's signature. The platform knows only public keys.
+* **Files never go through the API.** Inputs and outputs move directly between the server and object storage with
+  short-lived presigned URLs.
+* **Standards:** HTTP semantics (RFC 9110), JSON (RFC 8259), OpenAPI 3.1, RFC 9421, RFC 9530, Problem Details
+  (RFC 9457), W3C Trace Context, RFC 3339 timestamps, UUIDv7 ids (RFC 9562), `Idempotency-Key` (IETF httpapi draft),
+  `Retry-After` (RFC 9110).
+
+## 0. Scope
+
+**Goal of this section:** which APIs this file covers.
+
+| API | Caller → callee | Where specified |
+| --- | --- | --- |
+| **Processing API** (this file) | server → ACT3 appsrv, server → WTC backend | §3 to §9 |
+| Admin registration API | GitHub Action or admin page → platform | §7.10 |
+| Local API | owner, CLI, local tools → server on `127.0.0.1:9440` | ai_processing_server.mdx §13; auth in security.mdx §13; summary §10 |
+| Storage | server → S3 / R2 / IPFS gateways via presigned URLs | §9 |
+| Fleet admin UI APIs (Server page, Fleet page) | browser → platform | bryan_servers.mdx §12 |
+
+Both platforms implement the same Processing API. ACT3 serves it under `https://api.act3ai.com/processing/v1/` and
+WTC under `https://api.wethecitizens.io/api/processing/v1/` (hostnames to confirm, security.mdx §21 Q3). The server
+reads the base URL from `data/platforms/{platform}.yaml` and knows nothing else about which product it talks to.
+
+## 1. Design principles
+
+**Goal of this section:** the rules every endpoint follows.
+
+1. **Outbound only.** No endpoint on the server is reachable from the network. Everything the platform says is a
+   response.
+2. **Our coordination, a boring transport.** Leasing, priority and retries are rules in this spec, implemented in our
+   code. HTTP carries them; no broker is required (ai_processing_server.mdx §11, decision D-001).
+3. **Resources and verbs, not RPC soup.** Jobs are resources (`/jobs/{job_id}`) with a small set of state-changing
+   sub-resources (`/renew`, `/complete`, `/fail`). Every state change is a `POST` (not `PATCH`), because each one is
+   an event with its own rules, not a partial document update.
+4. **The platform is the source of truth for jobs; the server is the source of truth for its hardware.**
+5. **Every write is idempotent.** Retried requests are safe (§4.5).
+6. **Signed both ways.** No unsigned request is processed; no unsigned order is obeyed (§5).
+7. **Small, explicit payloads.** Bodies are capped (§4.8). Logs and files go elsewhere.
+8. **Versioned by path, extended by addition.** `/v1` changes only by adding optional fields and endpoints. Clients
+   ignore unknown response fields; servers reject unknown request fields only where the schema says so.
+9. **One shape for errors** (Problem Details, §4.6) and one list of codes (§12).
+
+## 2. Topology: going back and forth through a firewall
+
+**Goal of this section:** how two-way control works when only one side can open connections (security.mdx S6).
+
+### 2.1 The problem
+
+The render servers are in a house (the Bryan 4), an office behind NAT (Nepal), or a cloud VPC. None of them can accept
+an inbound call from the internet, and we do not want them to: an open port on a GPU machine is an attack surface. The
+platform still needs to (a) hand out jobs fast, (b) cancel a running job, (c) change priorities, pause and drain, and
+(d) learn progress.
+
+### 2.2 Options
+
+| Option | How | Verdict |
+| --- | --- | --- |
+| **A. HTTPS long-poll + piggy-backed commands** | the server keeps one `POST /lease` open per platform; the platform answers the moment a job fits, or after 25 s with none. Commands ride on the 15 s heartbeat and 20 s renew responses | **chosen**: plain HTTPS through every NAT, proxy and CDN; stateless on the platform (any appsrv instance can answer); trivial to test; latency under 1 s for new jobs and at most 20 s for cancel |
+| B. WebSocket (RFC 6455) or Server-Sent Events, server-initiated | one long-lived connection, platform pushes | **later, optional** (§2.5): faster cancel, but needs sticky connections, ping/reconnect logic, and proxies that time out idle sockets; signing per message has no RFC 9421 equivalent |
+| C. gRPC bidirectional streaming | protobuf over HTTP/2 | rejected: a proto toolchain on both platforms (NestJS appsrv), weaker support on CDNs, and REST was the stated preference |
+| D. Inbound webhooks to the server | platform calls the server | rejected: needs port forwarding or a public IP per machine |
+| E. Tunnels or VPN (Cloudflare Tunnel, ngrok, Tailscale, WireGuard) so the platform can call in | an overlay network | rejected for the job path: one more service per machine to secure and keep alive, and it moves the trust problem rather than solving it. Allowed for owner remote admin (security.mdx §13.3) |
+| F. Message broker (RabbitMQ / AMQP, MQTT, NATS) | servers keep an outbound broker connection | not now (ai_processing_server.mdx §11): new infrastructure to run and secure, and our priority rules do not map neatly onto queues. The `broker.Source` interface keeps the door open |
+
+### 2.3 The loops (per platform, per server)
+
+```
+  server                                                                 platform
+    │── POST /register (boot, reload) ───────────────────────────────────►│
+    │◄─────────────────────────────── 200 {status, config} (signed) ──────│
+    │
+    │── POST /heartbeat every 15 s ──────────────────────────────────────►│  load, offers, active jobs
+    │◄─────────────────────────────── 200 {directives, commands} (signed) │  weights, pauses, drain, cancel_all
+    │
+    │── POST /lease {offers, wait_s: 25} ────────────────────────────────►│  held open until a job fits
+    │◄────────────────────────── 200 {jobs: [envelope…]} (signed) ────────│  or 200 {jobs: []} at 25 s
+    │   (immediately opens the next /lease while any offer has free capacity)
+    │
+    │   per running job:
+    │── POST /jobs/{id}/renew every 20 s ────────────────────────────────►│  progress, stage
+    │◄──────────────────────── 200 {cancel, lease_expires_at} (signed) ───│
+    │── PUT  <presigned URL> (outputs, straight to storage) ──────────────────────────────► S3 / R2
+    │── POST /jobs/{id}/complete  or  /fail ─────────────────────────────►│
+    │◄──────────────────────────────── 200 {ok} (signed) ─────────────────│
+```
+
+### 2.4 Latency budget
+
+| Event | Worst case | Typical |
+| --- | --- | --- |
+| New job reaches an idle server with a free slot | the platform's wake-up latency on the open long-poll (§7.4) | < 1 s |
+| Cancel reaches a running job | one renew interval | ≤ 20 s (10 s average) |
+| Priority or pause change applies | one heartbeat interval | ≤ 15 s |
+| Platform notices a dead server | 90 s without heartbeat | 90 s |
+| Lease returns to the queue after a dead server | lease length | 60 s |
+
+### 2.5 Optional fast channel (phase 5, only if measured need)
+
+If 20 s cancel or 15 s directives prove too slow for a product feature, add `GET /processing/v1/stream` as Server-Sent
+Events opened by the server, carrying only **wake-up hints** (`{"type":"wake","reason":"cancel","job_id":"…"}`), never
+the command itself. On a hint the server immediately calls the normal signed endpoint (`renew`, `heartbeat`). The
+stream therefore needs no per-message signing and cannot be used to forge an order; losing it only means falling back
+to the poll intervals above.
+
+## 3. Base URLs, versioning and the contract file
+
+**Goal of this section:** where the API lives and how it changes.
+
+* **Base:** `{base_url}` from `data/platforms/{platform}.yaml`, for example `https://api.act3ai.com/processing/v1`.
+  All paths in this file are relative to it.
+* **Version in the path** (`/v1`). A breaking change means `/v2`, served alongside `/v1` for at least 90 days; the
+  platform's heartbeat response announces `deprecations` (§7.3) so the fleet upgrades before `/v1` is removed.
+* **Non-breaking changes** (allowed in `/v1`): new optional request fields, new response fields, new endpoints, new
+  enum values in fields documented as open (`events[].type`, `commands[].type`). The server ignores unknown response
+  fields and unknown command types (logging them once).
+* **Minimum server version:** the platform may answer any request with `426 upgrade_required` and
+  `min_version` in the problem body when a server's `version` (from the `X-Server-Version` header) is below the
+  minimum the admin set. The server goes `DEGRADED` for that platform with "upgrade to ≥ 0.4.0".
+* **Contract file:** `data/schemas/openapi/processing_v1.yaml` (OpenAPI 3.1, JSON Schema 2020-12 for bodies). The
+  existing `data/schemas/job_envelope.schema.json` and heartbeat schemas are referenced from it, not duplicated. The
+  Go client types are generated from it with `oapi-codegen` (types only, no generated HTTP client), and appsrv
+  validates request bodies against the same schemas.
+
+## 4. Common conventions
+
+**Goal of this section:** what every request and response has in common.
+
+### 4.1 Request headers (server → platform)
+
+| Header | Required | Value |
+| --- | --- | --- |
+| `Content-Type` | with a body | `application/json` (UTF-8) |
+| `Accept` | yes | `application/json` |
+| `Content-Digest` | with a body | `sha-256=:<base64>:` (RFC 9530) of the exact bytes sent |
+| `X-Server-Key` | yes | the server's key, `B5090` |
+| `X-Server-Version` | yes | `0.3.0+5f1ead1` |
+| `Signature-Input`, `Signature` | yes | RFC 9421, profile §5 |
+| `Idempotency-Key` | on every `POST` that changes state | UUIDv7, stable across retries of the same intent (§4.5) |
+| `traceparent` | yes | W3C Trace Context; per job, the job's `trace_id` |
+| `Accept-Encoding` | yes | `gzip` (Go's client handles it) |
+| `User-Agent` | yes | `ai_processing_server/0.3.0 (B5090; windows/amd64)` |
+
+Request bodies over 8 KB are sent `Content-Encoding: gzip`; the `Content-Digest` is computed over the **encoded**
+bytes (what is on the wire), as RFC 9530 specifies.
+
+### 4.2 Response headers (platform → server)
+
+| Header | Value |
+| --- | --- |
+| `Content-Type` | `application/json`, or `application/problem+json` for errors |
+| `Content-Digest` | of the response body |
+| `Signature-Input`, `Signature` | on the endpoints marked **signed** in §7 (profile §5.4) |
+| `Cache-Control` | `no-store`, always |
+| `Date` | always; the server uses it to watch clock skew |
+| `Retry-After` | on `429` and `503` |
+| `X-Request-Id` | the platform's id for this request, logged by the server with every failure |
+
+### 4.3 Identifiers and time
+
+* `job_id`, `lease_id`, `event_id`, `request ids`: UUIDv7 strings (time-ordered, RFC 9562). Generated by whoever
+  creates the thing (the platform for jobs and leases, the server for events).
+* `server_key`: `^[A-Z][A-Z0-9]{1,11}$`. `service`: `^[a-z0-9]+\.[a-z0-9_]+$`.
+* Timestamps: RFC 3339 in UTC with `Z` (`2026-10-27T17:02:30Z`). Durations: integer seconds in fields ending `_s`, or
+  milliseconds in fields ending `_ms`. Sizes: bytes in fields ending `_bytes`, GB as decimals in `_gb`.
+* Fractions (progress): number 0.0 to 1.0.
+
+### 4.4 JSON rules
+
+* Field names `snake_case`. Enums `UPPER_SNAKE` for states (`ONLINE`, `RUNNING`), `lower_snake` for kinds and types
+  (`invalid_input`, `model_loaded`).
+* Absent and `null` mean the same thing; servers send absent.
+* Numbers that can exceed 2^53 (byte counts of huge files are fine; none exceed it) are never used; ids are strings.
+* Requests with unknown top-level fields: accepted on `heartbeat`, `events` (forward compatible telemetry);
+  **rejected** with `400 unknown_field` on `complete`, `fail` and `enroll` (state changes must be exact).
+
+### 4.5 Idempotency and retries
+
+* Every state-changing `POST` (`register`, `enroll`, `complete`, `fail`, `events`, `keys/rotate`, `upload-urls`)
+  carries an `Idempotency-Key`. The platform stores `(server_key, idempotency_key) → response` for 24 hours and
+  returns the stored response for a repeat, with `Idempotent-Replayed: true`. A repeat with a different body digest is
+  `422 idempotency_key_reused`.
+* `renew` and `heartbeat` are naturally idempotent (latest wins) and need no key. `lease` is **not** retried with the
+  same key: a lost lease response means those jobs time out on the platform (60 s) and return to the queue; that is
+  the safe outcome (double work possible, double results impossible, ai_processing_server.mdx §9.4).
+* The retry key is new for each new nonce: a retry re-signs (fresh `created` and `nonce`) but keeps the same
+  `Idempotency-Key`.
+* Client retry policy (server side), for network errors, `429`, `502`, `503`, `504`: exponential backoff with full
+  jitter, base 1 s, cap 60 s, honoring `Retry-After`. `complete` and `fail` retry for up to 24 hours (the journal
+  keeps them, ai_processing_server.mdx §9.5). Never retried: `400`, `401`, `403`, `404`, `409`, `422`.
+
+### 4.6 Errors: Problem Details (RFC 9457)
+
+```json
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{
+  "type": "https://act3ai.com/problems/processing/lease_lost",
+  "title": "Lease lost",
+  "status": 409,
+  "code": "lease_lost",
+  "detail": "Job 7c0e… was re-assigned to BPC at 17:03:10Z after the lease expired.",
+  "instance": "/processing/v1/jobs/7c0e6f0a-3f0b-4d5f-9f0e-0b8d7f6b3c21/complete",
+  "request_id": "0192d4c1-…",
+  "retryable": false
+}
+```
+
+`code` is the stable machine value (catalog §12); `detail` is a sentence a person can act on. Auth failures give a
+`code` but a deliberately vague `detail` ("signature verification failed") so they do not teach an attacker which
+check failed; the precise reason is in the platform's log against `request_id`.
+
+### 4.7 Tracing and correlation
+
+* One `trace_id` per job, created by the platform and sent in the envelope; the server uses it in `traceparent` on
+  every call about that job and in every log line (`trace_id=`). Non-job calls (heartbeat) start a new trace per call.
+* The server logs the platform's `X-Request-Id` on every non-2xx.
+
+### 4.8 Limits
+
+| Limit | Value | Over the limit |
+| --- | --- | --- |
+| Request body (decoded) | 1 MB; heartbeat 256 KB; `renew` 64 KB | `413 body_too_large` |
+| `log_tail` in renew or fail | last 50 lines, 16 KB | truncated by the server before sending |
+| Jobs per lease response | ≤ the request's free capacity, max 8 | — |
+| Long-poll hold | `wait_s` ≤ 25 (CDN and proxy idle timeouts are typically 30 to 100 s) | clamped |
+| Rate per kid | heartbeat 1/10 s, lease 1 in flight per platform, events 10/min, enroll 5/hour per IP | `429` + `Retry-After` |
+| Client timeouts (server side) | connect 10 s, TLS 10 s, response headers 30 s (lease: `wait_s` + 10 s), whole call 60 s | retry per §4.5 |
+
+## 5. The signature profile (RFC 9421)
+
+**Goal of this section:** the exact bytes that are signed, so two independent implementations interoperate. The why is
+in security.mdx §3.
+
+### 5.1 Request signature
+
+Covered components, in this order:
+
+| Component | Why |
+| --- | --- |
+| `"@method"` | a signed GET cannot become a POST |
+| `"@authority"` | binds to `api.act3ai.com`, not staging; the platform compares with its configured public authority, not the proxied `Host` |
+| `"@path"` | binds to the endpoint and the job id |
+| `"@query"` | binds query parameters (usually `?`) |
+| `"content-digest"` | binds the body (omitted on requests without a body) |
+| `"content-type"` | binds how the body is parsed (omitted without a body) |
+| `"x-server-key"` | binds the claimed identity |
+| `"idempotency-key"` | when present |
+
+Signature parameters:
+
+| Parameter | Value |
+| --- | --- |
+| `created` | Unix seconds, now |
+| `expires` | `created + 60` |
+| `nonce` | 16 random bytes, base64url, unique per request (retries get a new one) |
+| `keyid` | the kid (RFC 7638 thumbprint of the server's public JWK) |
+| `alg` | `ed25519` (or `ecdsa-p256-sha256` for hardware keys) |
+| `tag` | `act3-processing-v1` (the same tag on both platforms; the authority separates them) |
+
+Label: `sig1`.
+
+### 5.2 Example
+
+```http
+POST /processing/v1/jobs/7c0e6f0a-3f0b-4d5f-9f0e-0b8d7f6b3c21/complete HTTP/1.1
+Host: api.act3ai.com
+Content-Type: application/json
+Content-Digest: sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:
+X-Server-Key: B5090
+X-Server-Version: 0.3.0+5f1ead1
+Idempotency-Key: 0192d4c1-7a3e-7c11-9d2b-5f0e1a2b3c4d
+traceparent: 00-b81f0c2a9e5d4c3b8a7f6e5d4c3b2a19-7d3c2b1a09f8e7d6-01
+Signature-Input: sig1=("@method" "@authority" "@path" "@query" "content-digest" "content-type" "x-server-key" "idempotency-key");created=1793120550;expires=1793120610;nonce="pX0qk2V7sB1mYc9Qw3eR4g";keyid="q3Fv8sLk2mPwZt9cR1aYJ0uXhN4eB6dKs7TgVfWmQpE";alg="ed25519";tag="act3-processing-v1"
+Signature: sig1=:<base64 Ed25519 signature over the signature base>:
+
+{"lease_id":"0192d4b8-…","outputs":[…],"timings":{…}}
+```
+
+The **signature base** (what is actually signed) is built exactly as RFC 9421 §2.5 specifies; for the request above:
+
+```
+"@method": POST
+"@authority": api.act3ai.com
+"@path": /processing/v1/jobs/7c0e6f0a-3f0b-4d5f-9f0e-0b8d7f6b3c21/complete
+"@query": ?
+"content-digest": sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:
+"content-type": application/json
+"x-server-key": B5090
+"idempotency-key": 0192d4c1-7a3e-7c11-9d2b-5f0e1a2b3c4d
+"@signature-params": ("@method" "@authority" "@path" "@query" "content-digest" "content-type" "x-server-key" "idempotency-key");created=1793120550;expires=1793120610;nonce="pX0qk2V7sB1mYc9Qw3eR4g";keyid="q3Fv8sLk2mPwZt9cR1aYJ0uXhN4eB6dKs7TgVfWmQpE";alg="ed25519";tag="act3-processing-v1"
+```
+
+### 5.3 Platform verification algorithm
+
+```
+verify(request):
+  1. parse Signature-Input; require exactly one signature labelled sig1 with tag "act3-processing-v1"
+  2. require alg ∈ {ed25519, ecdsa-p256-sha256}; require created, expires, nonce, keyid
+  3. require |now - created| ≤ 60 s and now < expires                       → else 401 signature_expired
+  4. require the covered components ⊇ the required list for this request    → else 401 signature_invalid
+  5. key = registry[keyid]; require key exists and status ∈ {APPROVED, NEXT, RETIRED-in-grace}
+                                                                           → else 401 key_unknown / key_revoked
+     (PENDING_APPROVAL passes only for register, heartbeat, time; other paths 403 server_not_approved)
+  6. require key.server_key == X-Server-Key                                 → else 401 signature_invalid
+  7. require key.alg == alg                                                 → else 401 signature_invalid
+  8. "@authority" is taken from configuration (public hostname), not from the incoming Host header
+  9. verify the signature over the base                                     → else 401 signature_invalid
+ 10. if a body: recompute sha-256 over the received bytes, compare with Content-Digest
+                                                                           → else 400 digest_mismatch
+ 11. insert (keyid, nonce) into the replay cache with TTL 5 min; if it was present → 401 replay
+ 12. update key.last_used_at / last_ip (at most once a minute)
+ 13. only now parse and validate the JSON body
+```
+
+The replay cache is Redis `SET NX EX 300` on ACT3 (appsrv already runs Redis for queues) and a Postgres table with a
+TTL sweep on WTC if it has no Redis. A cache outage fails **closed** (`503 replay_cache_unavailable`), never open.
+
+### 5.4 Response signature (platform → server)
+
+On the endpoints marked **signed** in §7, the platform signs:
+
+* Components: `"@status"`, `"content-digest"`, `"content-type"`, and `"signature";req;key="sig1"` (the request's own
+  signature value, which binds this response to that exact request, RFC 9421 §2.4).
+* Parameters: `created`, `keyid` (the platform key's kid), `alg`, `tag="act3-processing-v1-resp"`. Label `sig1`.
+* The server verifies against `data/platforms/{platform}.jwks.json` (pinned, never fetched unsigned), requires
+  `|now - created| ≤ 300 s`, recomputes the digest, and only then parses the body. Failure handling: security.mdx
+  §8.2.
+* Error responses (`4xx`, `5xx`) are also signed when the platform can, so a forged `401 key_revoked` cannot make a
+  fleet shut itself down. An unsigned error is treated as a network error (retry), except that after 10 minutes of
+  unsigned `401`s the server goes `DEGRADED` for that platform and alerts locally.
+
+### 5.5 Clock
+
+The signatures depend on clocks within 60 s. `GET /time` (§7.11) and the `Date` header let the server measure skew;
+over 30 s the server goes `DEGRADED` with "fix NTP" before the platform starts rejecting it (security.mdx §7).
+
+## 6. Status codes
+
+**Goal of this section:** what each HTTP status means in this API, everywhere.
+
+| Status | Meaning here | Server's reaction |
+| --- | --- | --- |
+| `200` | done; body follows | proceed |
+| `202` | accepted for later processing (events) | proceed |
+| `204` | done, no body | proceed |
+| `400` | malformed or schema-invalid request (`invalid_request`, `unknown_field`, `digest_mismatch`) | do not retry; log ERROR (it is our bug) |
+| `401` | authentication failed (`signature_invalid`, `signature_expired`, `key_unknown`, `key_revoked`, `replay`) | `key_revoked`: stop and clean up (security.mdx §10.2). Others: re-sign and retry once, then `DEGRADED` |
+| `403` | authenticated but not allowed (`server_not_approved`, `service_not_approved`, `customer_work_not_allowed`) | stop that action; heartbeat continues |
+| `404` | job or resource unknown to this server | drop the job locally |
+| `409` | state conflict (`lease_lost`, `job_cancelled`, `job_already_final`) | discard outputs or stop as the code says |
+| `413` | body too large | trim (log tail) and retry once |
+| `422` | semantically wrong (`idempotency_key_reused`, `output_mismatch`) | do not retry; log ERROR |
+| `426` | server version too old (`upgrade_required`) | `DEGRADED` for that platform |
+| `429` | rate limited | wait `Retry-After` |
+| `500` | platform bug | retry with backoff |
+| `502`, `503`, `504` | platform or edge unavailable | retry with backoff |
+
+## 7. Endpoint reference
+
+**Goal of this section:** every endpoint, its body, its responses. Paths relative to `{base_url}`
+(`…/processing/v1`). **signed** = the response carries a platform signature (§5.4).
+
+| # | Method and path | Purpose | Interval | Response signed |
+| --- | --- | --- | --- | --- |
+| 7.1 | `POST /enroll` | first contact with a one-time enrollment code (security.mdx §5.2) | once | yes |
+| 7.2 | `POST /register` | identity, version, full hardware, offers | boot, reload | yes |
+| 7.3 | `POST /heartbeat` | load, slots, offers, active jobs; returns directives and commands | 15 s | yes |
+| 7.4 | `POST /lease` | long-poll for jobs | continuous while capacity is free | yes |
+| 7.5 | `POST /jobs/{job_id}/renew` | extend the lease, report progress; returns cancel | 20 s per job | yes |
+| 7.6 | `POST /jobs/{job_id}/upload-urls` | fresh presigned URLs for outputs | when needed | yes |
+| 7.7 | `POST /jobs/{job_id}/complete` · `/fail` | final report (with `dry_run` lease check) | once per job | yes |
+| 7.8 | `POST /events` | batched server events (model loaded, degraded, security) | ≤ 10/min | no (202 only) |
+| 7.9 | `POST /keys/rotate` | register the next key, vouched for by the current key | rotation | yes |
+| 7.10 | `POST /admin/servers/{server_key}/keys` | register or revoke keys from git (GitHub Action) | on merge | n/a |
+| 7.11 | `GET /time` | platform clock, unauthenticated | boot, hourly | yes |
+| 7.12 | `GET /jwks` | the platform's public signing keys (optional, phase 4) | daily | yes |
+| 7.13 | `GET /config` | the platform's view of this server (approved services, customer work, min version) | boot, on `refresh_config` | yes |
+
+### 7.1 `POST /enroll`
+
+Signed with the **new** key; the kid is not yet known to the platform, so step 5 of §5.3 is replaced by "take the key
+from the body, require its thumbprint == keyid, verify with it".
+
+```json
+{
+  "enrollment_code": "ENR-7KQ2-H9XW-4MZD-PT3A",
+  "server_key": "NPL1",
+  "public_jwk": { "kty": "OKP", "crv": "Ed25519", "x": "…", "kid": "…", "use": "sig", "alg": "EdDSA" },
+  "identity": { "display_name": "Nepal Office 1", "hostname": "npl-gpu-01", "machine_id_sha256": "…" },
+  "version": "0.3.0+5f1ead1",
+  "hardware": { "...": "same shape as register" }
+}
+```
+
+* `200 {"status":"PENDING_APPROVAL","fingerprint":"SHA256:q3Fv-8sLk-2mPw-Zt9c","server_id":"…"}`
+* `400 enrollment_code_invalid` (wrong, expired, used, or for a different `server_key`; one code for all four, on
+  purpose), `400 jwk_invalid` (wrong curve, has a private `d` member, thumbprint mismatch), `429` (5 per hour per IP).
+* `machine_id` is sent hashed (SHA-256 with the server key as salt): enough to spot a copied key, without shipping the
+  raw hardware id.
+
+### 7.2 `POST /register`
+
+```json
+{
+  "server_key": "B5090",
+  "version": "0.3.0", "git_sha": "5f1ead1", "build_time": "2026-10-27T16:01:00Z",
+  "identity": { "display_name": "Bryan 5090", "profile": "b5090", "family": "bryan", "site": "bryan_office",
+                "hostname": "DESKTOP-B5090", "machine_id_sha256": "…", "os": "windows", "arch": "amd64" },
+  "hardware": { "...": "the effective hardware, ai_processing_server.mdx §6.3 / §7.4" },
+  "services": [ { "id": "act3.comfy_on_prem", "enabled_by_owner": true, "max_parallel": 1 } ],
+  "offers": [ { "service": "act3.comfy_on_prem", "parallel": 1, "reason": "ok" } ],
+  "hardening": { "disk_encryption": true, "firewall": true, "runs_as_admin": false, "clock_skew_ms": 120 }
+}
+```
+
+* Only this platform's services (`act3.*` to ACT3, `wtc.*` to WTC) and `sys.*` are sent.
+* `200` (signed):
+
+```json
+{
+  "status": "APPROVED",
+  "server_id": "0192d3…",
+  "approved_services": ["act3.comfy_on_prem", "act3.video_merge", "sys.self_test"],
+  "customer_work": true,
+  "intervals": { "heartbeat_s": 15, "renew_s": 20, "lease_wait_s": 25, "lease_ttl_s": 60 },
+  "min_version": "0.3.0",
+  "directives": { "...": "as §7.3" }
+}
+```
+
+* `status: PENDING_APPROVAL` → the server heartbeats but does not lease (its state reason says "waiting for approval
+  on ACT3; fingerprint SHA256:…").
+* The platform may shorten or lengthen intervals; the server clamps to heartbeat 5..60 s, renew 5..60 s, wait 5..25 s.
+
+### 7.3 `POST /heartbeat`
+
+Request: the body in ai_processing_server.mdx §14.3 (`key`, `version`, `state`, `load`, `slots`, `active_jobs`,
+`offers`, `resident_models`, `drift`, `special`), plus `"seq": 18231` (monotonic per boot) and `"boot_id"` (UUIDv7 per
+process start). Every 40th heartbeat (10 minutes) adds the full `hardware` block.
+
+Response `200` (signed):
+
+```json
+{
+  "server_time": "2026-10-27T17:02:31Z",
+  "directives": {
+    "service_weights": { "act3.video_gen_open_source": 40, "act3.video_merge": -10 },
+    "paused_services": ["act3.blender_render"],
+    "drain": false,
+    "set_by": "bryan@act3ai.com", "set_at": "2026-10-27T16:20:00Z"
+  },
+  "commands": [
+    { "command_id": "0192d4…", "type": "refresh_hardware" },
+    { "command_id": "0192d5…", "type": "cancel_job", "job_id": "7c0e…", "reason": "user cancelled" }
+  ],
+  "deprecations": []
+}
+```
+
+* **Directives are state** (the full current value every time; the server replaces, never merges). **Commands are
+  events** (each has a `command_id`, executed at most once; the server records executed ids for 24 hours and reports
+  each result in the next `events` batch as `command_done` / `command_failed`). The split matters: a lost heartbeat
+  response loses no state (the next one repeats it), and a repeated command is not executed twice.
+* Command types in v1: `cancel_job`, `cancel_all`, `refresh_hardware`, `refresh_config`, `reload`, `rotate_key`
+  (asks the owner via a WARN, never rotates silently), `self_test`, `upload_job_log`. Unknown types are logged and
+  ignored.
+* Directives and commands from one platform apply only to that platform's services and jobs (security.mdx §9). They
+  can never enable a service the owner turned off.
+
+### 7.4 `POST /lease`
+
+Request:
+
+```json
+{
+  "offers": [
+    { "service": "act3.comfy_on_prem", "free_slots": 1, "resident_models": ["flux1-dev-fp8"],
+      "max_vram_gb": 30.5, "gpu_index_hint": 0 },
+    { "service": "act3.video_merge", "free_slots": 2 }
+  ],
+  "wait_s": 25
+}
+```
+
+* Response `200` (signed): `{ "jobs": [ <job envelope> … ] }`, envelope as ai_processing_server.mdx §9.1, with
+  `lease.lease_id`, `lease.expires_at` (now + `lease_ttl_s`) and `lease.renew_every_s`.
+* **Long-poll semantics:** if a job fits now, answer at once. Otherwise hold the request up to `wait_s`, and answer as
+  soon as a job that fits is created or released (ACT3: appsrv subscribes to a Redis pub/sub channel
+  `processing:wake:{service}` that the job-creation path publishes to; with no pub/sub, it re-checks every 1 s). At
+  `wait_s` answer `{ "jobs": [] }`. The server immediately opens the next lease while any offer has free capacity.
+* **Claim rule (platform):** in one transaction, `SELECT … FOR UPDATE SKIP LOCKED` over waiting jobs whose type maps
+  to an offered and approved service, dependencies complete, ordered by `priority DESC, created_at ASC`, limited to
+  `free_slots` per service; set `server_key`, `lease_id`, `lease_expires_at`; generate presigned URLs. (Same order
+  job_runner uses today, ai_processing_server.mdx §14.2.)
+* Never more jobs than `free_slots + 1` per service (the server's anti-hoarding rule, ai_processing_server.mdx §9.4).
+* One lease long-poll in flight per server per platform; a second gets `429`.
+* A server that is `PAUSED`, `DRAINING`, `DEGRADED` for every service, or has no free slot does not call `lease` at
+  all.
+
+### 7.5 `POST /jobs/{job_id}/renew`
+
+```json
+{ "lease_id": "0192d4b8-…", "state": "RUNNING", "stage": "render", "progress": 0.42,
+  "note": "frame 101/240", "log_tail": ["…", "…"], "eta_s": 310 }
+```
+
+* `200` (signed): `{ "ok": true, "cancel": false, "lease_expires_at": "2026-10-27T17:03:31Z" }`. When
+  `cancel: true`, it also carries `cancel_reason`; the server stops the runner, uploads nothing, and reports
+  `fail` with kind `cancelled` (or simply stops if the platform already marked it cancelled).
+* `409 lease_lost` → stop the job, discard everything. `409 job_cancelled` → same, reason cancel.
+* `log_tail` is sent at most every 60 s per job (throttled) to keep renew small.
+
+### 7.6 `POST /jobs/{job_id}/upload-urls`
+
+```json
+{ "lease_id": "0192d4b8-…",
+  "outputs": [ { "name": "scene", "content_type": "video/mp4", "bytes": 2147483648, "sha256": "…" } ] }
+```
+
+* `200` (signed): per output either a single `PUT` URL (≤ 1 GB) or a multipart plan
+  `{ "multipart": { "upload_id": "…", "part_size_bytes": 67108864, "parts": [ { "n": 1, "url": "…" } … ],
+  "complete_via": "platform" } }`. URLs expire in 60 minutes; the platform enforces `x-amz-checksum-sha256` when the
+  server sends `sha256`.
+* Completion of a multipart upload is done by the platform when it receives `complete` (it holds the storage
+  credentials); the server sends the part ETags in `complete.outputs[].parts`.
+
+### 7.7 `POST /jobs/{job_id}/complete` and `POST /jobs/{job_id}/fail`
+
+`complete`:
+
+```json
+{
+  "lease_id": "0192d4b8-…",
+  "dry_run": false,
+  "outputs": [
+    { "name": "scene", "storage_key": "org/…/scene.mp4", "bytes": 48211234, "sha256": "…",
+      "content_type": "video/mp4", "media": { "duration_s": 61.04, "width": 1920, "height": 1080, "fps": 24 } },
+    { "name": "log", "storage_key": "…/job.log", "bytes": 18211, "sha256": "…", "content_type": "text/plain" }
+  ],
+  "timings_ms": { "queued": 1200, "staging": 8400, "running": 312000, "uploading": 9100 },
+  "slot": { "gpu_index": 0, "cores": 4 },
+  "resident_models": ["wan2.2-a14b-fp8"]
+}
+```
+
+* `dry_run: true` checks the lease (and that the job is not cancelled) without finishing it; used before uploading
+  when renewals were failing (ai_processing_server.mdx §9.4). `200 {"ok": true, "lease_valid": true}`.
+* `200` (signed) `{ "ok": true }`. `409 lease_lost`, `409 job_cancelled` (outputs discarded), `409
+  job_already_final` (a retried complete after success: treated as success when the platform says the same lease
+  completed it, via idempotency). `422 output_mismatch` when a declared output is missing or a checksum does not
+  match storage.
+
+`fail`:
+
+```json
+{ "lease_id": "0192d4b8-…", "kind": "infra", "message": "Out of GPU memory: needed 31.4 GB, had 30.5 GB.",
+  "stage": "render", "detail": ["…last 50 log lines, redacted…"], "retry_on_other_server": true }
+```
+
+* `kind` ∈ `invalid_input`, `content_policy`, `transient`, `timeout`, `infra`, `internal`, `cancelled`
+  (ai_processing_server.mdx §12.2).
+* `200` (signed) `{ "ok": true, "will_retry": true }`. The platform alone decides whether to retry and where.
+
+### 7.8 `POST /events`
+
+```json
+{ "events": [
+  { "event_id": "0192d6…", "at": "2026-10-27T17:01:02Z", "type": "model_loaded",
+    "data": { "model": "wan2.2-a14b-fp8", "gpu_index": 0, "load_ms": 41000 } },
+  { "event_id": "0192d6…", "at": "2026-10-27T17:01:40Z", "type": "security",
+    "data": { "code": "response_signature_invalid", "path": "/lease" } },
+  { "event_id": "0192d6…", "at": "2026-10-27T17:02:00Z", "type": "command_done",
+    "data": { "command_id": "0192d4…" } }
+] }
+```
+
+* Up to 100 events per call; deduplicated by `event_id`. `202 {"accepted": 3}`.
+* Types in v1: `state_changed`, `model_loaded`, `model_unloaded`, `degraded`, `recovered`, `drift`, `owner_pause`,
+  `owner_resume`, `owner_cancel`, `command_done`, `command_failed`, `security`, `config_reloaded`. Open enum.
+* Events are buffered in memory (max 1,000, oldest dropped with a counter) and in `state/events_outbox.jsonl` across
+  restarts.
+
+### 7.9 `POST /keys/rotate`
+
+Signed with the **current** key. Body:
+
+```json
+{
+  "next_public_jwk": { "kty": "OKP", "crv": "Ed25519", "x": "…", "kid": "…" },
+  "proof": {
+    "payload": "<base64url of {\"server_key\":\"B5090\",\"next_kid\":\"…\",\"current_kid\":\"…\",\"at\":\"2026-10-27T17:05:00Z\"}>",
+    "signature": "<base64url Ed25519 signature of payload by the NEXT key>"
+  }
+}
+```
+
+* The proof is a compact JWS-style detached signature: the next key proves possession; the request signature proves
+  the current key vouches for it (security.mdx §10.1).
+* `200` (signed): `{ "status": "NEXT", "kid": "…" }`. The server switches to the next key for every request after
+  this; the platform promotes it on first use and retires the old key with a 24-hour grace.
+* `409 rotation_in_progress` if a `NEXT` key already exists (finish or cancel that first:
+  `DELETE /keys/next`, signed by the current key).
+
+### 7.10 `POST /admin/servers/{server_key}/keys` (git registration)
+
+Called by the GitHub Action on `main` (security.mdx §5.1), not by servers.
+
+* Auth: GitHub Actions OIDC (the Action requests an OIDC token for audience `act3-processing-admin`; the platform
+  verifies it against GitHub's issuer and requires `repository == ACT3ai/ai_processing_server`, `ref ==
+  refs/heads/main`). An open standard (OpenID Connect), and no long-lived deploy secret stored in GitHub.
+* Body: `{ "jwks": { "keys": [ … ] }, "commit_sha": "…", "path": "servers/Bryan_5090/keys/server_identity.jwks.json" }`.
+* Effect: keys with `act3:status: current` become `APPROVED` with `source: git`; `retired` keys become `RETIRED`
+  (24-hour grace); keys missing from the file are left alone (removal is an explicit `retired`, never an absence).
+* `200 { "applied": [ { "kid": "…", "status": "APPROVED" } ] }`. Audited with the commit SHA.
+
+### 7.11 `GET /time`
+
+Unauthenticated (so a server with a bad clock can still find out), rate limited per IP. Response signed so it cannot
+be spoofed to push a fleet's clocks around: `{ "server_time": "2026-10-27T17:02:31.412Z" }`. The server never sets
+the OS clock from it; it only measures and reports skew.
+
+### 7.12 `GET /jwks` (phase 4)
+
+Returns the platform's JWK Set. The response is signed by a key the server already pins; the server adds any new key
+from it to its runtime trust only under that condition (security.mdx §8.3), and writes a notice telling the owner to
+pull the repo so the pin becomes permanent.
+
+### 7.13 `GET /config`
+
+The platform's view of this server: `approved_services`, `customer_work`, `site` as the admin set it, `min_version`,
+`intervals`, and the admin's notes. Called at boot (after `register`) and on the `refresh_config` command. Signed.
+
+## 8. The control channel
+
+**Goal of this section:** every way the platform can tell a server to do something, in one table.
+
+| Platform wants | Carried by | Latency | Notes |
+| --- | --- | --- | --- |
+| run this job | `lease` response | < 1 s | only if the server offered capacity |
+| cancel this job | `renew` response `cancel: true`; also `cancel_job` command in heartbeat | ≤ 15 s | the first one to arrive wins; both are idempotent |
+| change service weights, pause a service | heartbeat `directives` | ≤ 15 s | state, full value each time |
+| drain the server | heartbeat `directives.drain: true` | ≤ 15 s | running jobs finish; resume by `drain: false` |
+| stop everything now | `cancel_all` command | ≤ 15 s | jobs fail as `cancelled`; server stays up |
+| re-detect hardware, reload config | `refresh_hardware`, `reload` commands | ≤ 15 s | |
+| revoke the server | any response `401 key_revoked` (signed) | ≤ 15 s | security.mdx §10.2 |
+| make the server upgrade | `426 upgrade_required` | next call | server goes `DEGRADED` for that platform; never self-updates in v1 |
+
+What the platform **cannot** do through any of these: turn on a service the owner turned off, raise the owner's
+caps, change `this_server.yaml`, read files outside a job's work dir, run arbitrary commands, or touch the other
+platform's jobs.
+
+## 9. File transfer
+
+**Goal of this section:** how inputs and outputs move without passing through the API.
+
+* **Inputs:** `GET` presigned URLs from the envelope, HTTPS only, host on the platform's `allowed_storage_hosts`, SSRF
+  guard on every dial (security.mdx §12.3). Downloads stream to disk, verify `sha256` and `bytes` from the envelope,
+  and resume with `Range` on interruption. URLs expire in 15 minutes; a job whose inputs expired before staging asks
+  for fresh ones by failing with `transient` (the platform re-issues on retry).
+* **Outputs:** `PUT` to presigned URLs (single part up to 1 GB, multipart above, §7.6), streaming from disk, sending
+  `x-amz-checksum-sha256` so storage rejects a corrupted upload. Retries per part.
+* **IPFS:** for platforms that publish to IPFS, the server uploads to the platform's storage, and the platform pins
+  (its pinning service). URLs reported back to people are public gateway URLs (`https://ipfs.io/ipfs/<CID>/…` or
+  `https://<CID>.ipfs.dweb.link/…`), never `127.0.0.1`.
+* **Models:** downloaded from catalog URLs with sha256 (ai_processing_server.mdx §8.3), not through the platform.
+* Presigned URLs are secrets (security.mdx §14): never logged with their query string, never shown on the local API.
+
+## 10. Local API summary
+
+**Goal of this section:** how the local API relates to this contract. Full route list: ai_processing_server.mdx §13.
+
+* Separate surface, separate auth: loopback `127.0.0.1:9440`, bearer token from `local_api.token_file`, Origin and
+  Host checks against browser attacks (security.mdx §13). It is **not** signed with RFC 9421, because it never leaves
+  the machine.
+* Same conventions as this file where they apply: `/v1` paths, `snake_case` JSON, Problem Details errors, RFC 3339
+  times.
+* Local actions that a platform should know about (owner pause, owner cancel) are reported through `events` (§7.8).
+
+## 11. Sequences
+
+**Goal of this section:** the main flows, end to end.
+
+### 11.1 First boot of a checked-in server
+
+```
+owner: git clone; just build
+  init → this_server.yaml created; keys init → private key + servers/Bryan_5090/keys/server_identity.jwks.json
+owner: git add servers/Bryan_5090/keys; PR; review; merge to main
+GitHub Action (OIDC) → POST /admin/servers/B5090/keys            → kid APPROVED (source git)
+owner: just run
+  GET  /time                                                     → skew 0.1 s OK
+  POST /register  (signed by kid)                                → APPROVED, approved_services, intervals (signed)
+  loops start: heartbeat every 15 s, lease long-poll
+```
+
+### 11.2 One job
+
+```
+POST /lease {offers}                       ── held 3 s ──►  {jobs:[envelope]} (signed, bound to this request)
+  verify response signature; validate envelope; SSRF-check URLs; customer-data gate
+  STAGING: GET presigned inputs (sha256 verified)
+  RUNNING: runner; every 20 s POST /jobs/{id}/renew → {cancel:false}
+  UPLOADING: PUT outputs to presigned URLs (checksum enforced)
+POST /jobs/{id}/complete (Idempotency-Key K1)  → 200 {ok} (signed)
+  journal entry removed; work dir deleted
+```
+
+### 11.3 Cancel during a render
+
+```
+user clicks Cancel in ACT3 → job.cancel_requested = true
+next POST /jobs/{id}/renew → {cancel:true, cancel_reason:"user"} (signed)
+server: kill the process tree; upload nothing; POST /jobs/{id}/fail {kind:"cancelled"} → 200
+```
+
+### 11.4 Network outage mid-render
+
+```
+renew fails (timeouts) for 2 min → lease probably expired; job keeps running
+network back; job done
+POST /jobs/{id}/complete {dry_run:true}
+  → 200 {lease_valid:true}   : upload, then complete
+  → 409 lease_lost           : discard outputs, delete work dir, event "lease_lost_after_outage"
+```
+
+### 11.5 Server not in the repo (enrollment)
+
+```
+admin: Add server NPL1 → enrollment code ENR-…
+owner: just build; ./ai_processing_server enroll --platform act3 --code ENR-…
+  POST /enroll (signed by new key, public JWK in body)     → PENDING_APPROVAL, fingerprint
+owner reads fingerprint to admin by phone; admin compares; Approve
+next heartbeat → register again → APPROVED → leasing starts
+```
+
+### 11.6 Key rotation
+
+```
+./ai_processing_server keys rotate
+  POST /keys/rotate (signed by current, proof by next)     → NEXT
+  every request after this is signed by next
+  platform: first verified request with next → APPROVED; old → RETIRED (24 h grace)
+owner commits the updated JWK Set (checked-in servers)
+```
+
+## 12. Error code catalog
+
+**Goal of this section:** the stable `code` values in Problem Details.
+
+| Code | Status | Meaning | Retry |
+| --- | --- | --- | --- |
+| `invalid_request` | 400 | body fails the schema | no |
+| `unknown_field` | 400 | strict endpoint got an unknown field | no |
+| `digest_mismatch` | 400 | `Content-Digest` does not match the body | no (bug or tampering) |
+| `body_too_large` | 413 | over §4.8 | trim once |
+| `enrollment_code_invalid` | 400 | wrong, expired, used, or other server | no |
+| `jwk_invalid` | 400 | bad curve, private member, thumbprint mismatch | no |
+| `signature_invalid` | 401 | missing, malformed or failing signature; wrong components | re-sign once |
+| `signature_expired` | 401 | `created`/`expires` out of window | re-sign once; check clock |
+| `replay` | 401 | nonce already seen | re-sign once |
+| `key_unknown` | 401 | kid not in registry | no; enroll |
+| `key_revoked` | 401 | kid revoked or retired past grace | no; stop |
+| `server_not_approved` | 403 | key pending approval | no; wait |
+| `service_not_approved` | 403 | offered a service the platform did not approve | drop that offer |
+| `customer_work_not_allowed` | 403 | customer job on a server or site not allowed | no |
+| `job_not_found` | 404 | unknown job for this server | no |
+| `lease_lost` | 409 | lease expired or re-assigned | no; discard |
+| `job_cancelled` | 409 | job cancelled | no; discard |
+| `job_already_final` | 409 | job already completed or failed | no |
+| `rotation_in_progress` | 409 | a NEXT key exists | no |
+| `idempotency_key_reused` | 422 | same key, different body | no |
+| `output_mismatch` | 422 | declared output missing or checksum differs from storage | no |
+| `upgrade_required` | 426 | server version below minimum | no; upgrade |
+| `rate_limited` | 429 | too many requests | after `Retry-After` |
+| `replay_cache_unavailable` | 503 | platform cannot check nonces (fails closed) | yes |
+| `unavailable` | 503 | platform maintenance | yes |
+
+## 13. Implementation
+
+**Goal of this section:** where the code goes on each side.
+
+### 13.1 Server (Go)
+
+```
+code/internal/
+├── security/
+│   ├── keys/          # InitKey, LoadKey, Rotate, WritePublicJWKS, Thumbprint (security.mdx §4, §5)
+│   └── httpsig/       # Signer (RFC 9421 + Content-Digest), Verifier for platform responses, replay-safe nonces
+├── broker/
+│   └── httplease/     # Source implementation: Register, Heartbeat, Lease (long-poll), Renew, UploadURLs,
+│                      # Complete, Fail, Events, Rotate; retry policy §4.5; Problem Details decoding
+├── storage/           # SafeDialer (SSRF guard), presigned GET/PUT, multipart, checksums
+└── api/               # local API (unchanged; §10)
+```
+
+* One `http.Client` per platform with a custom `Transport`: TLS 1.3 minimum, the SSRF-safe dialer **not** used for
+  the platform itself (its host is fixed by config) but used for every storage and model URL.
+* Signing is a `RoundTripper` wrapper (`httpsig.SigningTransport`) so no endpoint can forget it; response verification
+  happens in the same wrapper before the body reaches the caller.
+* Types for bodies generated from `data/schemas/openapi/processing_v1.yaml` into `code/internal/broker/httplease/
+  apitypes/` by `oapi-codegen -generate types`; `just generate` refreshes them and CI fails on drift.
+
+### 13.2 ACT3 appsrv (NestJS)
+
+* A `ProcessingModule` with `ProcessingController` (routes §7), `ProcessingSignatureGuard` (verification §5.3, before
+  any body parsing: the raw body is kept with `rawBody: true` in the Nest app options so the digest is computed over
+  the exact bytes), `ProcessingResponseSigner` (an interceptor that signs §5.4), and `ProcessingLeaseService` (claim
+  rule §7.4, Redis wake-ups).
+* Registry tables per security.mdx §6.1; replay cache in Redis.
+* Lives in `~/BGit/all/film/code/p/act3ai-appsrv/src/processing/` (to create).
+
+### 13.3 WTC backend (Go)
+
+* Imports `code/internal/security/httpsig` via a small shared public module (`github.com/ACT3ai/ai_processing_server/
+  pkg/processingauth`, a `pkg/` directory exported on purpose) so both sides use one verified implementation.
+* Middleware `processing.VerifySignature`, handlers under `/api/processing/v1/`, in `~/BGit/act3/AI_Coding/internal/
+  processing/` (to create; matches the AI_Coding `internal/` rule).
+
+## 14. Testing
+
+**Goal of this section:** how we know two implementations agree and the contract holds.
+
+* **Conformance vectors:** `tests/vectors/httpsig/` holds request/response pairs with keys, signature bases and
+  expected signatures (including RFC 9421 Appendix B.2.6, the Ed25519 example). The Go server, the Go WTC
+  middleware and the NestJS guard all run the same vectors in CI.
+* **Contract tests:** a fake platform (`httptest`) generated from the OpenAPI file plays every endpoint, including
+  long-poll timing, `409 lease_lost`, `401 key_revoked`, `426`, `429` with `Retry-After`, and unsigned or forged
+  responses. appsrv runs the same scenarios against its controller with a test server key.
+* **Negative security tests:** every rejection in security.mdx §19.1, end to end through the real HTTP stack.
+* **Load test:** 50 simulated servers × 2 platforms (heartbeat 15 s, long-poll, renew 20 s for 4 jobs each) against
+  staging; target p99 < 200 ms for renew and heartbeat, and no lease ever granted twice.
+* **Chaos:** drop 30% of responses, delay 10 s, duplicate requests: no double results, no lost completions (journal +
+  idempotency).
+
+## 15. Decisions
+
+**Goal of this section:** decisions this spec makes; to be copied into `pm/Decisions.yaml`.
+
+| Id | Decision | Status |
+| --- | --- | --- |
+| D-201 | REST + JSON over HTTPS, OpenAPI 3.1 contract in `data/schemas/openapi/processing_v1.yaml` | proposed |
+| D-202 | Outbound-only; jobs by long-poll `lease`, orders by heartbeat/renew responses; no inbound, no tunnel, no broker in v1 | proposed (confirms D-001) |
+| D-203 | Version in path (`/processing/v1`), additive changes only within a version | proposed |
+| D-204 | Directives are state (full value every heartbeat); commands are events with ids, executed at most once | proposed |
+| D-205 | Problem Details (RFC 9457) for all errors, stable `code` catalog §12 | proposed |
+| D-206 | `Idempotency-Key` on every state-changing POST; platform stores responses 24 h | proposed |
+| D-207 | Files only through presigned URLs with enforced sha256 checksums | proposed |
+| D-208 | Git key registration through GitHub Actions OIDC, no stored deploy secret | proposed |
+| D-209 | Optional SSE wake-up hints only (never commands) if faster control is needed | deferred |
+
+## 16. Open questions for Bryan
+
+1. **Q1.** Confirm the platform hostnames and the path prefixes (`/processing/v1` on ACT3, `/api/processing/v1` on
+   WTC).
+2. **Q2.** Is 20 s worst-case cancel acceptable for renders, or should the SSE wake-up channel (§2.5) be in the first
+   release?
+3. **Q3.** Does WTC have Redis (replay cache, lease wake-ups), or should its side use Postgres for both?
+4. **Q4.** GitHub Actions OIDC for git key registration (§7.10): OK to enable on the ACT3ai org?
+
+## 17. Source code map and upgrade log
+
+**Goal of this section:** where each part will be implemented, and what changed when.
+
+### 17.1 Planned source map
+
+The platform client (register, heartbeat, lease long-poll, renew, complete, fail, events) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/broker/httplease/client.go` — `Source`, `Source.Lease`, `Source.Heartbeat`
+
+Signing every request and verifying every response in one transport is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/security/httpsig/transport.go` — `SigningTransport.RoundTrip`
+
+Retry, backoff and idempotency keys for platform calls are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/broker/httplease/retry.go` — `doWithRetry`
+
+Executing heartbeat commands at most once is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/commands.go` — `CommandExecutor.Apply`
+
+Presigned downloads and uploads (multipart, checksums) are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/storage/transfer.go` — `Download`, `Upload`
+
+The ACT3 side of the Processing API is implemented in code (to write):
+`~/BGit/all/film/code/p/act3ai-appsrv/src/processing/processing.controller.ts` — `ProcessingController`;
+`processing-lease.service.ts` — `ProcessingLeaseService.claim`
+
+### 17.2 Upgrade log
+
+* 2026-10-27: spec written; supersedes the endpoint table in ai_processing_server.mdx §14.2 (paths gain `/v1`,
+  bearer tokens replaced by RFC 9421 signatures). No code yet.

@@ -1,0 +1,21 @@
+# Compiled binary — each machine builds its own with `just build`. Never commit it.
+/ai_processing_server
+/ai_processing_server.exe
+
+# Local build output
+/bin/
+/dist/
+*.test
+*.out
+
+# Per-machine data: this_server.yaml, PRIVATE KEYS, state, work, cache. Never commit (pm/security.mdx §4).
+/data/git_ignore/
+
+# Never commit a private key anywhere in the repo, even by mistake (pm/security.mdx §4.4).
+*.key
+*.private.pem
+*_private.jwk
+*.private.jwk
+
+# Python test caches
+__pycache__/

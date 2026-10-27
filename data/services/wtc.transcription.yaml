@@ -1,0 +1,14 @@
+schema_version: 1
+id: wtc.transcription
+platform: wtc
+title: "Video and audio to text (Whisper)"
+runner: whisper
+default_enabled: true
+requires:
+  engines: { python: ">=3.10" }
+  gpu: optional
+  compute: [cuda, metal, none]
+resources_per_job: { cpu_cores: 4, ram_gb: 8, vram_gb: 6 }
+max_parallel_default: 2
+timeouts: { stage_inputs: 10m, run: 120m, upload: 10m }
+retry: { max_attempts: 2, retry_on: [transient, infra] }

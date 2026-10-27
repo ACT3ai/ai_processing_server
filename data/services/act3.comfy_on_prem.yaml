@@ -1,0 +1,15 @@
+schema_version: 1
+id: act3.comfy_on_prem
+platform: act3
+title: "ComfyUI image/video generation on our own NVIDIA GPU"
+runner: comfy
+default_enabled: true
+requires:
+  engines: { comfyui: "" }
+  gpu: required
+  compute: [cuda]
+  min_vram_gb: 16
+resources_per_job: { cpu_cores: 4, ram_gb: 16, vram_gb: 16 }
+max_parallel_default: 1
+timeouts: { stage_inputs: 20m, run: 90m, upload: 20m }
+retry: { max_attempts: 2, retry_on: [transient, infra] }

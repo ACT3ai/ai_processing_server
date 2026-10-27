@@ -1,0 +1,103 @@
+# Decisions for ai_processing_server. Copied from pm/ai_processing_server.mdx §22, plus decisions made while building.
+# status: proposed | decided | superseded
+
+- id: D-001
+  title: "Transport: HTTPS lease API as the contract; Temporal adapter optional; RabbitMQ not now"
+  status: proposed
+  date: 2026-10-27
+  note: "Bryan to confirm (spec §11, §23 Q1). v0.1.0 has no platform transport yet: jobs arrive by direct mode (POST /v1/jobs)."
+
+- id: D-002
+  title: "this_server.yaml is written only by init when missing; machine-written state goes to state/"
+  status: decided
+  date: 2026-10-27
+
+- id: D-003
+  title: "The owner's allow-list is a hard fence; platforms set priority, weight, pause and drain only inside it"
+  status: proposed
+  date: 2026-10-27
+
+- id: D-004
+  title: "Effective hardware = min(detected, declared)"
+  status: proposed
+  date: 2026-10-27
+
+- id: D-005
+  title: "Pure Go build (CGO_ENABLED=0); GPU facts from vendor CLIs"
+  status: decided
+  date: 2026-10-27
+  note: "justfile exports CGO_ENABLED=0 and GOWORK=off (a parent ~/BGit/act3/go.work would otherwise capture the module)."
+
+- id: D-006
+  title: "Local API on 127.0.0.1:9440 with a bearer token"
+  status: proposed
+  date: 2026-10-27
+
+- id: D-007
+  title: "Priority scale shared with ACT3's JobPriority (0..300)"
+  status: proposed
+  date: 2026-10-27
+
+- id: D-008
+  title: "Job record mirrors Asynq's TaskInfo; the v0.1 queue is embedded"
+  status: decided for v0.1.0; to be revisited if D-Q1 is confirmed
+  conflict: >
+    pm/task_queue.mdx (written the same day in a parallel session) proposes D-Q1: NATS JetStream (revised the same day:
+    run as its own nats-server service, never embedded), with its own task contract (§13: envelope v1, lifecycle SUBMITTED → … → SUCCEEDED / FAILED / CANCELLED,
+    events on evt.<caller>.<job_id>). NATS has no per-job status model of its own, so if D-Q1 is confirmed the
+    "standard to mirror" becomes task_queue.mdx §13, and the record's state names move from Asynq's to §13.4's. The
+    scheduler, runners and tests are unaffected by that rename except for state strings.
+  date: 2026-10-27
+  decision: >
+    The server keeps its own job table (in memory plus a JSON journal per job under data/git_ignore/state/journal/).
+    The job JSON uses Asynq's TaskInfo field names and state names (id, queue, type, payload, state, max_retry,
+    retried, last_err, last_failed_at, timeout, deadline, next_process_at, completed_at, result; states pending,
+    active, retry, completed, archived) plus "cancelled" and server fields (stage, step, progress, priority,
+    outputs, history). queue = platform (direct | act3 | wtc), type = service id.
+  why: >
+    Bryan asked that the API mirror whatever real task system sits behind it, so the API is mostly pass-through.
+    Asynq is the Go-native task queue with the most complete job-status model, and it runs on Redis, which is
+    already installed on the Bryan laptop. RabbitMQ (spec option C) has no per-job status model to mirror, and
+    neither it nor Docker is installed here. An embedded queue keeps "just build && just run on a clean checkout
+    with only Go" true on every machine, including Windows.
+  consequence: >
+    If Asynq (or another queue) is adopted later, it goes behind the scheduler's job table and its TaskInfo JSON
+    maps 1:1 onto ours. The scheduling rules (slots, effective priority, owner fence, retries) stay our code.
+
+- id: D-009
+  title: "Tests: Python 3 standard library, black-box against the compiled binary"
+  status: decided
+  date: 2026-10-27
+  why: "Independent reference calculations in a different language than the server; no dependencies to install on GPU boxes; runs on all three OSes. See tests/README.md."
+
+- id: D-010
+  title: "gopkg.in/yaml.v3 for YAML"
+  status: decided
+  date: 2026-10-27
+  why: "Spec §3.3 allowed list; already in the module cache. gopsutil was not needed for v0.1 (sysctl, /proc and kernel32 cover it)."
+
+- id: D-011
+  title: "Local API error shape stays {error:{code,message}} for v0.1"
+  status: decided for v0.1.0
+  date: 2026-10-27
+  note: "ai_processing_server.mdx §13 specifies {error:{code,message}}; apis.mdx §10 asks for RFC 9457 Problem Details. v0.1 follows §13; switching is a change in api.writeErr only. Host/Origin checks from apis.mdx §10 are implemented."
+
+- id: D-012
+  title: "error.err: one central log for errors that should not happen, gopkg.in/natefinch/lumberjack.v2 for rolling"
+  status: decided
+  date: 2026-10-27
+  decision: >
+    ~/T/ai_processing_server/error.err (override --error-dir / $APS_ERROR_DIR), 4 MB cap, 3 rolled files, one line per
+    entry with UTC time and the absolute source path (at=). All code records through internal/errlog. See pm/errors.mdx.
+  why: >
+    Bryan asked for it (2026-10-27) and allowed a library. lumberjack is the de facto Go rolling writer (MIT, stable,
+    thread safe, size cap honored before each write). The format follows error.err in the_starbucks, we_citizens and
+    all/app.
+
+- id: D-013
+  title: "RFC 9421 signatures implemented in-repo (internal/security/httpsig), no third-party module"
+  status: decided
+  date: 2026-10-27
+  why: >
+    security.mdx §3.4 allows a small in-repo implementation tested against the RFC 9421 Appendix B vectors. It covers
+    exactly the profile in apis.mdx §5 and adds no dependency. The B.2.6 Ed25519 vector reproduces byte for byte.

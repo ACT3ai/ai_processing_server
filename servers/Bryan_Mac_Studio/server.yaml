@@ -1,0 +1,109 @@
+# server.yaml: Bryan's Mac Studio as an ai_processing_server node.
+# Source: GUESSED 2026-10-27 from the laptop. Not probed. Replace every value marked "guess"
+# by running the hardware detection on the Mac Studio itself.
+# Known: this is the always-on "CLAW" server that runs OpenClaw agents and voice-memo transcription.
+
+server:
+  name: Bryan_Mac_Studio
+  display_name: "Bryan's Mac Studio (CLAW)"
+  role: render_node                      # always-on server, also runs OpenClaw agents
+  owner: Bryan Starbuck
+  location: office
+  data_source: guessed                   # detected | guessed
+  updated: "2026-10-27"
+  hostname: "Bryan-Mac-Studio.local"     # guess
+  always_on: true
+  enabled: true
+
+  capabilities:
+    machine:
+      model: "Mac Studio (M3 Ultra, 2025)"   # guess
+      model_identifier: "Mac15,14"           # guess
+      form_factor: desktop
+    os:
+      family: macOS
+      version: "27.0.1"                  # guess: assumed same as laptop
+      arch: arm64
+      go_target: darwin/arm64
+    cpu:
+      model: "Apple M3 Ultra"            # guess
+      cores: 32                          # guess
+      performance_cores: 24
+      efficiency_cores: 8
+      threads: 32
+    memory:
+      total_gb: 256                      # guess (configs: 96 / 256 / 512)
+      type: LPDDR5
+      unified: true
+      bandwidth_gb_per_s: 819
+    gpus:
+      - vendor: Apple
+        model: "Apple M3 Ultra (80-core GPU)"   # guess
+        api: Metal
+        metal_support: "Metal 4"
+        vram_gb: 0                       # unified memory, see max_working_set_gb
+        max_working_set_gb: 192          # guess: ~75% of unified memory
+        hardware_ray_tracing: true
+        fp32_tflops: 28.0
+    neural_engine:
+      cores: 32
+      tops_int8: 36
+    cuda: false
+    rocm: false
+    storage:
+      total_tb: 4.0                      # guess
+      free_tb: 2.0                       # guess
+      type: NVMe SSD
+      scratch_dir: "~/T/_ai_processing_server/"
+    network:
+      primary: ethernet
+      ethernet_gbps: 10
+      thunderbolt: "Thunderbolt 5"
+    power:
+      source: ac
+      ups: false                         # guess
+    media_engines:
+      hw_encode: [h264, hevc, prores]
+      hw_decode: [h264, hevc, prores, av1]
+      encode_engines: 4
+      prores_engines: 4
+    software:                            # all guesses
+      go: "1.27.x"
+      python: "3.x"
+      node: "26.x"
+      ffmpeg: "9.x"
+      blender: "4.x"
+      davinci_resolve: false
+      final_cut_pro: false
+      ipfs: true
+      redis: false
+      pytorch: true                      # MPS backend, for Whisper transcription
+      mlx: true
+      comfyui: false
+      ollama: true
+      docker: false
+      whisper_transcription: true        # known: processes iPhone voice memos
+      openclaw_agents: true              # known: runs OpenClaw agent workspaces
+    job_slots:
+      gpu: 1                             # one integrated GPU; heavy jobs serialized
+      cpu: 12
+      max_model_memory_gb: 200
+    job_types:
+      cloud_api_jobs: true
+      transcode_h264_hevc_prores: true
+      transcode_av1: true
+      blender_render: true               # Cycles Metal
+      image_generation_local: true       # MLX / MPS (FLUX, SDXL)
+      video_generation_local: partial    # no CUDA; slow on MPS
+      llm_inference_local: true          # large unified memory fits big quantized models
+      upscale: partial
+      tts_transcription: true
+      lipsync: partial
+      cuda_only_jobs: false
+    constraints:
+      - "Shares the machine with OpenClaw agents and transcription; reserve CPU and memory for them."
+      - "Hardware values are guesses until detected on the machine."
+
+  services:
+    act3: true
+    we_the_citizens: true

@@ -1,0 +1,108 @@
+# server.yaml: Bryan's laptop as an ai_processing_server node.
+# Source: DETECTED on this machine 2026-10-27 (sysctl, system_profiler, Metal, PATH probes).
+# Full raw probe: ~/BGit/act3/ai_processing_server/data/git_ignore/this_server.yaml
+# Serial numbers and UUIDs are left out on purpose.
+
+server:
+  name: Bryan_Laptop
+  display_name: "Bryan's MacBook Pro"
+  role: development_workstation          # interactive laptop, not a dedicated render node
+  owner: Bryan Starbuck
+  location: mobile
+  data_source: detected                  # detected | guessed
+  updated: "2026-10-27"
+  hostname: "Bry-MacBook-Pro-2025b.local"
+  always_on: false
+  enabled: true
+
+  capabilities:
+    machine:
+      model: "MacBook Pro 16-inch (M4 Max, 2024)"
+      model_identifier: "Mac16,5"
+      form_factor: laptop
+    os:
+      family: macOS
+      version: "27.0.1"
+      arch: arm64
+      go_target: darwin/arm64
+    cpu:
+      model: "Apple M4 Max"
+      cores: 16
+      performance_cores: 12
+      efficiency_cores: 4
+      threads: 16
+    memory:
+      total_gb: 128
+      type: LPDDR5X
+      unified: true
+      bandwidth_gb_per_s: 546
+    gpus:
+      - vendor: Apple
+        model: "Apple M4 Max (40-core GPU)"
+        api: Metal
+        metal_support: "Metal 4"
+        vram_gb: 0                       # unified memory, see max_working_set_gb
+        max_working_set_gb: 107.5
+        hardware_ray_tracing: true
+        fp32_tflops: 18.4
+    neural_engine:
+      cores: 16
+      tops_int8: 38
+    cuda: false
+    rocm: false
+    storage:
+      total_tb: 8.0
+      free_tb: 2.17
+      type: NVMe SSD
+      scratch_dir: "~/T/_ai_processing_server/"
+    network:
+      primary: "Wi-Fi 6E"
+      ethernet_gbps: 0                   # USB/Thunderbolt adapters only
+      thunderbolt: "Thunderbolt 5"
+    power:
+      source: battery_or_ac
+      ups: false
+    media_engines:
+      hw_encode: [h264, hevc, prores]
+      hw_decode: [h264, hevc, prores, av1]
+      encode_engines: 2
+      prores_engines: 2
+    software:
+      go: "1.27.3"
+      python: "3.15.2"
+      node: "26.12.1"
+      ffmpeg: "9.0.2"
+      blender: "3.6.2"
+      davinci_resolve: true
+      final_cut_pro: true
+      ipfs: true
+      redis: true
+      pytorch: false
+      mlx: false
+      comfyui: false
+      ollama: false
+      docker: false
+    job_slots:
+      gpu: 1
+      cpu: 4
+      max_model_memory_gb: 96
+    job_types:
+      cloud_api_jobs: true               # Veo, Runway, FLUX API: network + CPU only
+      transcode_h264_hevc_prores: true
+      transcode_av1: true
+      blender_render: true               # Cycles Metal, Blender 3.6 is old
+      image_generation_local: partial    # needs PyTorch/MLX + models
+      video_generation_local: partial    # no CUDA; most open video models are CUDA-first
+      llm_inference_local: partial       # 128 GB fits 70B quantized; no runtime installed
+      upscale: partial
+      tts_transcription: partial
+      lipsync: false
+      cuda_only_jobs: false
+    constraints:
+      - "Accept long jobs only on AC power with sleep disabled."
+      - "Interactive workstation: keep parallelism low so the user stays responsive."
+      - "Check free disk before large renders (2.17 TB free)."
+
+  services:
+    act3: true
+    we_the_citizens: true

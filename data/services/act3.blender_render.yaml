@@ -1,0 +1,14 @@
+schema_version: 1
+id: act3.blender_render
+platform: act3
+title: "Blender shot and set renders"
+runner: blender
+default_enabled: false
+requires:
+  engines: { blender: ">=4.2" }
+  gpu: optional
+  compute: [cuda, metal, none]
+resources_per_job: { cpu_cores: 8, ram_gb: 16, vram_gb: 8 }
+max_parallel_default: 1
+timeouts: { stage_inputs: 20m, run: 180m, upload: 20m }
+retry: { max_attempts: 2, retry_on: [transient, infra] }

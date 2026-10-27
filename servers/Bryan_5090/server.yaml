@@ -1,0 +1,114 @@
+# server.yaml: Bryan's RTX 5090 PC as an ai_processing_server node.
+# Source: GUESSED 2026-10-27 from the directory name only. Not probed. Replace every value
+# marked "guess" by running the hardware detection on the 5090 machine itself.
+# This is the only CUDA machine, so it is the main node for local image/video generation.
+
+server:
+  name: Bryan_5090
+  display_name: "Bryan's RTX 5090 PC"
+  role: gpu_render_node
+  owner: Bryan Starbuck
+  location: office
+  data_source: guessed                   # detected | guessed
+  updated: "2026-10-27"
+  hostname: "bryan-5090"                 # guess
+  always_on: true
+  enabled: true
+
+  capabilities:
+    machine:
+      model: "Custom tower PC"           # guess
+      form_factor: desktop_tower
+    os:
+      family: linux                      # guess: could be Windows 11 + WSL2
+      distro: "Ubuntu 24.04 LTS"         # guess
+      arch: amd64
+      go_target: linux/amd64
+    cpu:
+      model: "AMD Ryzen 9 9950X"         # guess
+      cores: 16
+      performance_cores: 16
+      efficiency_cores: 0
+      threads: 32
+    memory:
+      total_gb: 128                      # guess
+      type: DDR5
+      unified: false
+      bandwidth_gb_per_s: 89
+    gpus:
+      - index: 0
+        vendor: NVIDIA
+        model: "GeForce RTX 5090"
+        architecture: Blackwell
+        api: CUDA
+        cuda_compute_capability: "12.0"
+        vram_gb: 32
+        vram_type: GDDR7
+        memory_bandwidth_gb_per_s: 1792
+        tensor_cores: 680
+        fp32_tflops: 104.8
+        fp8_fp4_support: true
+        nvenc_engines: 3
+        nvdec_engines: 2
+        driver: "580.x"                  # guess
+        cuda_version: "13.0"             # guess
+    neural_engine:
+      cores: 0
+    cuda: true
+    rocm: false
+    storage:
+      total_tb: 4.0                      # guess
+      free_tb: 3.0                       # guess
+      type: NVMe SSD (PCIe 5.0)
+      scratch_dir: "~/T/_ai_processing_server/"
+    network:
+      primary: ethernet
+      ethernet_gbps: 2.5                 # guess
+    power:
+      source: ac
+      psu_watts: 1200                    # guess; 5090 draws up to 575 W
+      ups: false                         # guess
+    media_engines:
+      hw_encode: [h264, hevc, av1]       # NVENC
+      hw_decode: [h264, hevc, av1, vp9]  # NVDEC
+      encode_engines: 3
+      prores_engines: 0
+    software:                            # all guesses
+      go: "1.27.x"
+      python: "3.12"
+      node: "26.x"
+      ffmpeg: "9.x (with NVENC)"
+      blender: "4.x"
+      pytorch: true                      # CUDA build
+      comfyui: true
+      ollama: true
+      docker: true
+      nvidia_container_toolkit: true
+      tensorrt: false
+      ipfs: false
+      models_hint: [FLUX, SDXL, "Wan 2.1", "Hunyuan Video", "Real-ESRGAN"]
+    job_slots:
+      gpu: 1                             # one GPU; heavy video models use all 32 GB
+      cpu: 8
+      max_model_memory_gb: 30            # VRAM bound, leave ~2 GB headroom
+    job_types:
+      cloud_api_jobs: true
+      transcode_h264_hevc: true          # NVENC
+      transcode_av1: true                # NVENC AV1 hardware
+      transcode_prores: partial          # CPU only (prores_ks)
+      blender_render: true               # Cycles OptiX
+      image_generation_local: true       # FLUX, SDXL via ComfyUI
+      video_generation_local: true       # Wan 2.1, Hunyuan
+      llm_inference_local: partial       # 32 GB VRAM: up to ~30B models fully on GPU
+      upscale: true
+      tts_transcription: true
+      lipsync: true
+      cuda_only_jobs: true
+    constraints:
+      - "Only CUDA node: route CUDA-only and heavy video generation here first."
+      - "32 GB VRAM: one large video model at a time; do not run two GPU jobs together."
+      - "Hardware values are guesses until detected on the machine."
+
+  services:
+    act3: true
+    we_the_citizens: true

@@ -1,0 +1,11 @@
+schema_version: 1
+id: sys.compute
+platform: sys
+title: "CPU compute: primes, sha256 chains, matrices, file stats (checkable results)"
+runner: compute
+default_enabled: true
+requires: { gpu: none }
+resources_per_job: { cpu_cores: 1, ram_gb: 0.5, vram_gb: 0 }
+max_parallel_default: 8
+timeouts: { stage_inputs: 5m, run: 30m, upload: 10m }
+retry: { max_attempts: 1, retry_on: [transient, infra, timeout] }

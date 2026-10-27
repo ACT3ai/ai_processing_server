@@ -1,0 +1,11 @@
+schema_version: 1
+id: sys.self_test
+platform: sys
+title: "Self test: a tiny known job (acceptance tests, the admin Test-this-server button)"
+runner: compute
+default_enabled: true
+requires: { gpu: none }
+resources_per_job: { cpu_cores: 1, ram_gb: 0.25, vram_gb: 0 }
+max_parallel_default: 4
+timeouts: { stage_inputs: 2m, run: 10m, upload: 5m }
+retry: { max_attempts: 1, retry_on: [transient, infra, timeout] }
