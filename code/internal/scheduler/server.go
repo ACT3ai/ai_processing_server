@@ -171,7 +171,8 @@ func New(o Options) (*Server, error) {
 // recompute derives effective hardware, offers and pool size. Caller holds mu (or is New).
 func (s *Server) recompute() {
 	s.effective, s.drift = hardware.Effective(s.opt.Monitor.Detected(), s.cfg.Hardware)
-	offers := capability.ComputeOffers(capability.Input{Catalog: s.cat, Server: s.cfg, Facts: s.effective, Runners: runners.Names()})
+	offers := capability.ComputeOffers(capability.Input{Catalog: s.cat, Server: s.cfg, Facts: s.effective, Runners: runners.Names(),
+		NotInstalled: runners.InstallProblems()})
 	s.offers = map[string]capability.Offer{}
 	for _, o := range offers {
 		s.offers[o.Service] = o

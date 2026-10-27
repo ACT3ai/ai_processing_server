@@ -98,18 +98,8 @@ func (OSSUpscale) Check(_ context.Context, job *jobs.Job, env Env) error {
 	if FakeModels() {
 		return nil
 	}
-	home := seedvr2Home()
-	repo := filepath.Join(home, "repo")
-	models := filepath.Join(home, "models", "SEEDVR2")
-	for _, f := range []string{venvPython(repo), filepath.Join(repo, "inference_cli.py")} {
-		if !fileAtLeast(f, 1) {
-			return jobs.Errf(jobs.KindInfra, "SeedVR2 is not installed on this server: missing %s (install: ~/BGit/all/film/code/subp/upscaling/open_source/seed_vr2_mac_studio/install_mac.sh)", f)
-		}
-	}
-	for _, w := range []string{seedvr2VAE, q.dit} {
-		if !fileAtLeast(filepath.Join(models, w), 100<<20) {
-			return jobs.Errf(jobs.KindInfra, "SeedVR2 weight %s is missing or partial in %s", w, models)
-		}
+	if why := seedvr2InstallProblem(q.dit); why != "" {
+		return jobs.Errf(jobs.KindInfra, "%s", why)
 	}
 	return nil
 }

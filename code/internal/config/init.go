@@ -108,7 +108,7 @@ func InitThisServer(o InitOptions) (InitResult, error) {
 // Generate renders the template for this machine and parses it back, so what is written is exactly what loads.
 func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunFunc, keep *Identity) (string, *ThisServer, error) {
 	id := Identity{Key: "CHANGE_ME", DisplayName: facts.Hostname, Profile: "generic", Family: "office", Site: "unknown"}
-	var off map[string]bool
+	var off, on map[string]bool
 	localMode := LocalShare
 	if ks := MatchKnown(cat.Known, facts); ks != nil {
 		if ks.LocalMode != "" {
@@ -119,6 +119,10 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 		off = map[string]bool{}
 		for _, s := range ks.ServicesOff {
 			off[s] = true
+		}
+		on = map[string]bool{}
+		for _, s := range ks.ServicesOn {
+			on[s] = true
 		}
 	}
 	if keep != nil {
@@ -140,7 +144,7 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 			fmt.Fprintf(&svc, "  # %s: %s\n", sid, why)
 			continue
 		}
-		enabled := def.DefaultEnabled && !off[sid]
+		enabled := (def.DefaultEnabled || on[sid]) && !off[sid]
 		fmt.Fprintf(&svc, "  - id: %s\n    enabled: %t\n", sid, enabled)
 		if def.Title != "" {
 			fmt.Fprintf(&svc, "    # %s\n", def.Title)

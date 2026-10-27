@@ -109,11 +109,8 @@ func (OSSVideo) Check(_ context.Context, job *jobs.Job, env Env) error {
 	if FakeModels() {
 		return nil
 	}
-	home := wanHome()
-	for _, f := range []string{venvPython(home), filepath.Join(home, "models", "Wan2.2-T2V-A14B-Diffusers", "model_index.json")} {
-		if !fileAtLeast(f, 1) {
-			return jobs.Errf(jobs.KindInfra, "Wan 2.2 is not installed on this server: missing %s (install guide: ~/BGit/all/app/smartc/film/servers/bms/oss_video/wan_2_2/)", f)
-		}
+	if why := wanInstallProblem(); why != "" {
+		return jobs.Errf(jobs.KindInfra, "%s", why)
 	}
 	return nil
 }
