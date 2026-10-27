@@ -4,7 +4,7 @@
 # Build if needed, then run every suite
 default: all
 
-# Every suite: api compute render queue lifecycle stress
+# Every suite: api compute render queue broker lifecycle stress
 all:
     python3 run_tests.py
 
@@ -18,7 +18,7 @@ only text:
 
 # Everything except the stress burst (quick check)
 quick:
-    python3 run_tests.py api compute render queue lifecycle
+    python3 run_tests.py api compute render queue broker lifecycle
 
 # Show the last run's results
 results:

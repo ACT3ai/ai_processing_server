@@ -22,6 +22,7 @@ import (
 
 	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
+	"github.com/ACT3ai/ai_processing_server/internal/queue"
 	"github.com/ACT3ai/ai_processing_server/internal/scheduler"
 )
 
@@ -52,6 +53,10 @@ func NewRouter(s *scheduler.Server, o Options) http.Handler {
 	mux.HandleFunc("GET /v1/jobs/{id}/log", h.auth(h.jobLog))
 	mux.HandleFunc("GET /v1/jobs/{id}/outputs/{name}", h.auth(h.output))
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", h.auth(h.cancel))
+	mux.HandleFunc("GET /v1/broker", h.auth(h.broker))
+	mux.HandleFunc("POST /v1/queue/jobs", h.auth(h.queueSubmit))
+	mux.HandleFunc("GET /v1/queue/jobs/{id}", h.auth(h.queueJob))
+	mux.HandleFunc("POST /v1/queue/jobs/{id}/cancel", h.auth(h.queueCancel))
 	mux.HandleFunc("POST /v1/drain", h.auth(h.drain))
 	mux.HandleFunc("POST /v1/resume", h.auth(h.resume))
 	mux.HandleFunc("POST /v1/reload", h.auth(h.reload))
@@ -197,6 +202,68 @@ func (h *handler) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Location", "/v1/jobs/"+j.ID)
 	writeJSON(w, http.StatusAccepted, j)
+}
+
+// ---- task queue (pm/task_queue.mdx §10, §13) ----
+
+func (h *handler) broker(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	writeJSON(w, 200, h.s.Broker(ctx))
+}
+
+// queueSubmit stores a task envelope (§13.2) in the queue as caller "local". Any server offering the service runs it.
+func (h *handler) queueSubmit(w http.ResponseWriter, r *http.Request) {
+	var env queue.Envelope
+	dec := json.NewDecoder(io.LimitReader(r.Body, queue.MaxEnvelopeBytes+1))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&env); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	ack, err := h.s.QueueSubmit(ctx, &env)
+	if err != nil {
+		writeQueueErr(w, err)
+		return
+	}
+	w.Header().Set("Location", "/v1/queue/jobs/"+ack.JobID)
+	writeJSON(w, http.StatusAccepted, ack)
+}
+
+func (h *handler) queueJob(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	j, err := h.s.QueueJob(ctx, r.PathValue("id"))
+	if err != nil {
+		writeQueueErr(w, err)
+		return
+	}
+	writeJSON(w, 200, j)
+}
+
+func (h *handler) queueCancel(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.s.QueueCancel(ctx, r.PathValue("id"), "owner (local API)"); err != nil {
+		writeQueueErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "job_id": r.PathValue("id"), "cancel": "requested"})
+}
+
+func writeQueueErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, scheduler.ErrBroker), errors.Is(err, queue.ErrUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, "broker_missing", err.Error())
+	case errors.Is(err, queue.ErrInvalid):
+		writeErr(w, http.StatusBadRequest, "invalid_input", err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		writeErr(w, http.StatusGatewayTimeout, "broker_timeout", err.Error())
+	default:
+		writeSchedErr(w, err)
+	}
 }
 
 func (h *handler) getJob(w http.ResponseWriter, r *http.Request) {

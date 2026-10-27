@@ -865,24 +865,29 @@ code/internal/
 
 | Id | Decision | Status |
 | --- | --- | --- |
-| D-201 | REST + JSON over HTTPS, OpenAPI 3.1 contract in `data/schemas/openapi/processing_v1.yaml` | proposed |
-| D-202 | Outbound-only; jobs by long-poll `lease`, orders by heartbeat/renew responses; no inbound, no tunnel, no broker in v1 | proposed (confirms D-001) |
-| D-203 | Version in path (`/processing/v1`), additive changes only within a version | proposed |
-| D-204 | Directives are state (full value every heartbeat); commands are events with ids, executed at most once | proposed |
-| D-205 | Problem Details (RFC 9457) for all errors, stable `code` catalog §12 | proposed |
-| D-206 | `Idempotency-Key` on every state-changing POST; platform stores responses 24 h | proposed |
-| D-207 | Files only through presigned URLs with enforced sha256 checksums | proposed |
-| D-208 | Git key registration through GitHub Actions OIDC, no stored deploy secret | proposed |
+| D-201 | REST + JSON over HTTPS, OpenAPI 3.1 contract in `data/schemas/openapi/processing_v1.yaml` | decided 2026-10-27 for the HTTPS gateway (D-022) |
+| D-202 | Outbound-only; jobs by long-poll `lease`, orders by heartbeat/renew responses; no inbound, no tunnel, no broker in v1 | superseded by D-014 (NATS JetStream) |
+| D-203 | Version in path (`/processing/v1`), additive changes only within a version | decided 2026-10-27 for the HTTPS gateway (D-022) |
+| D-204 | Directives are state (full value every heartbeat); commands are events with ids, executed at most once | superseded: directives live in the `overrides` KV, commands in `job_control` (task_queue.mdx §13.1) |
+| D-205 | Problem Details (RFC 9457) for all errors, stable `code` catalog §12 | decided 2026-10-27 for the HTTPS gateway (D-022) |
+| D-206 | `Idempotency-Key` on every state-changing POST; platform stores responses 24 h | decided 2026-10-27 for the HTTPS gateway (D-022) |
+| D-207 | Files only through presigned URLs with enforced sha256 checksums | decided 2026-10-27 for the HTTPS gateway (D-022) |
+| D-208 | Git key registration through GitHub Actions OIDC, no stored deploy secret | decided 2026-10-27 for the HTTPS gateway (D-022) |
 | D-209 | Optional SSE wake-up hints only (never commands) if faster control is needed | deferred |
 
-## 16. Open questions for Bryan
+## 16. Decisions on the open questions
 
-1. **Q1.** Confirm the platform hostnames and the path prefixes (`/processing/v1` on ACT3, `/api/processing/v1` on
-   WTC).
-2. **Q2.** Is 20 s worst-case cancel acceptable for renders, or should the SSE wake-up channel (§2.5) be in the first
-   release?
-3. **Q3.** Does WTC have Redis (replay cache, lease wake-ups), or should its side use Postgres for both?
-4. **Q4.** GitHub Actions OIDC for git key registration (§7.10): OK to enable on the ACT3ai org?
+**Answered 2026-10-27** (D-022). D-014 made NATS JetStream the transport, so the lease endpoints in §7 are kept only
+as the design of the HTTPS **gateway** on the hub (task_queue.mdx §10.3) and are not built for now.
+
+1. **Q1. Hostnames and prefixes:** the gateway lives at `https://queue.act3ai.com/v1` (task_queue.mdx §24 Q2). The
+   platform-side prefixes `/processing/v1` (ACT3) and `/api/processing/v1` (WTC) are not needed, because platforms no
+   longer serve a lease API.
+2. **Q2. Cancel latency:** cancel goes through the `job_control` KV watch, which is under a second. The SSE wake-up
+   channel (§2.5) is not needed.
+3. **Q3. WTC Redis:** not needed for this. NATS KV holds the replay cache, job state and wake-ups.
+4. **Q4. GitHub Actions OIDC for git key registration:** yes, enable it on the ACT3ai org when key registration is
+   built.
 
 ## 17. Source code map and upgrade log
 

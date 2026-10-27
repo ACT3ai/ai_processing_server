@@ -74,7 +74,7 @@ func (s *Server) execute(ctx context.Context, cancel context.CancelCauseFunc, jo
 		defer stageCancel()
 		for i, in := range job.Payload.Inputs {
 			rep.Log("staging input " + in.Name + " " + logging.RedactURL(in.URL) + in.Path)
-			path, n, sum, err := storage.Fetch(stageCtx, in, inDir, job.Queue == "direct")
+			path, n, sum, err := storage.Fetch(stageCtx, in, inDir, job.Queue == "direct" || job.Queue == "local")
 			if err != nil {
 				return err
 			}
@@ -193,6 +193,12 @@ func (s *Server) finishLocked(j *jobs.Job, st jobs.State, kind jobs.ErrorKind, s
 	if kind == jobs.KindCancelled {
 		st = jobs.Cancelled
 	}
+	retryable := retryOn != nil && slices.Contains(retryKinds(*retryOn), string(kind))
+	defer func() {
+		if j.State.Final() {
+			s.settleLocked(j, retryable)
+		}
+	}()
 	switch st {
 	case jobs.Completed:
 		j.CompletedAt, j.FinishedAt = &now, &now
@@ -205,7 +211,6 @@ func (s *Server) finishLocked(j *jobs.Job, st jobs.State, kind jobs.ErrorKind, s
 		s.stats.Cancelled[j.Type]++
 	default:
 		j.ErrorKind, j.ErrorStage, j.LastErr, j.LastFailedAt = kind, stage, msg, &now
-		retryable := retryOn != nil && slices.Contains(retryKinds(*retryOn), string(kind))
 		if retryable && j.Retried < j.MaxRetry {
 			j.Retried++
 			next := now.Add(backoff(j.Retried))
@@ -293,6 +298,7 @@ func (s *Server) moveStage(id string, sg jobs.Stage, note string) {
 	if j, ok := s.jobs[id]; ok && j.State == jobs.Active {
 		j.Move(jobs.Active, sg, note)
 		s.save(j, true)
+		s.eventLocked(j, "stage", nil)
 	}
 }
 
@@ -334,6 +340,7 @@ func (r *reporter) Progress(frac float64, note string) {
 			j.Note = note
 		}
 		r.s.save(j, false)
+		r.s.progressEventLocked(j)
 	}
 	r.s.mu.Unlock()
 	if note != "" {

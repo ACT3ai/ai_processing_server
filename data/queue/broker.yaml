@@ -1,0 +1,10 @@
+# The task queue broker: NATS JetStream in its own nats-server process (pm/task_queue.mdx §8.2, pm/Decisions.yaml D-014).
+# `just broker-install` installs this line; `ai_processing_server broker status` warns on any other line and
+# refuses anything older than min_version. As of 2026-10-27 the Bryan laptop runs nats-server v2.15.2 (Homebrew).
+schema_version: 1
+supported_line: "2.15"
+min_version: "2.10.0"
+install:
+  darwin: "brew install nats-server"
+  linux: "download the nats-server release tarball for your arch from https://github.com/nats-io/nats-server/releases (2.15.x) and put nats-server on PATH"
+  windows: "winget install NATS.Server (or download the 2.15.x zip from https://github.com/nats-io/nats-server/releases) and put nats-server.exe on PATH"

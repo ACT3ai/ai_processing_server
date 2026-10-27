@@ -35,7 +35,7 @@ func detectOS(ctx context.Context, f *Facts) {
 		b, _ := strconv.ParseFloat(strings.TrimSpace(out), 64)
 		f.RAMGB = round1(b / (1 << 30))
 	}
-	if out, err := run(ctx, "system_profiler", "SPDisplaysDataType", "-json"); err == nil {
+	if out, err := runSlow(ctx, "system_profiler", "SPDisplaysDataType", "-json"); err == nil {
 		f.GPUs = ParseSystemProfilerDisplays([]byte(out), f.RAMGB)
 	} else {
 		f.Errors = append(f.Errors, "system_profiler: "+err.Error())

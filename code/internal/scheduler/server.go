@@ -1,6 +1,6 @@
 // Package scheduler is our coordination logic (spec §9, §10, §15.2): it owns the job table, the slot pool,
 // admission by effective priority, the per-job lifecycle, retries, cancel, pause, drain and crash recovery.
-// The transport underneath (direct mode today; platform leases later) never decides any of this.
+// The transport underneath (direct mode, and the NATS JetStream task queue in queue.go) never decides any of this.
 package scheduler
 
 import (
@@ -20,6 +20,7 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
+	"github.com/ACT3ai/ai_processing_server/internal/queue"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
 )
 
@@ -64,6 +65,8 @@ type Options struct {
 	GitSHA   string
 	Warnings []string // config warnings to report (legacy file, unknown services)
 	Logger   *slog.Logger
+	// OpenQueue connects to the task queue (this machine's nats-server). nil: queue.enabled is false, direct mode only.
+	OpenQueue func(context.Context) (queue.Queue, error)
 	// Intervals; zero means the spec default.
 	TelemetryEvery time.Duration
 	SweepEvery     time.Duration
@@ -101,6 +104,16 @@ type Server struct {
 	lastSave  map[string]time.Time
 
 	workDir, resultsDir, jobLogDir string
+
+	// Task queue link (queue.go). q is nil until the broker answers.
+	q        queue.Queue
+	qState   string
+	qErr     string
+	qVersion string
+	held     map[string]*heldJob
+	qwake    chan struct{}
+	pub      chan pubReq
+	reclaim  []queue.ClaimHandle
 }
 
 type counters struct {
@@ -126,7 +139,11 @@ func New(o Options) (*Server, error) {
 		jobs: map[string]*jobs.Job{}, cancels: map[string]context.CancelCauseFunc{}, activeBy: map[string]int{},
 		pausedSvc: map[string]string{}, wake: make(chan struct{}, 1), log: o.Logger.With("ctx", "scheduler"),
 		bootAt: time.Now(), lastSave: map[string]time.Time{}, warnings: o.Warnings,
+		held: map[string]*heldJob{}, qwake: make(chan struct{}, 1), pub: make(chan pubReq, 1024), qState: BrokerDisabled,
 		stats: counters{map[string]int64{}, map[string]int64{}, map[string]int64{}, map[string]int64{}},
+	}
+	if o.OpenQueue != nil {
+		s.qState = BrokerConnecting // until queueMain's first attempt answers; never "disabled" while enabled
 	}
 	s.workDir = s.cfg.Paths.WorkDir
 	if s.workDir == "" {
@@ -189,6 +206,10 @@ func (s *Server) recover() {
 			j.LastErr = fmt.Sprintf("server restarted during %s", stage)
 			j.LastFailedAt, j.FinishedAt = &now, &now
 			j.Slot = nil
+			if j.Claim != nil { // a queued job: its claim goes back to the queue once the broker answers
+				s.reclaim = append(s.reclaim, *j.Claim)
+				j.Claim = nil
+			}
 			j.Move(jobs.Archived, jobs.StageFailed, j.LastErr)
 			elog.Check("deleting the work dir of a job interrupted by a restart", os.RemoveAll(filepath.Join(s.workDir, j.ID)), "job_id", j.ID)
 			if err := s.journal.Save(j); err != nil {
@@ -217,6 +238,12 @@ func (s *Server) Run(ctx context.Context) {
 	tHW := time.NewTicker(s.opt.HardwareEvery)
 	defer func() { tAdmit.Stop(); tTele.Stop(); tSweep.Stop(); tHW.Stop() }()
 	s.sweep()
+	if s.opt.OpenQueue != nil {
+		go func() {
+			defer elog.Recover("running the task queue link")
+			s.queueMain(ctx)
+		}()
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -247,6 +274,10 @@ func (s *Server) poke() {
 	case s.wake <- struct{}{}:
 	default:
 	}
+	select {
+	case s.qwake <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Server) offerSummary() string {
@@ -262,9 +293,19 @@ func (s *Server) offerSummary() string {
 
 // Submit accepts a job in direct mode (POST /v1/jobs). The owner's fence applies: a service that is off, or that
 // this hardware cannot run, is refused up front rather than left waiting forever.
-func (s *Server) Submit(env jobs.Envelope, queue string) (*jobs.Job, error) {
+func (s *Server) Submit(env jobs.Envelope, platform string) (*jobs.Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	j, err := s.acceptLocked(env, platform, 0, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return j.Redacted(), nil
+}
+
+// acceptLocked validates and stores a new job. retried and maxRetry come from the queue for queued jobs (the queue
+// owns their retries, so maxRetry is 0); claim is the broker claim, nil for direct jobs.
+func (s *Server) acceptLocked(env jobs.Envelope, platform string, retried int, maxRetryOverride *int, claim *queue.ClaimHandle) (*jobs.Job, error) {
 	def, ok := s.cat.Services[env.Service]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q is not in data/services", ErrUnknownService, env.Service)
@@ -291,12 +332,15 @@ func (s *Server) Submit(env jobs.Envelope, queue string) (*jobs.Job, error) {
 	}
 	env.JobID, env.Service = id, def.ID
 	if env.Platform == "" {
-		env.Platform = queue
+		env.Platform = platform
 	}
 	env.Priority = min(max(env.Priority, 0), 300) // spec §10.2 clamp
 	maxRetry := max(def.Retry.MaxAttempts-1, 0)
 	if env.MaxRetry != nil {
 		maxRetry = min(max(*env.MaxRetry, 0), 25)
+	}
+	if maxRetryOverride != nil {
+		maxRetry = *maxRetryOverride
 	}
 	timeout := def.Timeouts.Run.Or(time.Hour)
 	if env.TimeoutSeconds > 0 {
@@ -306,14 +350,19 @@ func (s *Server) Submit(env jobs.Envelope, queue string) (*jobs.Job, error) {
 	j := &jobs.Job{
 		ID: id, Queue: env.Platform, Type: def.ID, Payload: env, MaxRetry: maxRetry,
 		Timeout: int64(timeout / time.Second), Deadline: env.Deadline, Priority: env.Priority, CreatedAt: now,
+		Retried: retried, Claim: claim,
 	}
-	j.Move(jobs.Pending, jobs.StageLeased, "accepted")
+	note := "accepted"
+	if claim != nil {
+		note = fmt.Sprintf("claimed from the task queue (caller %s, attempt %d)", platform, retried+1)
+	}
+	j.Move(jobs.Pending, jobs.StageLeased, note)
 	j.EffectivePriority = s.effPriority(j, now)
 	s.jobs[id] = j
 	s.save(j, true)
-	s.log.Info("job accepted", "job_id", id, "service", j.Type, "platform", j.Queue, "priority", j.Priority)
+	s.log.Info("job accepted", "job_id", id, "service", j.Type, "platform", j.Queue, "priority", j.Priority, "queued", claim != nil)
 	s.poke()
-	return j.Redacted(), nil
+	return j, nil
 }
 
 // effPriority is spec §10.3: priority + platform weight + owner bias + one point per waiting minute (max 60).
@@ -398,6 +447,7 @@ func (s *Server) startLocked(j *jobs.Job, slot jobs.Slot) {
 	ctx, cancel := context.WithCancelCause(s.jobsCtx)
 	s.cancels[j.ID] = cancel
 	s.save(j, true)
+	s.eventLocked(j, "stage", nil)
 	s.log.Info("job start", "job_id", j.ID, "service", j.Type, "platform", j.Queue, "slot", slot.ID,
 		"cores", slot.Cores, "attempt", attempt, "effective_priority", j.EffectivePriority)
 	s.wg.Add(1)
