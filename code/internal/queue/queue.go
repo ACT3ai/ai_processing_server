@@ -274,6 +274,26 @@ type SubmitAck struct {
 	Duplicate bool   `json:"duplicate"`
 }
 
+// WorkItem is one job the WORK stream still holds: waiting for a slot, or claimed and not yet acked.
+type WorkItem struct {
+	JobID         string    `json:"job_id"`
+	Caller        string    `json:"caller"`
+	Service       string    `json:"service"`
+	Model         string    `json:"model,omitempty"`
+	CallerJobType string    `json:"caller_job_type,omitempty"`
+	Priority      int       `json:"priority"`
+	Band          string    `json:"band"`
+	Sequence      uint64    `json:"sequence"`
+	AdmittedAt    time.Time `json:"admitted_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+}
+
+// Lister is implemented by queues that can list what they hold (GET /v1/queue/jobs, `ai_processing_server queue ls`):
+// debugging only, never on the scheduling path.
+type Lister interface {
+	List(ctx context.Context, limit int) ([]WorkItem, error)
+}
+
 // Control is the job_control record for one job.
 type Control struct {
 	Cancel bool   `json:"cancel,omitempty"`

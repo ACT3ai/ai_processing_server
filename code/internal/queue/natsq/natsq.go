@@ -282,6 +282,39 @@ func (q *Queue) Resume(ctx context.Context, h queue.ClaimHandle) (queue.Delivery
 	return &delivery{q: q, env: &env, data: raw.Data, h: h}, nil
 }
 
+// List reads up to limit jobs the WORK stream still holds, oldest first. A work-queue stream keeps only unacked
+// messages, so this is the waiting line plus the claims in flight. Debugging only: one GetMsg per sequence.
+func (q *Queue) List(ctx context.Context, limit int) ([]queue.WorkItem, error) {
+	info, err := q.work.Info(ctx)
+	if err != nil {
+		return nil, q.unavailable("reading the WORK stream", err)
+	}
+	out := []queue.WorkItem{}
+	if info.State.Msgs == 0 {
+		return out, nil
+	}
+	// Acked messages leave holes between first and last; bound the scan so a long-lived stream cannot stall a call.
+	last := min(info.State.LastSeq, info.State.FirstSeq+uint64(max(limit, 1))*50)
+	for seq := info.State.FirstSeq; seq <= last && len(out) < limit; seq++ {
+		raw, err := q.work.GetMsg(ctx, seq)
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			continue
+		}
+		if err != nil {
+			return out, q.unavailable("reading the WORK stream", err)
+		}
+		var env queue.Envelope
+		if json.Unmarshal(raw.Data, &env) != nil {
+			continue
+		}
+		admitted, _ := time.Parse(time.RFC3339Nano, raw.Header.Get("X-Admitted-At"))
+		out = append(out, queue.WorkItem{JobID: env.JobID, Caller: env.Caller, Service: env.Service, Model: env.Model,
+			CallerJobType: env.CallerJobType, Priority: env.Priority, Band: queue.BandFor(env.Priority), Sequence: seq,
+			AdmittedAt: admitted, ExpiresAt: env.ExpiresAt})
+	}
+	return out, nil
+}
+
 // Publish writes one event to evt.<caller>.<job_id>. The message id (job, seq) makes a repeated final event a no-op.
 func (q *Queue) Publish(ctx context.Context, ev *queue.Event) error {
 	if ev.At.IsZero() {

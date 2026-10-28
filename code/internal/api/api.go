@@ -55,6 +55,7 @@ func NewRouter(s *scheduler.Server, o Options) http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", h.auth(h.cancel))
 	mux.HandleFunc("GET /v1/broker", h.auth(h.broker))
 	mux.HandleFunc("POST /v1/queue/jobs", h.auth(h.queueSubmit))
+	mux.HandleFunc("GET /v1/queue/jobs", h.auth(h.queueList))
 	mux.HandleFunc("GET /v1/queue/jobs/{id}", h.auth(h.queueJob))
 	mux.HandleFunc("POST /v1/queue/jobs/{id}/cancel", h.auth(h.queueCancel))
 	mux.HandleFunc("POST /v1/drain", h.auth(h.drain))
@@ -230,6 +231,22 @@ func (h *handler) queueSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Location", "/v1/queue/jobs/"+ack.JobID)
 	writeJSON(w, http.StatusAccepted, ack)
+}
+
+// queueList is GET /v1/queue/jobs?limit=N: what the WORK stream holds (waiting + claimed), with job_state each.
+func (h *handler) queueList(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n <= 1000 {
+		limit = n
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	items, err := h.s.QueueList(ctx, limit)
+	if err != nil {
+		writeQueueErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"jobs": items})
 }
 
 func (h *handler) queueJob(w http.ResponseWriter, r *http.Request) {

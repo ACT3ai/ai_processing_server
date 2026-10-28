@@ -749,6 +749,7 @@ type QueueJob struct {
 	State    queue.JobState `json:"job_state"`
 	Revision uint64         `json:"revision"`
 	Events   []queue.Event  `json:"events"`
+	Control  queue.Control  `json:"control"` // cancel / pause flags set for the job
 }
 
 func (s *Server) QueueJob(ctx context.Context, id string) (*QueueJob, error) {
@@ -770,13 +771,84 @@ func (s *Server) QueueJob(ctx context.Context, id string) (*QueueJob, error) {
 	if evs == nil {
 		evs = []queue.Event{}
 	}
-	return &QueueJob{State: st, Revision: rev, Events: evs}, nil
+	ctl, _ := q.GetControl(ctx, id)
+	return &QueueJob{State: st, Revision: rev, Events: evs, Control: ctl}, nil
 }
 
-// QueueCancel sets the job's cancel flag; whichever server holds it (or pulls it later) stops it.
+// QueueItem is one row of GET /v1/queue/jobs: a job the WORK stream holds, with its job_state and cancel flag.
+type QueueItem struct {
+	queue.WorkItem
+	State   string `json:"state"`
+	Attempt int    `json:"attempt,omitempty"`
+	Server  string `json:"server,omitempty"`
+	Cancel  bool   `json:"cancel,omitempty"`
+	Held    bool   `json:"held"` // claimed by this server right now
+}
+
+// QueueList lists what the task queue holds (debugging: `ai_processing_server queue ls`).
+func (s *Server) QueueList(ctx context.Context, limit int) ([]QueueItem, error) {
+	q, err := s.queueOrErr()
+	if err != nil {
+		return nil, err
+	}
+	l, ok := q.(queue.Lister)
+	if !ok {
+		return nil, fmt.Errorf("%w: this queue backend cannot list its jobs", ErrInvalid)
+	}
+	items, err := l.List(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]QueueItem, 0, len(items))
+	for _, it := range items {
+		row := QueueItem{WorkItem: it}
+		if st, _, err := q.State(ctx, it.JobID); err == nil {
+			row.State, row.Attempt, row.Server = st.State, st.Attempt, st.Server
+		}
+		ctl, _ := q.GetControl(ctx, it.JobID)
+		row.Cancel = ctl.Cancel
+		s.mu.Lock()
+		_, row.Held = s.held[it.JobID]
+		s.mu.Unlock()
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// inQueue reports whether the WORK stream still holds the job (a job_state write that failed at submit).
+func inQueue(ctx context.Context, q queue.Queue, id string) bool {
+	l, ok := q.(queue.Lister)
+	if !ok {
+		return false
+	}
+	items, err := l.List(ctx, 1000)
+	if err != nil {
+		return false
+	}
+	for _, it := range items {
+		if it.JobID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// QueueCancel sets the job's cancel flag; whichever server holds it (or pulls it later) stops it. A finished job is
+// ErrFinal and a job the queue never had is ErrNotFound, so the caller is told, not answered "ok".
 func (s *Server) QueueCancel(ctx context.Context, id, by string) error {
 	q, err := s.queueOrErr()
 	if err != nil {
+		return err
+	}
+	st, rev, err := q.State(ctx, id)
+	switch {
+	case err == nil && queue.FinalState(st.State):
+		return fmt.Errorf("%w: %s is %s since %s", ErrFinal, id, st.State, st.UpdatedAt.Format(time.RFC3339))
+	case errors.Is(err, queue.ErrNotFound):
+		if !inQueue(ctx, q, id) {
+			return fmt.Errorf("%w: %s is not on the task queue", ErrNotFound, id)
+		}
+	case err != nil:
 		return err
 	}
 	if err := q.SetControl(ctx, id, queue.Control{Cancel: true, By: by}); err != nil {
@@ -788,7 +860,27 @@ func (s *Server) QueueCancel(ctx context.Context, id, by string) error {
 	if mine {
 		_, _ = s.Cancel(id, by)
 	}
+	if err == nil && st.State == queue.StateQueued {
+		s.cancelWaiting(ctx, q, st, rev, by)
+	}
 	return nil
+}
+
+// cancelWaiting ends a job no server holds (§16.5) at once instead of when a slot frees: job_state QUEUED →
+// CANCELLED (CAS) and a final `cancelled` event. Its WORK message stays; the server that pulls it reads the final
+// state and acks it without running it. A claim that raced us fences the CAS off and the cancel flag stops it.
+func (s *Server) cancelWaiting(ctx context.Context, q queue.Queue, st queue.JobState, rev uint64, by string) {
+	st.State, st.Kind, st.Message, st.UpdatedAt = queue.StateCancelled, "", "cancelled before any server ran it", time.Time{}
+	if _, err := q.CASState(ctx, st, rev); err != nil {
+		s.log.Info("waiting job was claimed while cancelling; its cancel flag stops it", "job_id", st.JobID, "error", err)
+		return
+	}
+	ev := &queue.Event{JobID: st.JobID, Caller: st.Caller, Seq: int64(st.Attempt)*eventSeqBase + eventSeqBase - 1,
+		Type: "cancelled", State: queue.StateCancelled, Attempt: st.Attempt, Band: st.Band, By: by}
+	if err := s.publishSync(ctx, ev); err != nil {
+		elog.Error("publishing the cancelled event of a waiting job", err, "job_id", st.JobID)
+	}
+	s.log.Info("waiting job cancelled before it ran", "job_id", st.JobID, "by", by)
 }
 
 // BrokerView is GET /v1/broker.

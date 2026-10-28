@@ -91,6 +91,14 @@ status: _binary
     @echo
     @./{{bin}} jobs
 
+# The task queue: `just queue` lists what waits or runs; `just queue show <id>` is one job's states, events and log
+queue *args: _binary
+    @./{{bin}} queue {{args}}
+
+# Cancel jobs on whichever route holds them and wait until they stop: `just cancel <id>...`, `just cancel --prefix act3_<hex>_`
+cancel *args: _binary
+    @./{{bin}} cancel {{args}}
+
 # Tail the server logs in ~/_act3_logs
 [unix]
 logs:

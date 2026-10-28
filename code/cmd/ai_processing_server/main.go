@@ -69,6 +69,9 @@ type paths struct {
 	JSONOut  bool
 	Force    bool
 	WriteNew bool
+	Prefix   string // cancel: every unfinished job whose id starts with this
+	NoWait   bool   // cancel: do not wait for a running job to stop
+	Lines    int    // queue show: log lines to print
 }
 
 // elog records errors that should not happen (pm/errors.mdx) in error.err.
@@ -101,7 +104,10 @@ func main() {
 	fs.BoolVar(&p.JSONOut, "json", false, "print JSON (status, jobs, detect)")
 	fs.BoolVar(&p.Force, "force", false, "stop: kill now instead of draining")
 	fs.BoolVar(&p.WriteNew, "write-new", false, "init: write this_server.yaml.new for the owner to merge")
-	fs.Parse(args)
+	fs.StringVar(&p.Prefix, "prefix", "", "cancel: every unfinished job whose id starts with this (e.g. all _aN tries of one caller job)")
+	fs.BoolVar(&p.NoWait, "no-wait", false, "cancel: return once the cancel is asked, without waiting for the job to stop")
+	fs.IntVar(&p.Lines, "lines", 20, "queue show: lines of the job's log to print (0: none)")
+	fs.Parse(flagsFirst(fs, args))
 	if err := p.resolve(); err != nil && cmd != "version" {
 		fail(err)
 	}
@@ -133,10 +139,9 @@ func main() {
 	case "jobs":
 		err = cmdJobs(p, fs.Args())
 	case "cancel":
-		if fs.NArg() != 1 {
-			fail(errors.New("usage: ai_processing_server cancel <job_id>"))
-		}
-		err = cmdPost(p, "/v1/jobs/"+fs.Arg(0)+"/cancel")
+		err = cmdCancel(p, fs.Args())
+	case "queue":
+		err = cmdQueue(p, fs.Args())
 	case "drain":
 		err = cmdPost(p, "/v1/drain")
 	case "resume":
@@ -160,10 +165,42 @@ func main() {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
-commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
+commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · drain · resume · stop [--force]
+          queue ls · queue show <id> [--lines N] · cancel [--prefix P] [--no-wait] <id>...
           broker status|config · enable|disable <service-id|queue>... · version
-flags: --root --state-dir --config --log-dir --error-dir --listen --json
+flags: --root --state-dir --config --log-dir --error-dir --listen --json (flags go before ids)
 `)
+}
+
+// flagsFirst moves flags (and their values) ahead of positional args, so `cancel <id> --no-wait` and
+// `queue show <id> --lines 5` work: the flag package stops at the first non-flag. "--" ends flag reordering.
+func flagsFirst(fs *flag.FlagSet, args []string) []string {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			pos = append(pos, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			pos = append(pos, a)
+			continue
+		}
+		flags = append(flags, a)
+		name := strings.TrimLeft(a, "-")
+		if strings.Contains(name, "=") {
+			continue
+		}
+		f := fs.Lookup(name)
+		if f == nil { // unknown: Parse reports it
+			continue
+		}
+		if b, ok := f.Value.(interface{ IsBoolFlag() bool }); !(ok && b.IsBoolFlag()) && i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	return append(flags, pos...)
 }
 
 func fail(err error) {

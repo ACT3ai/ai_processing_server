@@ -67,6 +67,22 @@ func (m *Mem) Submit(_ context.Context, env *queue.Envelope) (queue.SubmitAck, e
 	return queue.SubmitAck{JobID: env.JobID, Band: ref.Band, Subject: ref.Subject(), Sequence: m.seq}, nil
 }
 
+// List returns the jobs still in the work list (waiting or claimed), oldest first.
+func (m *Mem) List(_ context.Context, limit int) ([]queue.WorkItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []queue.WorkItem{}
+	for _, w := range m.work {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, queue.WorkItem{JobID: w.env.JobID, Caller: w.env.Caller, Service: w.env.Service,
+			Model: w.env.Model, CallerJobType: w.env.CallerJobType, Priority: w.env.Priority, Band: w.ref.Band,
+			Sequence: w.seq, AdmittedAt: w.env.IssuedAt, ExpiresAt: w.env.ExpiresAt})
+	}
+	return out, nil
+}
+
 func (m *Mem) Pull(ctx context.Context, order []queue.ConsumerRef, wait time.Duration) (queue.Delivery, error) {
 	deadline := time.Now().Add(wait)
 	for {

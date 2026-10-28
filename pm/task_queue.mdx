@@ -1303,7 +1303,11 @@ second job.
 ### 16.5 Cancellation
 
 The caller sets `job_control.<job_id>.cancel = true` (or `DELETE /v1/jobs/{job_id}`). A queued job is removed by the
-hub and acked with event `cancelled`. A running job's worker sees the change through its watch and cancels the job's
+hub and acked with event `cancelled`.
+**As built (2026-10-28):** `POST /v1/queue/jobs/{id}/cancel` on a job no server holds (`job_state` QUEUED) sets the
+flag and CASes `job_state` to CANCELLED with a `cancelled` event at once; its WORK message stays until a server pulls it,
+reads the final state and acks it without running it. A claim that races the CAS fences it off and the flag stops the
+job instead. A finished job answers 409 `already_final`; a job the queue never had answers 404 `not_found`. A running job's worker sees the change through its watch and cancels the job's
 context; the parent spec's cancel checkpoints (§9.2 there) apply and nothing is uploaded after cancel.
 
 ### 16.6 When the hub is down
@@ -1418,8 +1422,15 @@ file in `data/services/` (parent §8.2), under `queue:`.
 service yet), `just broker-config` (writes `~/.act3_processing/nats/<role>.conf` from `data/queue/nats/<role>.conf.tmpl`;
 `$APS_BROKER_DIR` overrides the directory), `just broker-run` / `just broker-stop` (a background `nats-server` until it
 is an OS service), `just broker-status` (`ai_processing_server broker status [--json]`). The local API adds
-`POST /v1/queue/jobs`, `GET /v1/queue/jobs/{id}`, `POST /v1/queue/jobs/{id}/cancel` and `GET /v1/broker`. The other
-recipes in the table are not built.
+`POST /v1/queue/jobs`, `GET /v1/queue/jobs` (what the WORK stream holds, with each job's `job_state`, cancel flag and
+whether this server holds it), `GET /v1/queue/jobs/{id}` (also returns `control`), `POST /v1/queue/jobs/{id}/cancel`
+and `GET /v1/broker`. The other recipes in the table are not built.
+
+**Debugging from the shell (2026-10-28):** `ai_processing_server queue ls` (`just queue`) lists waiting and claimed
+jobs; `queue show <id> [--lines N]` prints one job's queue state, cancel flag, event timeline, local record, files and
+log tail; `cancel <id>...` (`just cancel`) cancels on whichever route holds the job (queue first, then the local job
+table), waits up to 90 s until it is final, says "nothing to cancel" for a finished job, and `cancel --prefix P`
+cancels every unfinished job whose id starts with P (every `_aN` try of one caller job). Flags may follow ids.
 
 * `/metrics` (parent §13) adds queue depth per band and caller, wait time percentiles, admission rejects by reason,
   redeliveries, dead letters, and per-caller share actually delivered.
