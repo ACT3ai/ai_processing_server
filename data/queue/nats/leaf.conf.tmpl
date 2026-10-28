@@ -1,0 +1,7 @@
+# Phase Q3 (pm/task_queue.mdx §8.1): a worker's leaf node, outbound to the hub. Not used in Q1.
+server_name: "{{.ServerName}}"
+listen: "{{.Host}}:{{.Port}}"
+http: "127.0.0.1:{{.MonitorPort}}"
+pid_file: "{{.PidFile}}"
+jetstream { store_dir: "{{.StoreDir}}", max_file_store: {{.MaxFileStore}}, domain: "{{.ServerName}}" }
+leafnodes { remotes: [ { url: "{{.HubURL}}", credentials: "{{.Credentials}}" } ] }

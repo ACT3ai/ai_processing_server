@@ -11,3 +11,7 @@ standard PROJECT layout is complete.
 | `capability` | offers and reasons for a 5090, a Mac (no CUDA), two 16 GB cards never summed, the owner's fence and caps |
 | `scheduler` | slot pool per card, release, CPU accounting |
 | `runners` | primes, sha256 chains, matrices, Mandelbrot against known values; cancellation |
+| `queue/queuetest`, `queue/natsq` | the queue contract (pm/task_queue.mdx §13.7, acceptance Q8), run on the in-memory queue and on a real `nats-server` process: idempotent submit, one delivery at a time, delayed requeue as the next attempt, a resumed claim acks the same delivery, redelivery after the ack wait, create-only and fenced `job_state`, ordered and deduplicated events, control watch |
+| `priority` | priority → band at every threshold, caller ceilings, pull order band → caller → local_bias |
+| `snapshot` | the same binary reuses its snapshot, a new build gets its own, garbage collection keeps snapshots in use |
+| `runs` | a torn last line of `events.jsonl` is left for the next read; a task host is alive only with a fresh heartbeat from the same pid |

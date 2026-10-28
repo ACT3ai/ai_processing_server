@@ -3,9 +3,9 @@
 
 - id: D-001
   title: "Transport: HTTPS lease API as the contract; Temporal adapter optional; RabbitMQ not now"
-  status: proposed
+  status: superseded by D-Q1 (2026-10-27)
   date: 2026-10-27
-  note: "Bryan to confirm (spec §11, §23 Q1). v0.1.0 has no platform transport yet: jobs arrive by direct mode (POST /v1/jobs)."
+  note: "Bryan confirmed D-Q1 (NATS JetStream as a separate nats-server service) on 2026-10-27. The HTTPS gateway of task_queue.mdx §10.3 (phase Q3) is how HTTPS-only callers submit."
 
 - id: D-002
   title: "this_server.yaml is written only by init when missing; machine-written state goes to state/"
@@ -40,7 +40,7 @@
 
 - id: D-008
   title: "Job record mirrors Asynq's TaskInfo; the v0.1 queue is embedded"
-  status: decided for v0.1.0; to be revisited if D-Q1 is confirmed
+  status: superseded by D-Q1 and D-014 (2026-10-27)
   conflict: >
     pm/task_queue.mdx (written the same day in a parallel session) proposes D-Q1: NATS JetStream (revised the same day:
     run as its own nats-server service, never embedded), with its own task contract (§13: envelope v1, lifecycle SUBMITTED → … → SUCCEEDED / FAILED / CANCELLED,
@@ -101,3 +101,57 @@
   why: >
     security.mdx §3.4 allows a small in-repo implementation tested against the RFC 9421 Appendix B vectors. It covers
     exactly the profile in apis.mdx §5 and adds no dependency. The B.2.6 Ed25519 vector reproduces byte for byte.
+
+- id: D-Q1
+  title: "Task system: NATS JetStream, run as its own nats-server service, never embedded"
+  status: decided
+  date: 2026-10-27
+  decided_by: Bryan ("I confirm NATS JetStream", 2026-10-27)
+  decision: >
+    pm/task_queue.mdx §1 to §3: nats-server is a separate long-lived OS service (hub cluster and a leaf node per worker
+    in phase Q3; one local server in standalone). ai_processing_server is only a client. Supersedes D-001 and D-008.
+  consequence: "Phase Q1 built the same day (D-014 to D-017). The remaining task_queue.mdx §23 decisions (D-Q2 to D-Q10) stay proposed."
+
+- id: D-014
+  title: "The job record and local API pass the task queue contract through: envelope v1, §13.4 states, §13.5 events"
+  status: decided
+  date: 2026-10-27
+  decision: >
+    The record's names come from task_queue.mdx §13 with no renames: job_id, caller, category, service, band, attempt,
+    max_attempts, state (SUBMITTED, QUEUED, CLAIMED, STAGING, RUNNING, UPLOADING, SUCCEEDED, FAILED, CANCELLED, EXPIRED,
+    REJECTED), events_seq, code_version, and the envelope as submitted. GET /v1/jobs/{id}/events returns the caller's
+    events from the EVENTS stream. POST /v1/jobs takes envelope fields (max_attempts replaces max_retry). The Asynq
+    names of v0.1 are gone; the v0.1 journal in state/journal/ is left untouched and the new one is state/jobs/.
+  why: "D-008's rule (mirror the real task system) applied to the system Bryan picked. NATS has no per-job status model, so the standard is our §13 contract."
+
+- id: D-015
+  title: "The broker listens on 127.0.0.1:4244, not 4222"
+  status: decided
+  date: 2026-10-27
+  why: >
+    Other apps on our machines already run a nats-server on 4222 (on the Bryan laptop a Homebrew service with no
+    JetStream). A separate port keeps the processing server's broker, store and config independent of them.
+    queue.broker_url in this_server.yaml can change it.
+
+- id: D-016
+  title: "Controller and task host talk only through files in the run directory; the fence is a file handshake"
+  status: decided
+  date: 2026-10-27
+  decision: >
+    task.json, run.json, events.jsonl, heartbeat.json (every 2 s), cancel, fence_request / fence_ok / fence_lost,
+    result.json, exit.json, handled (data/schemas/run_record.v1.schema.json). Before uploading, a task host writes
+    fence_request and waits; a controller compare-and-sets job_state with the claim's revision and answers. A task host
+    whose controller is down therefore finishes its runner and waits at the fence; the next controller answers it.
+    A task host is "the same process" when its pid is alive and it rewrote heartbeat.json with that pid in the last
+    10 s (a reused pid never does); this replaces the start-time comparison of §9.4 step 2 and works on Windows too.
+  why: "Default (non self-claim) mode keeps the task host off the network, as §9.3 asks, while still honoring §16.3: nothing leaves the machine unless the claim is still ours."
+
+- id: D-017
+  title: "A code snapshot is keyed by commit and by the binary's own hash, made at controller start"
+  status: decided
+  date: 2026-10-27
+  decision: >
+    data/git_ignore/snapshots/<git_sha>-<first 8 hex of sha256(binary)>/ holds a read-only copy of the binary (the task
+    host shim and, today, every runner) plus data/services and data/queue. It is built when the controller starts, from
+    the file the process was started from, before anything can rebuild it; a dirty tree gets its own id automatically.
+  why: "§9.2 says 'the first job after a pull builds it', but by then `just build` may already have replaced the binary on disk. Building at start copies exactly the code this controller is."

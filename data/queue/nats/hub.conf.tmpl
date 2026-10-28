@@ -1,0 +1,7 @@
+# Phase Q3 (pm/task_queue.mdx §8.1): the hub's nats-server with leaf node listener and accounts. Not used in Q1.
+server_name: "{{.ServerName}}"
+listen: "{{.Host}}:{{.Port}}"
+http: "127.0.0.1:{{.MonitorPort}}"
+pid_file: "{{.PidFile}}"
+jetstream { store_dir: "{{.StoreDir}}", max_file_store: {{.MaxFileStore}} }
+leafnodes { listen: "0.0.0.0:7422" }

@@ -41,8 +41,8 @@ class MandelbrotRender(ServerTestCase):
     def test_video_encode(self):
         seen = []
         j = self.api.submit("sys.render_test", {**PARAMS, "frames": 12, "throttle_ms": 40, "encode_video": True})
-        done = self.api.wait(j["id"], timeout=120, on_poll=lambda s: seen.append(s.get("step")))
-        self.assertEqual(done["state"], "completed", done.get("last_err"))
+        done = self.api.wait(j["job_id"], timeout=120, on_poll=lambda s: seen.append(s.get("step")))
+        self.assertEqual(done["state"], "SUCCEEDED", done.get("error_message"))
         self.assertIn("render", seen)
         body = self.assertOutputIntact(done, "video")
         with tempfile.TemporaryDirectory() as d:
@@ -55,6 +55,6 @@ class MandelbrotRender(ServerTestCase):
         self.assertAlmostEqual(info["duration"], 12 / 6, delta=0.2)
 
     def test_invalid_size_is_rejected(self):
-        j = self.run_job("sys.render_test", {"width": 63, "height": 48}, expect="archived")
+        j = self.run_job("sys.render_test", {"width": 63, "height": 48}, expect="FAILED")
         self.assertEqual(j["error_kind"], "invalid_input")
-        self.assertIn("even", j["last_err"])
+        self.assertIn("even", j["error_message"])

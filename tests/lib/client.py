@@ -5,7 +5,9 @@ import time
 import urllib.error
 import urllib.request
 
-FINAL = ("completed", "archived", "cancelled")
+# Final states of the task queue lifecycle (pm/task_queue.mdx §13.4).
+FINAL = ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED", "REJECTED")
+HOLDING = ("CLAIMED", "STAGING", "RUNNING", "UPLOADING")  # the job holds a slot on the machine
 
 
 class APIError(Exception):
@@ -70,6 +72,10 @@ class Client:
         q = "&".join(f"{k}={v}" for k, v in filters.items())
         return self.get("/v1/jobs" + ("?" + q if q else ""))["jobs"]
 
+    def events(self, job_id):
+        """The job's events as its caller reads them from the broker's EVENTS stream."""
+        return self.get(f"/v1/jobs/{job_id}/events")["events"]
+
     def cancel(self, job_id):
         return self.post(f"/v1/jobs/{job_id}/cancel")
 
@@ -95,7 +101,7 @@ class Client:
             if j["state"] in states:
                 return j
             if time.time() > deadline:
-                raise TimeoutError(f"job {job_id} still {j['state']}/{j['stage']} after {timeout}s: {j.get('note')}")
+                raise TimeoutError(f"job {job_id} still {j['state']} (attempt {j.get('attempt')}) after {timeout}s: {j.get('note')}")
             time.sleep(interval)
 
     def wait_until(self, job_id, predicate, timeout=30, interval=0.03):

@@ -37,12 +37,32 @@ class ComputeResults(ServerTestCase):
         j = self.run_job("sys.self_test", {"op": "primes", "limit": 100})
         self.assertEqual(j["result"]["count"], 25)
         self.assertEqual(j["platform_status"], "COMPLETED")
-        self.assertEqual(j["stage"], "DONE")
+        self.assertEqual(j["attempt"], 1)
         self.assertEqual(j["progress"], 1)
 
-    def test_history_records_every_stage(self):
+    def test_history_records_every_state(self):
+        """The record walks the task queue lifecycle (pm/task_queue.mdx §13.4), in order, once each."""
         j = self.run_job("sys.compute", {"op": "sleep", "ms": 50})
-        stages = [h["stage"] for h in j["history"]]
-        self.assertEqual(stages, ["LEASED", "STAGING", "RUNNING", "UPLOADING", "REPORTING", "DONE"])
+        states = [h["state"] for h in j["history"]]
+        self.assertEqual(states, ["SUBMITTED", "QUEUED", "CLAIMED", "STAGING", "RUNNING", "UPLOADING", "SUCCEEDED"])
         self.assertIsNotNone(j["started_at"])
-        self.assertIsNotNone(j["completed_at"])
+        self.assertIsNotNone(j["finished_at"])
+        self.assertEqual((j["caller"], j["category"], j["band"]), ("local", "system", "p4"))
+        self.assertRegex(j["code_version"], r"^[0-9a-z]+-[0-9a-f]{8}$")
+
+    def test_events_on_the_broker(self):
+        """The caller's view: events on evt.local.<job_id>, numbered 1..n, ending with succeeded and the result."""
+        j = self.run_job("sys.compute", {"op": "primes", "limit": 1000})
+        evs = self.api.events(j["job_id"])
+        self.assertEqual([e["seq"] for e in evs], list(range(1, len(evs) + 1)))
+        types = [e["type"] for e in evs]
+        self.assertEqual(types[0], "admitted")
+        self.assertEqual(types[1], "claimed")
+        self.assertEqual(types[-1], "succeeded")
+        self.assertIn("stage", types)
+        final = evs[-1]
+        self.assertEqual(final["state"], "SUCCEEDED")
+        self.assertEqual(final["result"]["count"], 168)
+        self.assertEqual(final["code_version"], j["code_version"])
+        self.assertEqual(final["outputs"][0]["sha256"], j["outputs"][0]["sha256"])
+        self.assertEqual(evs[-1]["seq"], j["events_seq"])

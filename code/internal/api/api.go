@@ -50,6 +50,7 @@ func NewRouter(s *scheduler.Server, o Options) http.Handler {
 	mux.HandleFunc("POST /v1/jobs", h.auth(h.submit))
 	mux.HandleFunc("GET /v1/jobs/{id}", h.auth(h.getJob))
 	mux.HandleFunc("GET /v1/jobs/{id}/log", h.auth(h.jobLog))
+	mux.HandleFunc("GET /v1/jobs/{id}/events", h.auth(h.jobEvents))
 	mux.HandleFunc("GET /v1/jobs/{id}/outputs/{name}", h.auth(h.output))
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", h.auth(h.cancel))
 	mux.HandleFunc("POST /v1/drain", h.auth(h.drain))
@@ -140,7 +141,7 @@ func (h *handler) capabilities(w http.ResponseWriter, _ *http.Request) {
 func (h *handler) services(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, map[string]any{"services": h.s.Services()})
 }
-func (h *handler) queues(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, h.s.Queues()) }
+func (h *handler) queues(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, h.s.Queues(r.Context())) }
 
 func (h *handler) hardwareRefresh(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
@@ -167,7 +168,7 @@ func (h *handler) resumeService(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) listJobs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	list := h.s.List(scheduler.Filter{State: q.Get("state"), Service: q.Get("service"), Queue: q.Get("queue")})
+	list := h.s.List(scheduler.Filter{State: strings.ToUpper(q.Get("state")), Service: q.Get("service"), Caller: q.Get("caller")})
 	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n >= 0 && n < len(list) {
 		list = list[:n]
 	}
@@ -190,7 +191,7 @@ func (h *handler) submit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_input", "service is required")
 		return
 	}
-	j, err := h.s.Submit(env, "direct")
+	j, err := h.s.Submit(r.Context(), env)
 	if err != nil {
 		writeSchedErr(w, err)
 		return
@@ -206,6 +207,16 @@ func (h *handler) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, j)
+}
+
+// jobEvents is the job's event stream as its caller reads it from the broker (pm/task_queue.mdx §13.5).
+func (h *handler) jobEvents(w http.ResponseWriter, r *http.Request) {
+	evs, err := h.s.Events(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeSchedErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"job_id": r.PathValue("id"), "events": evs, "count": len(evs)})
 }
 
 func (h *handler) jobLog(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +264,7 @@ func (h *handler) output(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) cancel(w http.ResponseWriter, r *http.Request) {
-	j, err := h.s.Cancel(r.PathValue("id"), "the machine owner")
+	j, err := h.s.Cancel(r.Context(), r.PathValue("id"), "the machine owner")
 	if err != nil {
 		writeSchedErr(w, err)
 		return
@@ -293,19 +304,19 @@ func (h *handler) status(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="5"><title>%s processing server</title>
 <style>body{font:14px system-ui,sans-serif;margin:24px;color:#222;background:#fff}table{border-collapse:collapse}td,th{padding:4px 10px;border-bottom:1px solid #ddd;text-align:left}
 @media (prefers-color-scheme:dark){body{background:#111;color:#ddd}td,th{border-color:#333}}</style>
-<h1>%s · %s</h1><p>State <b>%s</b> %s · version %s · up %ds · slots %d/%d cores</p>`,
+<h1>%s · %s</h1><p>State <b>%s</b> %s · version %s · code %s · broker %s · up %ds · slots %d/%d cores</p>`,
 		e(info.Identity.Key), e(info.Identity.Key), e(info.Identity.DisplayName), e(info.State), e(info.Reason), e(info.Version),
-		info.UptimeS, info.Slots.CoresUsed, info.Slots.CoresTotal)
+		e(info.Code), e(info.Broker.State), info.UptimeS, info.Slots.CoresUsed, info.Slots.CoresTotal)
 	fmt.Fprint(w, "<h2>Services</h2><table><tr><th>service</th><th>parallel</th><th>running</th><th>waiting</th><th>reason</th></tr>")
 	for _, sv := range h.s.Services() {
 		fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%s</td></tr>", e(sv.Service), sv.Parallel, sv.Running, sv.Waiting, e(sv.Reason))
 	}
-	fmt.Fprint(w, "</table><h2>Recent jobs</h2><table><tr><th>id</th><th>service</th><th>state</th><th>stage</th><th>progress</th><th>note</th></tr>")
+	fmt.Fprint(w, "</table><h2>Recent jobs</h2><table><tr><th>job</th><th>service</th><th>state</th><th>attempt</th><th>progress</th><th>note</th></tr>")
 	for i, j := range h.s.List(scheduler.Filter{}) {
 		if i >= 30 {
 			break
 		}
-		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%.0f%%</td><td>%s</td></tr>", e(j.ID), e(j.Type), e(string(j.State)), e(string(j.Stage)), j.Progress*100, e(j.Note+" "+j.LastErr))
+		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%.0f%%</td><td>%s</td></tr>", e(j.ID), e(j.Service), e(string(j.State)), j.Attempt, j.Progress*100, e(j.Note+" "+j.ErrorMessage))
 	}
 	fmt.Fprint(w, "</table>")
 }
@@ -336,6 +347,8 @@ func writeSchedErr(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, "already_final", err.Error())
 	case errors.Is(err, scheduler.ErrInvalid):
 		writeErr(w, http.StatusBadRequest, "invalid_input", err.Error())
+	case errors.Is(err, scheduler.ErrBrokerMissing):
+		writeErr(w, http.StatusServiceUnavailable, "broker_missing", err.Error())
 	default:
 		errlog.For("api").Error("answering a local API call (no error code mapped)", err)
 		writeErr(w, http.StatusInternalServerError, "internal", err.Error())

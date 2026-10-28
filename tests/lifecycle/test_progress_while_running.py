@@ -11,15 +11,15 @@ class ProgressWhileRunning(ServerTestCase):
 
         def watch(s):
             snaps.append(s)
-            if s["state"] == "active" and 0.3 < s["progress"] < 0.9 and not logs_mid_run:
-                logs_mid_run.append(self.api.log(j["id"]))
+            if s["state"] == "RUNNING" and 0.3 < s["progress"] < 0.9 and not logs_mid_run:
+                logs_mid_run.append(self.api.log(j["job_id"]))
                 # Other API calls keep answering while the job runs.
                 self.assertEqual(self.api.get("/v1/server")["active_jobs"], 1)
-                self.assertTrue(any(x["id"] == j["id"] for x in self.api.jobs(state="active")))
+                self.assertTrue(any(x["job_id"] == j["job_id"] for x in self.api.jobs(state="RUNNING")))
 
-        done = self.api.wait(j["id"], timeout=30, interval=0.03, on_poll=watch)
-        self.assertEqual(done["state"], "completed")
-        running = [s for s in snaps if s["stage"] == "RUNNING"]
+        done = self.api.wait(j["job_id"], timeout=30, interval=0.03, on_poll=watch)
+        self.assertEqual(done["state"], "SUCCEEDED")
+        running = [s for s in snaps if s["state"] == "RUNNING"]
         self.assertTrue(running, "never saw the RUNNING stage")
         self.assertTrue(all(s["step"] == "compute:primes" for s in running if s.get("step")))
         values = [s["progress"] for s in running]
@@ -33,15 +33,15 @@ class ProgressWhileRunning(ServerTestCase):
 
     def test_log_tail(self):
         j = self.run_job("sys.compute", {"op": "primes", "limit": 200_000, "segments": 10})
-        full = self.api.log(j["id"]).strip().splitlines()
-        tail = self.api.log(j["id"], tail=3).strip().splitlines()
+        full = self.api.log(j["job_id"]).strip().splitlines()
+        tail = self.api.log(j["job_id"], tail=3).strip().splitlines()
         self.assertGreater(len(full), 10)
         self.assertEqual(tail, full[-3:])
 
     def test_list_filters(self):
         a = self.run_job("sys.compute", {"op": "sleep", "ms": 1})
         b = self.run_job("sys.self_test", {"op": "sleep", "ms": 1})
-        ids = {x["id"] for x in self.api.jobs(service="sys.self_test")}
-        self.assertIn(b["id"], ids)
-        self.assertNotIn(a["id"], ids)
-        self.assertTrue(all(x["state"] == "completed" for x in self.api.jobs(state="completed")))
+        ids = {x["job_id"] for x in self.api.jobs(service="sys.self_test")}
+        self.assertIn(b["job_id"], ids)
+        self.assertNotIn(a["job_id"], ids)
+        self.assertTrue(all(x["state"] == "SUCCEEDED" for x in self.api.jobs(state="SUCCEEDED")))

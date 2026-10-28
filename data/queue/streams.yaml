@@ -1,0 +1,19 @@
+# Streams and KV buckets the queue uses (pm/task_queue.mdx §13.1). natsq.Open creates or updates them on start,
+# so changing a number here and restarting the controller is the whole procedure.
+schema_version: 1
+streams:
+  - { name: SUBMIT, subjects: ["submit.>"], retention: workqueue, max_age: 168h, duplicate_window: 2h }
+  - { name: WORK,   subjects: ["work.>"],   retention: workqueue, max_age: 168h, duplicate_window: 2h }
+  - { name: EVENTS, subjects: ["evt.>"],    retention: limits,    max_age: 168h }
+  - { name: DEAD,   subjects: ["dead.>"],   retention: limits,    max_age: 720h }
+  - { name: AUDIT,  subjects: ["audit.>"],  retention: limits,    max_age: 2160h }
+kv:
+  - { bucket: servers,     ttl: 90s }
+  - { bucket: job_state,   ttl: 720h, history: 5 }
+  - { bucket: job_control, ttl: 168h }
+  - { bucket: overrides }
+  - { bucket: depth,       ttl: 10s }
+# Work consumers: one shared durable pull consumer per (band, caller, service) (§13.1).
+consumers:
+  ack_wait: 5m        # overridden by this_server.yaml continuity.ack_wait; never shorter than a controller restart
+  max_deliver: 10     # broker backstop; the per-job limit is the envelope's max_attempts (§16.2)

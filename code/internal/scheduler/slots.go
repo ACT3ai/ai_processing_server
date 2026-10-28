@@ -110,6 +110,26 @@ func (p *SlotPool) TryAcquire(req config.Resources, needGPU bool, allowed []int)
 	return slot, true
 }
 
+// Adopt puts back a slot a re-adopted job still holds (§9.4 step 3). It never refuses: the job is already running,
+// so the pool may be over-committed until it ends.
+func (p *SlotPool) Adopt(s jobs.Slot) {
+	if _, ok := p.held[s.ID]; ok {
+		return
+	}
+	var n int
+	if _, err := fmt.Sscanf(s.ID, "slot-%d", &n); err == nil && n > p.seq {
+		p.seq = n
+	}
+	p.held[s.ID] = s
+	if s.GPU != nil {
+		for i := range p.gpus {
+			if p.gpus[i].Index == *s.GPU {
+				p.gpus[i].UsedGB += s.VRAMGB
+			}
+		}
+	}
+}
+
 // Release returns a slot.
 func (p *SlotPool) Release(id string) {
 	s, ok := p.held[id]

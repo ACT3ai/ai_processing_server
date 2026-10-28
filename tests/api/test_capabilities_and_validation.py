@@ -48,22 +48,26 @@ class CapabilitiesAndValidation(ServerTestCase):
         self.assertEqual(e.exception.code, "conflict")
 
     def test_invalid_params_fail_fast_without_retry(self):
-        j = self.run_job("sys.compute", {"op": "primes", "limit": 1}, expect="archived", max_retry=3)
+        j = self.run_job("sys.compute", {"op": "primes", "limit": 1}, expect="FAILED", max_attempts=4)
         self.assertEqual(j["error_kind"], "invalid_input")
-        self.assertEqual(j["retried"], 0)
+        self.assertEqual((j["attempt"] - 1), 0)
         self.assertEqual(j["platform_status"], "ERROR")
-        self.assertIn("limit", j["last_err"])
+        self.assertIn("limit", j["error_message"])
 
     def test_priority_is_clamped(self):
         j = self.api.submit("sys.compute", {"op": "sleep", "ms": 1}, priority=9999)
         self.assertEqual(j["priority"], 300)
 
-    def test_asynq_style_record(self):
+    def test_task_queue_record(self):
+        """The record passes the task queue's own names through (pm/task_queue.mdx §13, D-008): the envelope as
+        submitted on SUBMIT, the job_state fields, the event sequence."""
         j = self.run_job("sys.compute", {"op": "sleep", "ms": 1})
-        for field in ("id", "queue", "type", "payload", "state", "max_retry", "retried", "timeout_seconds", "completed_at", "result"):
+        for field in ("job_id", "caller", "category", "service", "priority", "band", "state", "attempt", "max_attempts",
+                      "server", "timeout_seconds", "finished_at", "result", "code_version", "events_seq", "envelope", "history"):
             self.assertIn(field, j)
-        self.assertEqual(j["queue"], "direct")
-        self.assertEqual(j["type"], "sys.compute")
+        env = j["envelope"]
+        self.assertEqual((env["envelope_version"], env["caller"], env["service"]), (1, "local", "sys.compute"))
+        self.assertEqual(env["reply"]["events"], "evt.local." + j["job_id"])
         q = self.api.get("/v1/queues")
-        direct = next(x for x in q["queues"] if x["queue"] == "direct")
-        self.assertGreaterEqual(direct["completed"], 1)
+        self.assertEqual(q["broker"]["state"], "ok")
+        self.assertGreaterEqual(q["jobs_by_service"]["sys.compute"]["SUCCEEDED"], 1)

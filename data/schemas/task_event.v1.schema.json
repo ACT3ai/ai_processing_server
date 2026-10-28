@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://act3ai.com/schemas/task_event.v1.schema.json",
+  "title": "Task event v1 (pm/task_queue.mdx §13.5)",
+  "description": "One lifecycle event on evt.<caller>.<job_id>. At least once: callers dedupe by (job_id, seq). The final event is written before the work message is acked. Implemented in code: ~/BGit/act3/ai_processing_server/code/internal/queue/queue.go — Event",
+  "type": "object",
+  "required": ["job_id", "caller", "seq", "type", "state", "at"],
+  "properties": {
+    "job_id": { "type": "string" },
+    "caller": { "type": "string" },
+    "seq": { "type": "integer", "minimum": 1, "description": "1, 2, 3 ... with no gaps across attempts and controller restarts" },
+    "type": { "enum": ["admitted", "rejected", "claimed", "stage", "progress", "requeued", "succeeded", "failed", "cancelled", "expired"] },
+    "state": { "enum": ["SUBMITTED", "ADMITTED", "QUEUED", "CLAIMED", "STAGING", "RUNNING", "UPLOADING", "SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED", "REJECTED"] },
+    "attempt": { "type": "integer" },
+    "server": { "type": "string" },
+    "band": { "enum": ["p0", "p1", "p2", "p3", "p4"] },
+    "stage": { "type": "string" },
+    "step": { "type": "string" },
+    "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+    "note": { "type": "string" },
+    "reason": { "type": "string" },
+    "kind": { "type": "string", "description": "error kind: invalid_input, content_policy, transient, timeout, infra, internal, cancelled, expired, caller_not_allowed, no_capable_server, bad_signature" },
+    "message": { "type": "string" },
+    "next_attempt_after": { "type": "string", "format": "date-time" },
+    "outputs": { "type": "array" },
+    "result": {},
+    "timings": { "type": "object" },
+    "code_version": { "type": "string", "description": "the code snapshot that ran the job (§9.2)" },
+    "by": { "type": "string" },
+    "detail": { "type": "string" },
+    "at": { "type": "string", "format": "date-time" }
+  }
+}

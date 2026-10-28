@@ -3,11 +3,12 @@ title: "Task queue: engineering specification"
 description: "CTO engineering spec for the task system that ai_processing_server runs. Opens with the vendor selection (the 15 best open-source contenders scored and ranked best first, with pros and cons) and the selection criteria, led by task continuity across frequent code updates and a broker that runs as its own long-lived process outside our Go binary. Then: how ACT3, We The Citizens and the local machine submit jobs; detached task hosts and frozen code snapshots so running tasks survive code updates; capabilities and accepting or refusing job categories and AI models; the standard task contract; prioritization; security; reliability; configuration."
 ---
 
-{/* Written 2026-10-27 by the CTO pass from Bryan's dictation of the same day. Companion to ./ai_processing_server.mdx (the server itself). This spec owns the transport and queueing layer; it replaces the transport proposal in ai_processing_server.mdx §11 and decision D-001 there. Read for context: ~/BGit/all/film/pm/subp/render_queue/RenderEngine.mdx (ACT3 job_runner on Temporal + appsrv BullMQ), ~/BGit/act3/AI_Coding/go.mod (WTC already uses nats.go, amqp091-go and go-redis). No code exists yet. Revised the same day from Bryan's second dictation: vendor ranking and criteria moved to the top; criteria v2 adds task continuity across code updates, an external long-lived broker and TypeScript task hosts; NATS moves from embedded to a separate nats-server service; new §9 (task continuity). */}
+{/* Written 2026-10-27 by the CTO pass from Bryan's dictation of the same day. Companion to ./ai_processing_server.mdx (the server itself). This spec owns the transport and queueing layer; it replaces the transport proposal in ai_processing_server.mdx §11 and decision D-001 there. Read for context: ~/BGit/all/film/pm/subp/render_queue/RenderEngine.mdx (ACT3 job_runner on Temporal + appsrv BullMQ), ~/BGit/act3/AI_Coding/go.mod (WTC already uses nats.go, amqp091-go and go-redis). Revised the same day from Bryan's second dictation: vendor ranking and criteria moved to the top; criteria v2 adds task continuity across code updates, an external long-lived broker and TypeScript task hosts; NATS moves from embedded to a separate nats-server service; new §9 (task continuity). */}
 
 # Task queue: engineering specification
 
-**Owner:** CTO · **As of:** 2026-10-27 · **Status:** specified, not built
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** D-Q1 confirmed by Bryan; **phase Q1 built** (standalone queue
+with continuity, §22); Q2 to Q6 not started
 · **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
 · **Parent spec:** [ai_processing_server.mdx](./ai_processing_server.mdx) (hardware, `this_server.yaml`, runners, job
 lifecycle on one machine)
@@ -662,7 +663,7 @@ Each running job lives in its own **task host**: a small shim process that owns 
   killed, the task host and its children keep running. This is the same pattern containerd uses with its shims.
 * The task host launches the runner (Python, TypeScript on Node, Blender, ComfyUI client, ffmpeg) from the snapshot,
   writes progress and stage changes to an append-only `events.jsonl`, the result to `result.json`, and its exit code
-  to `exit.json`, all in `data/git_ignore/runs/<job_id>/`. It heartbeats `heartbeat.json` every 5 s.
+  to `exit.json`, all in `data/git_ignore/runs/<job_id>/`. It heartbeats `heartbeat.json` every 2 s.
 * The task host itself does **not** need the network in the default mode; the controller turns its files into broker
   events. In **self-claim mode** (`continuity.taskhost_claims: true`) the task host also renews the job's claim on the
   local leaf node and publishes its own events, so a controller that stays down longer than the ack wait still loses
@@ -691,8 +692,8 @@ host starts and updated with every state change:
 On startup, before it pulls any new work, the controller:
 
 1. Scans `runs/` for records without `exit.json` handled.
-2. Checks each task host is still the same process: the pid is alive **and** its start time matches `started_at`
-   (pids get reused).
+2. Checks each task host is still the same process: the pid is alive **and** it rewrote `heartbeat.json` with that
+   pid within the last 10 s (a reused pid never rewrites our heartbeat; this works the same on Windows, D-016).
 3. Re-occupies the job's slot and GPU in the scheduler, so it never over-commits a machine that is still rendering.
 4. Sends "in progress" to the stored `ack_subject` at once, then every 20 s. A JetStream ack subject is not tied to the
    connection that received the job, so the broker sees one continuous claim.
@@ -1275,7 +1276,7 @@ machines that already have one, `just reinit` produces `this_server.yaml.new` wi
 ```yaml
 queue:
   role: worker                       # worker | hub | standalone
-  broker_url: "nats://127.0.0.1:4222"   # this machine's own nats-server service (leaf node, or the hub's server)
+  broker_url: "nats://127.0.0.1:4244"   # this machine's own nats-server service; 4244, not 4222 (D-015)
   hub_url: "tls://queue.act3ai.com:7422" # used only by `just broker-config` to write the leaf node's remote
   credentials_file: "~/BGit/act3/act3ai-credentials/processing_servers/B5090.creds"
   broker_version: "2.12.x"               # supported nats-server line; the controller warns on any other
@@ -1450,8 +1451,8 @@ The tests start a real `nats-server` binary as its own process, as production do
 
 | Phase | Delivers | Done when |
 | --- | --- | --- |
-| **Q0. Decide** | Bryan confirms D-Q1 (NATS JetStream as a separate service) and the hub location (§24 Q2) | decision in `pm/Decisions.yaml` |
-| **Q1. Standalone queue with continuity** | `just broker-install`/`broker-config`, `queue/natsq` as a client, streams and KV from `streams.yaml`, envelope and events, local API submits; snapshots, task hosts and re-adoption (§9) from the start, because they shape every runner | a `sys.self_test` job runs through the queue on the laptop and survives a restart storm (§21.2) |
+| **Q0. Decide** | Bryan confirms D-Q1 (NATS JetStream as a separate service) and the hub location (§24 Q2) | D-Q1 **done** 2026-10-27; hub location still open |
+| **Q1. Standalone queue with continuity** (**built** 2026-10-27, §25.2) | `just broker-install`/`broker-config`, `queue/natsq` as a client, streams and KV from `streams.yaml`, envelope and events, local API submits; snapshots, task hosts and re-adoption (§9) from the start, because they shape every runner | a `sys.self_test` job runs through the queue on the laptop and survives a restart storm (§21.2) |
 | **Q2. Priority and policy** | bands, DRR, aging, callers, categories, models, admission | Q3, Q5, Q6 pass in standalone |
 | **Q3. Hub and workers** | hub role, leaf nodes, operator/accounts/users, signed envelopes, gateway | Q1, Q2 pass across a cloud hub and B5090 |
 | **Q4. ACT3 first type** | appsrv submits `act3.video_merge`; job rows updated from events | flash merges in production through the queue |
@@ -1464,7 +1465,7 @@ To be copied into `pm/Decisions.yaml`.
 
 | Id | Decision | Status |
 | --- | --- | --- |
-| D-Q1 | Task system: NATS JetStream, run as its own `nats-server` service (hub cluster, leaf node per worker), never embedded; Temporal second on points, RabbitMQ the practical fallback (§1, §3). Supersedes parent D-001 and this spec's v1 (embedded). | **proposed**, Bryan to confirm |
+| D-Q1 | Task system: NATS JetStream, run as its own `nats-server` service (hub cluster, leaf node per worker), never embedded; Temporal second on points, RabbitMQ the practical fallback (§1, §3). Supersedes parent D-001 and this spec's v1 (embedded). | **decided** 2026-10-27 (Bryan) |
 | D-Q2 | Topology: one cloud hub, workers connect outbound as leaf nodes; standalone for development (§8.1) | proposed |
 | D-Q3 | Priority is ours: five bands plus DRR pull order and aging, not broker priority (§14) | proposed |
 | D-Q4 | Callers sign envelopes with Ed25519; public keys checked in (§15.3) | proposed |
@@ -1499,37 +1500,47 @@ To be copied into `pm/Decisions.yaml`.
 
 ## 25. Source code map and upgrade log
 
-### 25.1 Planned source map
+### 25.1 Source map
 
-The broker seam (Queue and Delivery interfaces) is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/queue/queue.go` — `Queue`, `Delivery`
+Built in phase Q1 (2026-10-27):
 
-The NATS client adapter (streams, consumers, KV, resuming a saved claim) is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/queue/natsq/` — `Open`, `natsQueue`, `natsQueue.Resume`
+The broker seam (Queue and Delivery interfaces, envelope, events, job state) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/queue/queue.go` — `Queue`, `Delivery`, `Envelope`, `Event`, `JobState`
+
+The NATS client adapter (streams, consumers, KV, claims held through ack subjects, resuming a saved claim) is
+implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/queue/natsq/natsq.go` — `Open`, `Q.Pull`, `Q.Resume`, `delivery.Ack`
+
+The in-memory Queue and the contract tests both implementations pass (acceptance Q8) are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/queue/queuetest/` — `New`, `Contract`
 
 Installing, configuring and version-checking the external `nats-server` service is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/brokerctl/` — `Install`, `WriteConfig`, `CheckVersion`
+`~/BGit/act3/ai_processing_server/code/internal/brokerctl/brokerctl.go` — `Install`, `WriteConfig`, `Reload`, `Find`, `Download`
 
-Frozen per-commit code snapshots and TypeScript bundling are implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/snapshot/` — `Ensure`, `GC`
+Frozen code snapshots and their garbage collection are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/snapshot/snapshot.go` — `Ensure`, `GC`
 
-Detached task hosts (launch per OS, run directory files, self-claim) are implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/taskhost/` — `Launch`, `Host.Run`
+Detached task hosts (launch per OS, the attempt lifecycle, the fence wait) are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `Launch`, `Run`, `host.fence`
 
-Re-adopting running jobs after a controller restart is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/runs/` — `Registry.Readopt`
+The run directory contract and the liveness check are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/runs/runs.go` — `Record`, `Task`, `ReadLines`, `Alive`
 
-Admission (signature, caller policy, categories, models, capability check) is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/admission/admit.go` — `Admitter.Admit`
+Standalone admission (SUBMIT → WORK, bands, caller ceilings, rejections) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/broker.go` — `Server.admitOne`, `Server.admissible`
 
-Band mapping, DRR pull order and aging are implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/priority/` — `BandFor`, `PullOrder`; `code/internal/promoter/` — `Promoter.Run`
+Pulling only when a slot is free, claiming with the fencing token, and starting the task host are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/broker.go` — `Server.pull`, `Server.claim`, `Server.rehold`
 
-Envelope signing and verification are implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/signing/ed25519.go` — `Sign`, `Verify`
+Turning task host files into events, renewing claims, answering the fence, finalizing (final event before ack) and
+re-adopting running jobs after a restart are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/supervise.go` — `Server.supervise`, `Server.answerFence`, `Server.finalize`, `Server.readopt`
 
-The HTTPS gateway and webhooks are implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/gateway/` — `NewRouter`
+Band mapping and the Q1 pull order are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/priority/priority.go` — `BandFor`, `CapBand`, `PullOrder`
+
+Still planned (phases Q2 and Q3): `admission/` as its own hub package, `gateway/`, `promoter/`, `signing/`, DRR in
+`priority/`, self-claim mode in `taskhost/`, TypeScript bundling in `snapshot/`.
 
 ### 25.2 Upgrade log
 
@@ -1541,3 +1552,15 @@ The HTTPS gateway and webhooks are implemented in code:
   separate `nats-server` service instead of embedded (85.6 → 88.8); Temporal 79.8 → 86.4; RabbitMQ 78.4 → 80.8;
   BullMQ rises 12th → 8th, River falls 6th → 10th, Asynq 9th → 14th. New §9: frozen code snapshots, detached task
   hosts, re-adoption, update procedure. §8, §13.7, §16, §17, §18, §19, §21, §22, §23, §24 updated to match.
+* 2026-10-27 (build): Bryan confirmed D-Q1. **Phase Q1 built**: `queue` (+ `natsq`, `queuetest`), `brokerctl`,
+  `snapshot`, `taskhost`, `runs`, `priority`; the scheduler rewritten as a controller over the queue (standalone
+  admission, pull when a slot is free, fencing, final event before ack, re-adoption); `just broker-install`,
+  `broker-config`, `broker-status`, `broker-uninstall`, `restart`, `update`, `runs`; `data/queue/` and
+  `data/schemas/`. Decisions D-014 to D-017 in `pm/Decisions.yaml` record what the build settled: the record passes
+  §13 through; the broker port is 4244 (§17.1 example changed); the fence is a file handshake and liveness is a
+  fresh heartbeat (§9.3 now 2 s, §9.4 step 2 changed); snapshots are keyed by the binary hash and made at controller
+  start. Tests: the queue contract passes on the in-memory queue and a real nats-server (Q8); the black-box suite (86
+  tests) adds the §21.2 restart storm, controller away longer than the ack wait, broker restart, a new build under a
+  running job (Q10) and broker missing (Q1). Not done in Q1: installing the broker service on the Bryan laptop
+  (`just broker-install` is for Bryan to run; the tests use their own nats-server processes), TypeScript task hosts
+  (Q11), self-claim mode, and everything in Q2 to Q6.

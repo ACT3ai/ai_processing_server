@@ -67,10 +67,10 @@ func Names() map[string]bool {
 
 // decodeParams unmarshals job params into v, classifying failure as invalid_input.
 func decodeParams(job *jobs.Job, v any) error {
-	if len(job.Payload.Params) == 0 {
+	if len(job.Envelope.Params) == 0 {
 		return nil
 	}
-	if err := json.Unmarshal(job.Payload.Params, v); err != nil {
+	if err := json.Unmarshal(job.Envelope.Params, v); err != nil {
 		return jobs.Wrap(jobs.KindInvalidInput, err, "params do not match this service")
 	}
 	return nil

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://act3ai.com/schemas/run_record.v1.schema.json",
+  "title": "Run directory contract v1 (pm/task_queue.mdx §9.3, §9.4)",
+  "description": "Files in data/git_ignore/runs/<job_id>/ shared by the controller and the job's detached task host: task.json, run.json, events.jsonl, heartbeat.json, cancel, fence_request/fence_ok/fence_lost, result.json, exit.json, handled. This schema covers run.json, the record a restarted controller re-adopts the job from. Implemented in code: ~/BGit/act3/ai_processing_server/code/internal/runs/runs.go — Record, Task, Line, Result",
+  "type": "object",
+  "required": ["run_version", "job_id", "caller", "service", "snapshot", "claim", "slot", "taskhost", "events_read", "seq", "claimed_at"],
+  "properties": {
+    "run_version": { "const": 1 },
+    "job_id": { "type": "string" },
+    "caller": { "type": "string" },
+    "service": { "type": "string" },
+    "snapshot": { "type": "string", "description": "<git_sha>-<binary sha256 prefix>: data/git_ignore/snapshots/<snapshot>/" },
+    "claim": { "type": "object", "required": ["job_id", "ack_subject", "fence_rev", "attempt"], "properties": {
+      "job_id": { "type": "string" }, "ack_subject": { "type": "string", "pattern": "^\\$JS\\.ACK\\." },
+      "fence_rev": { "type": "integer", "description": "job_state KV revision this worker holds (§16.3)" }, "attempt": { "type": "integer" } } },
+    "slot": { "type": "object" },
+    "taskhost": { "type": "object", "required": ["pid", "started_at"], "properties": { "pid": { "type": "integer" }, "started_at": { "type": "string", "format": "date-time" } } },
+    "events_read": { "type": "integer", "description": "lines of events.jsonl already turned into events" },
+    "seq": { "type": "integer", "description": "last event seq published" },
+    "claimed_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,10 @@
+# Categories of AI work and the services in each (pm/task_queue.mdx §11.1). A service in no category is `system`.
+schema_version: 1
+categories:
+  system:        [sys.self_test, sys.compute, sys.render_test]
+  transcode:     [act3.transcode, wtc.transcode]
+  assemble:      [act3.video_merge]
+  image_gen:     [act3.comfy_on_prem]
+  video_gen:     [act3.video_gen_open_source]
+  render_3d:     [act3.blender_render]
+  transcription: [wtc.transcription]

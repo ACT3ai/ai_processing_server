@@ -7,7 +7,10 @@
 //	validate             check this_server.yaml and data/ without starting
 //	status | jobs        ask the running server (thin clients of the local API)
 //	cancel <job_id> | drain | resume
-//	stop [--force]       drain and stop the running server
+//	stop [--force]       stop the controller; running jobs keep going in their task hosts (pm/task_queue.mdx §9.5)
+//	runs                 list jobs running in task hosts on this machine
+//	broker install|config|status|uninstall   the nats-server service this controller uses (§8.2, §18)
+//	taskhost --run-dir   internal: the detached process that owns one running job (§9.3)
 //	version
 package main
 
@@ -30,13 +33,19 @@ import (
 	"time"
 
 	"github.com/ACT3ai/ai_processing_server/internal/api"
+	"github.com/ACT3ai/ai_processing_server/internal/brokerctl"
 	"github.com/ACT3ai/ai_processing_server/internal/capability"
 	"github.com/ACT3ai/ai_processing_server/internal/config"
 	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/logging"
+	"github.com/ACT3ai/ai_processing_server/internal/queue"
+	"github.com/ACT3ai/ai_processing_server/internal/queue/natsq"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
+	"github.com/ACT3ai/ai_processing_server/internal/runs"
 	"github.com/ACT3ai/ai_processing_server/internal/scheduler"
+	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
+	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 	"gopkg.in/yaml.v3"
 )
 
@@ -59,6 +68,7 @@ type paths struct {
 	JSONOut  bool
 	Force    bool
 	WriteNew bool
+	RunDir   string // taskhost: the run directory of the job it owns
 }
 
 // elog records errors that should not happen (pm/errors.mdx) in error.err.
@@ -81,6 +91,7 @@ func main() {
 	fs.BoolVar(&p.JSONOut, "json", false, "print JSON (status, jobs, detect)")
 	fs.BoolVar(&p.Force, "force", false, "stop: kill now instead of draining")
 	fs.BoolVar(&p.WriteNew, "write-new", false, "init: write this_server.yaml.new for the owner to merge")
+	fs.StringVar(&p.RunDir, "run-dir", "", "taskhost: the job's run directory")
 	fs.Parse(args)
 	if err := p.resolve(); err != nil && cmd != "version" {
 		fail(err)
@@ -121,6 +132,17 @@ func main() {
 		err = cmdPost(p, "/v1/resume")
 	case "stop":
 		err = cmdStop(p)
+	case "runs":
+		err = cmdRuns(p)
+	case "broker":
+		err = cmdBroker(p, fs.Args())
+	case "taskhost":
+		if p.RunDir == "" {
+			fail(errors.New("usage: ai_processing_server taskhost --run-dir <dir> (started by the controller, not by hand)"))
+		}
+		code := taskhost.Run(p.RunDir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+		errlog.Close()
+		os.Exit(code)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -134,7 +156,8 @@ func main() {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
-commands: init [--write-new] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force] · version
+commands: init [--write-new] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
+          runs · broker install|config|status|uninstall · version
 flags: --root --state-dir --config --log-dir --error-dir --listen --json
 `)
 }
@@ -384,7 +407,21 @@ func cmdRun(p paths) error {
 		f := mon.Detected()
 		return loadConfig(p, &f)
 	}
+	// Freeze this binary as the code snapshot new jobs run from, before anything can rebuild it on disk (§9.2).
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	snap, err := snapshot.Ensure(filepath.Join(p.State, "snapshots"), exe, gitSHA, p.Data)
+	if err != nil {
+		return fmt.Errorf("code snapshot: %w", err)
+	}
+	thArgs := []string{"--root", p.Root, "--state-dir", p.State, "--log-dir", p.LogDir}
+	if p.ErrorDir != "" {
+		thArgs = append(thArgs, "--error-dir", p.ErrorDir)
+	}
 	srv, err := scheduler.New(scheduler.Options{Server: ts, Catalog: cat, Monitor: mon, StateDir: p.State, Loader: loader,
+		OpenQueue: openQueue(log), Snapshot: snap, TaskHostArgs: thArgs, BrokerFix: "just broker-install (once), or just broker-status",
 		Version: version, GitSHA: gitSHA, Warnings: warns, Logger: log})
 	if err != nil {
 		return err
@@ -432,17 +469,34 @@ func cmdRun(p paths) error {
 			}
 			continue
 		case sig := <-stop:
-			timeout := time.Duration(ts.Limits.DrainTimeoutS) * time.Second
-			log.Info("stopping: draining running jobs", "signal", sig.String(), "drain_timeout", timeout)
-			elog.Go("handling a second stop signal", func() { <-stop; log.Warn("second signal: stopping jobs now"); srv.Shutdown(0) })
-			srv.Shutdown(timeout)
+			// A code update restarts the controller only (§9.5): stop pulling, save every claim, close the broker
+			// connection without nacking, and leave every task host running for the next controller to re-adopt.
+			log.Info("stopping the controller; running jobs keep going in their task hosts", "signal", sig.String())
+			left := srv.Shutdown()
 			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
 			elog.Ignore("shutting down the local API", httpSrv.Shutdown(sctx))
 			scancel()
 			cancel()
-			log.Info("ai_processing_server stopped")
+			log.Info("ai_processing_server stopped", "jobs_left_running", left)
 			return nil
 		}
+	}
+}
+
+// openQueue connects to this machine's nats-server with the streams and buckets of data/queue/streams.yaml.
+func openQueue(log *slog.Logger) scheduler.OpenQueue {
+	return func(ctx context.Context, ts *config.ThisServer, cat *config.Catalog) (queue.Queue, error) {
+		o := natsq.Options{URL: ts.Queue.BrokerURL, Name: "ai_processing_server " + ts.Server.Key, CredsFile: config.ExpandHome(ts.Queue.CredentialsFile),
+			AckWait: ts.Continuity.AckWait.Duration, MaxDeliver: cat.Queue.Streams.Consumers.MaxDeliver, Logger: log}
+		for _, st := range cat.Queue.Streams.Streams {
+			o.Streams = append(o.Streams, natsq.StreamDef{Name: st.Name, Subjects: st.Subjects, Retention: st.Retention, MaxAge: st.MaxAge, DuplicateWindow: st.DuplicateWindow})
+		}
+		for _, kv := range cat.Queue.Streams.KV {
+			o.KV = append(o.KV, natsq.KVDef{Bucket: kv.Bucket, TTL: kv.TTL, History: kv.History})
+		}
+		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		return natsq.Open(cctx, o)
 	}
 }
 
@@ -545,26 +599,26 @@ func cmdJobs(p paths, args []string) error {
 	}
 	var out struct {
 		Jobs []struct {
-			ID       string  `json:"id"`
-			Type     string  `json:"type"`
+			ID       string  `json:"job_id"`
+			Service  string  `json:"service"`
 			State    string  `json:"state"`
-			Stage    string  `json:"stage"`
+			Attempt  int     `json:"attempt"`
 			Progress float64 `json:"progress"`
 			Note     string  `json:"note"`
-			LastErr  string  `json:"last_err"`
+			Err      string  `json:"error_message"`
 		} `json:"jobs"`
 	}
 	if err := c.do("GET", path, &out); err != nil {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tSERVICE\tSTATE\tSTAGE\tPROGRESS\tNOTE")
+	fmt.Fprintln(tw, "JOB\tSERVICE\tSTATE\tATTEMPT\tPROGRESS\tNOTE")
 	for _, j := range out.Jobs {
 		note := j.Note
-		if j.LastErr != "" {
-			note = j.LastErr
+		if j.Err != "" {
+			note = j.Err
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%.0f%%\t%s\n", j.ID, j.Type, j.State, j.Stage, j.Progress*100, note)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%.0f%%\t%s\n", j.ID, j.Service, j.State, j.Attempt, j.Progress*100, note)
 	}
 	return tw.Flush()
 }
@@ -603,14 +657,115 @@ func cmdStop(p paths) error {
 	if err := terminate(p, proc); err != nil {
 		return err
 	}
-	fmt.Printf("stopping pid %d: draining running jobs (waits up to limits.drain_timeout_s; `just stop force` kills now)\n", pid)
+	fmt.Printf("stopping controller pid %d; jobs running in task hosts keep going (`just runs` lists them)\n", pid)
 	start := time.Now()
 	for alive(proc) {
 		time.Sleep(250 * time.Millisecond)
-		if time.Since(start) > 15*time.Minute {
-			return errors.New("server did not stop within 15 minutes; use `just stop force`")
+		if time.Since(start) > time.Minute {
+			return errors.New("controller did not stop within a minute; use `just stop force`")
 		}
 	}
 	fmt.Printf("stopped after %s\n", time.Since(start).Round(100*time.Millisecond))
 	return nil
+}
+
+// cmdRuns lists the jobs running in task hosts on this machine, from their run directories (`just runs`).
+func cmdRuns(p paths) error {
+	root := filepath.Join(p.State, "runs")
+	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "JOB\tSERVICE\tATTEMPT\tCODE\tPID\tALIVE\tAGE\tLAST HEARTBEAT")
+	n := 0
+	for _, id := range runs.List(root) {
+		dir := filepath.Join(root, id)
+		var rec runs.Record
+		if runs.Exists(dir, runs.HandledFile) || runs.ReadJSON(dir, runs.RunFile, &rec) != nil {
+			continue
+		}
+		var hb runs.Heartbeat
+		last := "-"
+		if runs.ReadJSON(dir, runs.HeartbeatFile, &hb) == nil {
+			last = time.Since(hb.At).Round(time.Second).String() + " ago"
+		}
+		state := fmt.Sprint(runs.Alive(dir, &rec))
+		if runs.Exists(dir, runs.ExitFile) {
+			state = "finished (waiting for the controller)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\n", id, rec.Service, rec.Claim.Attempt, rec.Snapshot, rec.TaskHost.PID, state,
+			time.Since(rec.ClaimedAt).Round(time.Second), last)
+		n++
+	}
+	if n == 0 {
+		fmt.Println("no jobs running in task hosts")
+		return nil
+	}
+	return tw.Flush()
+}
+
+// cmdBroker manages this machine's nats-server service (`just broker-install`, `broker-config`, `broker-status`).
+func cmdBroker(p paths, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: ai_processing_server broker install|config|status|uninstall")
+	}
+	ts, cat, _, err := loadConfig(p, nil)
+	if err != nil {
+		return err
+	}
+	bp := brokerctl.DefaultPaths(ts)
+	logf := func(f string, a ...any) { fmt.Printf(f+"\n", a...) }
+	switch args[0] {
+	case "install":
+		if err := brokerctl.Install(context.Background(), ts, cat.Queue, bp, logf); err != nil {
+			return err
+		}
+		fmt.Printf("broker running as an OS service at %s (%s)\n", ts.Queue.BrokerURL, brokerctl.ServiceState())
+		return nil
+	case "config":
+		changed, err := brokerctl.Reload(ts, cat.Queue, bp)
+		if err != nil {
+			return err
+		}
+		if changed {
+			fmt.Println("broker config regenerated and reloaded:", bp.Conf)
+		} else {
+			fmt.Println("broker config unchanged:", bp.Conf)
+		}
+		return nil
+	case "uninstall":
+		if err := brokerctl.Uninstall(bp); err != nil {
+			return err
+		}
+		fmt.Println("broker service removed; its stored jobs stay in", bp.Store)
+		return nil
+	case "status":
+		fmt.Println("service:", brokerctl.ServiceState())
+		fmt.Println("config: ", bp.Conf)
+		q, err := openQueue(slog.New(slog.NewTextHandler(io.Discard, nil)))(context.Background(), ts, cat)
+		if err != nil {
+			fmt.Println("broker: ", err)
+			return errors.New("broker_missing: run `just broker-install`")
+		}
+		defer q.Close()
+		info := q.Info()
+		v := info.Version
+		if !brokerctl.Supported(ts, cat.Queue, v) {
+			v += " (NOT in the supported range " + cat.Queue.Broker.Supported + ")"
+		}
+		fmt.Printf("broker:  %s nats-server %s, connected %v\n", info.URL, v, info.Connected)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if depth, err := q.Depth(ctx); err == nil {
+			total := 0
+			for _, n := range depth {
+				total += n
+			}
+			fmt.Printf("work:    %d jobs stored in WORK across %d consumers\n", total, len(depth))
+		}
+		if srvs, err := q.Servers(ctx); err == nil {
+			for _, r := range srvs {
+				fmt.Printf("server:  %s %s code %s, %d services, seen %s ago\n", r.Key, r.State, r.CodeVersion, len(r.Services), time.Since(r.At).Round(time.Second))
+			}
+		}
+		return nil
+	}
+	return errors.New("usage: ai_processing_server broker install|config|status|uninstall")
 }

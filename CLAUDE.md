@@ -21,8 +21,8 @@ On every machine it runs on, it:
 
 Coordination is **ours**. We can use RabbitMQ (or another message broker) internally for
 transport, but the scheduling rules (which machine takes which job, priority, retries, how
-capabilities are matched) are our own logic, written in this repo and specified in `pm/`. Which
-broker we use is an open decision; record it in `pm/` once it is made.
+capabilities are matched) are our own logic, written in this repo and specified in `pm/`. The
+broker is decided: NATS JetStream, as its own `nats-server` service (`pm/task_queue.mdx`, D-Q1).
 
 ## Language and build
 
@@ -75,7 +75,10 @@ code/
     ├── capability/   # Turn hardware into "job types I can run, and how many"
     ├── jobs/         # Job definitions, intake, lifecycle (queued → running → done/failed)
     ├── scheduler/    # Our coordination: matching, priority, parallel slots, retries
-    ├── broker/       # Transport to/from the queue (RabbitMQ or alternative)
+    ├── queue/        # The broker seam (Queue, Delivery); queue/natsq is the NATS JetStream client
+    ├── brokerctl/    # Installs and configures the separate nats-server service
+    ├── taskhost/     # Detached process that owns one running job; survives controller restarts
+    ├── runs/ snapshot/  # Run directory contract; frozen code snapshots
     ├── runners/      # One runner per job type (image, video, upscale, Blender, ...)
     └── report/       # Progress, logs, and result reporting back to the platform
 ```
@@ -95,8 +98,11 @@ code/
 
 ## Current state (2026-10-27)
 
-v0.1.0 is built: Go code in `code/`, the `justfile`, `data/` catalogs, Go unit tests, and the black-box
-suite in `tests/` (Python standard library; `cd tests && just`). Jobs arrive by direct mode
-(`POST /v1/jobs`); the platform transport (spec phase 3) is next. Builds use `GOWORK=off` because the
-parent `~/BGit/act3/go.work` would otherwise capture this module. See `pm/TO_DO.md` and
-`pm/Decisions.yaml`.
+v0.1.0 plus task queue phase Q1 is built: Go code in `code/`, the `justfile`, `data/` catalogs (including
+`data/queue/` and `data/schemas/`), Go unit tests, and the black-box suite in `tests/` (Python standard library;
+`cd tests && just`; it needs `nats-server`). The broker is decided: **NATS JetStream as its own `nats-server`
+service** on 127.0.0.1:4244 (`pm/task_queue.mdx`, D-Q1); install it once per machine with `just broker-install`.
+Running jobs live in detached task hosts started from frozen code snapshots. A controller restart, `just stop` or
+`just update` must never stop a running job: the next controller re-adopts it (task_queue.mdx §9). Next: task queue
+phase Q2 (priority and policy), then Q3 (hub, workers, ACT3/WTC callers). Builds use `GOWORK=off` because the parent
+`~/BGit/act3/go.work` would otherwise capture this module. See `pm/TO_DO.md` and `pm/Decisions.yaml`.

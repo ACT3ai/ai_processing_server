@@ -7,7 +7,8 @@ description: "CTO engineering spec for the Go single-binary processing server th
 
 # ai_processing_server: engineering specification
 
-**Owner:** CTO · **As of:** 2026-10-27 · **Status:** v0.1.0 built (phases 0–2 mostly done; see §24.2)
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** v0.1.0 built (phases 0–2 mostly done); task queue phase Q1 built on NATS JetStream
+([task_queue.mdx](./task_queue.mdx), D-Q1); see §24.2
 · **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
 · **Siblings:** `~/BGit/all/film/pm/subp/render_queue/RenderEngine.mdx` (the engine that decides which server gets a
 job) · `~/BGit/all/film/pm/subp/render_queue/bryan_servers.mdx` (the home fleet B5090, BPC, BMT, BMS and the admin
@@ -692,6 +693,12 @@ What a platform sends in a lease response (JSON, schema `data/schemas/job_envelo
 
 ### 9.2 States on the server
 
+**Since task queue phase Q1 (2026-10-27):** the job record uses the task queue's states (task_queue.mdx §13.4,
+D-014): `SUBMITTED`, `QUEUED`, `CLAIMED`, `STAGING`, `RUNNING`, `UPLOADING`, then `SUCCEEDED`, `FAILED`, `CANCELLED`,
+`EXPIRED` or `REJECTED`. `LEASED` became `CLAIMED`; `REPORTING` and `DONE` became the final event and `SUCCEEDED`
+(the event is published before the broker message is acked). The table below keeps the platform-status mapping, which
+did not change.
+
 ```
 LEASED ──► STAGING ──► RUNNING ──► UPLOADING ──► REPORTING ──► DONE
    │          │           │            │              │
@@ -723,6 +730,10 @@ treated as one 32 GB card (bryan_servers.mdx §7.3.2).
 
 ### 9.4 Leases
 
+**Superseded by task_queue.mdx §14.4 and §16 (D-Q1):** a worker pulls one job per free slot from the broker, renews
+the claim with "in progress" every `continuity.heartbeat`, and fences its result with the `job_state` revision. The
+rules below are kept for history.
+
 * The server only leases what it can start soon: at most `free slots + 1` jobs per service waiting locally, so it never
   hoards work another server could start now.
 * It renews each lease every `renew_every_s` (default 20 s, lease length 60 s) with progress attached. A renewal
@@ -733,6 +744,11 @@ treated as one 32 GB card (bryan_servers.mdx §7.3.2).
   double results are not.
 
 ### 9.5 The journal and crash recovery
+
+**Superseded by task_queue.mdx §9 (phase Q1):** a running job lives in a detached task host, so a controller restart
+or crash no longer fails it. The next controller re-adopts it from `runs/<job_id>/run.json`; only a task host that is
+gone (a reboot) makes the job go back on the queue as `infra`. The journal is now `state/jobs/<job_id>.json`. The
+rules below are kept for history.
 
 * Every state change writes `state/journal/<job_id>.json` (state, attempt, lease id, slot, started time, work dir)
   atomically before acting on it.
@@ -819,8 +835,8 @@ renders, and the reverse, without hard partitions that waste idle time.
 **Goal of this section:** the broker decision (open in CLAUDE.md), with a recommendation.
 
 **Superseded 2026-10-27:** the transport and queueing layer is now specified in [task_queue.mdx](./task_queue.mdx)
-(NATS JetStream run as its own `nats-server` service, with detached task hosts that survive code updates; proposed
-decision D-Q1 there, which replaces D-001 below). This section is kept for history.
+(NATS JetStream run as its own `nats-server` service, with detached task hosts that survive code updates; decision
+D-Q1 there, **confirmed by Bryan on 2026-10-27**, which replaces D-001 below). This section is kept for history.
 
 ### 11.1 Options
 
@@ -1332,20 +1348,25 @@ Loading and validating `this_server.yaml` and the `data/` catalogs is implemente
 Turning hardware and allowed services into offers is implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/capability/offers.go` — `ComputeOffers`
 
-Slots, admission and the effective priority are implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.admit`, `Server.effPriority` (slots in `slots.go`, `SlotPool`)
+Slots, and pulling work from the task queue only when a slot is free, are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/broker.go` — `Server.pull`, `Server.claim` (slots in `slots.go`, `SlotPool`)
 
-Leasing from ACT3 and WTC will be implemented in code (phase 3, not built yet):
-`~/BGit/act3/ai_processing_server/code/internal/broker/httplease/` — `Source`
+Submitting through the task queue (local API → SUBMIT) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.Submit`
+
+Receiving work from ACT3 and WTC is task queue phase Q3 (hub and leaf nodes), not built yet; see task_queue.mdx §22.
 
 The local API is implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/api/api.go` — `NewRouter`
 
-The job lifecycle (stage, run, upload, retry, cancel) is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/scheduler/execute.go` — `Server.execute`, `Server.finishLocked`
+One attempt of a job (stage inputs, run, fence, upload) runs in a detached task host, implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `Run`, `host.attempt`
 
-Crash recovery from the journal is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.recover`
+Retry, cancel, the final event and acking are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/supervise.go` — `Server.finalize`, `retryable`; cancel in `broker.go`, `Server.applyControl`
+
+Recovery after a controller restart (re-adopting running jobs) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/supervise.go` — `Server.readopt`
 
 The black-box test suite (how it runs, what each suite proves) is documented in:
 `~/BGit/act3/ai_processing_server/tests/README.md`
@@ -1359,3 +1380,7 @@ The black-box test suite (how it runs, what each suite proves) is documented in:
   D-008). Runners built: `compute`, `render`, `ffmpeg`. The laptop's hand-written legacy `this_server.yaml` is left
   untouched; the server runs from a generated config and wrote `this_server.yaml.new` to merge.
 * 2026-10-27: security.mdx and apis.mdx written; §14.1 superseded (signed requests replace bearer tokens).
+* 2026-10-27: Bryan confirmed D-Q1. Task queue phase Q1 built (task_queue.mdx §25.2): jobs go through a separate
+  nats-server (SUBMIT → admission → WORK → pull when a slot is free) and run in detached task hosts from frozen code
+  snapshots, so a controller restart or a new build never stops a running job. The record now uses the task queue's
+  names and states (D-014); §9.2, §9.4 and §9.5 are marked superseded. Black-box suite: 86 tests.

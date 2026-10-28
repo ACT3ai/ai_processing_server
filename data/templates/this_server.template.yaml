@@ -58,5 +58,29 @@ local_api:
   token_file: "~/.credentials/ai_processing_server_local.token"
   allow_direct_jobs: true             # POST /v1/jobs without a platform (development, self tests, owner batches)
 
+# The task queue (pm/task_queue.mdx §17.1). The broker is a separate nats-server service on this machine:
+# `just broker-install` once, then `just broker-config` after editing this section.
+queue:
+  role: standalone                    # standalone today; worker | hub arrive in phase Q3
+  broker_url: "nats://127.0.0.1:4244" # this machine's own nats-server (4244, not 4222, which other apps use)
+  hub_url: ""                         # phase Q3: the cloud hub this machine's leaf node connects to
+  credentials_file: ""                # phase Q3: NATS .creds for this server
+  broker_version: ""                  # empty: the supported range in data/queue/broker.yaml
+  store_dir: "~/.act3_processing/nats/jetstream"   # outside the repo; the broker's own files
+  store_max_gb: 20
+
+# Task continuity across code updates (§9): running jobs live in detached task hosts and survive restarts.
+continuity:
+  ack_wait: 5m                        # must exceed the slowest controller restart
+  heartbeat: 20s                      # how often a held job's claim is renewed
+  taskhost_claims: false              # self-claim mode (phase Q3)
+  keep_snapshots: 5                   # code snapshots kept besides those in use
+
+# Who may submit work here, and how the owner's own jobs rank (§14.5).
+callers:
+  local:
+    enabled: true
+    mode: first                       # first | share | idle_only
+
 debug:
   keep_work_dirs: false

@@ -27,6 +27,9 @@ type ThisServer struct {
 	Limits        Limits                     `yaml:"limits" json:"limits"`
 	Paths         Paths                      `yaml:"paths" json:"paths"`
 	LocalAPI      LocalAPI                   `yaml:"local_api" json:"local_api"`
+	Queue         QueueSettings              `yaml:"queue" json:"queue"`
+	Continuity    Continuity                 `yaml:"continuity" json:"continuity"`
+	Callers       map[string]CallerSetting   `yaml:"callers" json:"callers"`
 	Debug         Debug                      `yaml:"debug" json:"debug"`
 }
 
@@ -94,9 +97,11 @@ func DefaultLimits() Limits {
 
 func defaults() ThisServer {
 	return ThisServer{
-		Limits:   DefaultLimits(),
-		LocalAPI: LocalAPI{Listen: "127.0.0.1:9440", TokenFile: "~/.credentials/ai_processing_server_local.token"},
-		Paths:    Paths{CacheMaxGB: 200},
+		Limits:     DefaultLimits(),
+		LocalAPI:   LocalAPI{Listen: "127.0.0.1:9440", TokenFile: "~/.credentials/ai_processing_server_local.token"},
+		Paths:      Paths{CacheMaxGB: 200},
+		Queue:      defaultQueue(),
+		Continuity: defaultContinuity(),
 	}
 }
 
@@ -125,6 +130,7 @@ type ServiceDef struct {
 	MaxParallelDefault int             `yaml:"max_parallel_default" json:"max_parallel_default"`
 	Timeouts           ServiceTimeouts `yaml:"timeouts" json:"timeouts"`
 	Retry              RetryPolicy     `yaml:"retry" json:"retry"`
+	Queue              ServiceQueue    `yaml:"queue" json:"queue"`
 	PlatformJobTypes   []string        `yaml:"platform_job_types" json:"platform_job_types,omitempty"`
 }
 
@@ -147,6 +153,20 @@ type ServiceTimeouts struct {
 	StageInputs Duration `yaml:"stage_inputs" json:"stage_inputs"`
 	Run         Duration `yaml:"run" json:"run"`
 	Upload      Duration `yaml:"upload" json:"upload"`
+}
+
+// ServiceQueue is a service's queue settings (pm/task_queue.mdx §16.1, §17.2).
+type ServiceQueue struct {
+	Backoff []Duration `yaml:"backoff" json:"backoff,omitempty"` // delay before attempt 2, 3, ...; default 30s, 2m, 10m
+}
+
+// BackoffFor returns the delay before attempt next (2 for the first retry).
+func (q ServiceQueue) BackoffFor(next int) time.Duration {
+	b := q.Backoff
+	if len(b) == 0 {
+		b = []Duration{{30 * time.Second}, {2 * time.Minute}, {10 * time.Minute}}
+	}
+	return b[min(max(next-2, 0), len(b)-1)].Duration
 }
 
 type RetryPolicy struct {
@@ -192,6 +212,19 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 }
 
 func (d Duration) MarshalJSON() ([]byte, error) { return []byte(`"` + d.String() + `"`), nil }
+
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), `"`)
+	if s == "" || s == "null" {
+		return nil
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("%q is not a duration like 10m or 90s", s)
+	}
+	d.Duration = v
+	return nil
+}
 
 // Or returns d, or def when d is zero.
 func (d Duration) Or(def time.Duration) time.Duration {

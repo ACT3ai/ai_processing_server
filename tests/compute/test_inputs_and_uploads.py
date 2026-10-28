@@ -36,14 +36,14 @@ class InputsAndUploads(ServerTestCase):
     def test_sha256_mismatch_is_invalid_input(self):
         inp = self.storage.add_file("bad.txt", b"hello\n")
         inp["sha256"] = "0" * 64
-        j = self.run_job("sys.compute", {"op": "file_stats"}, inputs=[inp], expect="archived")
+        j = self.run_job("sys.compute", {"op": "file_stats"}, inputs=[inp], expect="FAILED")
         self.assertEqual(j["error_kind"], "invalid_input")
-        self.assertIn("sha256 mismatch", j["last_err"])
+        self.assertIn("sha256 mismatch", j["error_message"])
         self.assertEqual(j["error_stage"], "STAGING")
 
     def test_missing_input_is_invalid_input(self):
         j = self.run_job("sys.compute", {"op": "file_stats"}, inputs=[{"name": "x.txt", "url": self.storage.base + "/files/missing"}],
-                         expect="archived")
+                         expect="FAILED")
         self.assertEqual(j["error_kind"], "invalid_input")
 
     def test_transient_download_failure_is_retried_inside_the_stage(self):
@@ -52,7 +52,7 @@ class InputsAndUploads(ServerTestCase):
         self.storage.fail_next_gets(1)  # first GET answers 503, the stage retries after 1 s
         j = self.run_job("sys.compute", {"op": "file_stats"}, inputs=[inp])
         self.assertEqual(j["result"]["words"], 3)
-        self.assertEqual(j["retried"], 0)  # stage retry, not a whole-job retry
+        self.assertEqual((j["attempt"] - 1), 0)  # stage retry, not a whole-job retry
         self.assertGreaterEqual(self.storage.gets.count("flaky.txt"), 2)
 
     def test_local_path_input_in_direct_mode(self):
@@ -74,7 +74,7 @@ class InputsAndUploads(ServerTestCase):
         self.assertEqual(up["headers"].get("Content-Type"), "application/json")
         # The signed query string must not appear anywhere the API or the job log exposes.
         self.assertNotIn("s3cr3t", json.dumps(j))
-        self.assertNotIn("s3cr3t", self.api.log(j["id"]))
+        self.assertNotIn("s3cr3t", self.api.log(j["job_id"]))
         self.assertTrue(out["uploaded_to"].endswith("/bucket/results/primes.json"))
         self.assertNotIn("download", out)  # uploaded, not kept
 

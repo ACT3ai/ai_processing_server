@@ -115,7 +115,7 @@ class Reload(unittest.TestCase):
             self.api.post("/v1/reload")
         self.assertEqual(e.exception.code, "invalid_config")
         self.assertEqual(self.api.get("/v1/server")["limits"]["max_parallel_jobs"], 4)
-        self.assertEqual(self.api.wait(self.api.submit("sys.compute", {"op": "sleep", "ms": 5})["id"])["state"], "completed")
+        self.assertEqual(self.api.wait(self.api.submit("sys.compute", {"op": "sleep", "ms": 5})["job_id"])["state"], "SUCCEEDED")
 
     def test_direct_mode_can_be_turned_off(self):
         cfg = json.loads(self.server.config_path.read_text())
