@@ -29,7 +29,7 @@ type ffmpegParams struct {
 
 func (FFmpeg) Name() string { return "ffmpeg" }
 
-func isMerge(job *jobs.Job) bool { return strings.HasSuffix(job.Service, ".video_merge") }
+func isMerge(job *jobs.Job) bool { return strings.HasSuffix(job.Type, ".video_merge") }
 
 func (FFmpeg) Check(_ context.Context, job *jobs.Job, env Env) error {
 	var p ffmpegParams
@@ -48,7 +48,7 @@ func (FFmpeg) Check(_ context.Context, job *jobs.Job, env Env) error {
 	if p.Preset != "" && !slices.Contains(strings.Fields("ultrafast superfast veryfast faster fast medium slow slower veryslow"), p.Preset) {
 		return jobs.Errf(jobs.KindInvalidInput, "unknown x264 preset %q", p.Preset)
 	}
-	n := len(job.Envelope.Inputs)
+	n := len(job.Payload.Inputs)
 	if isMerge(job) && n < 2 {
 		return jobs.Errf(jobs.KindInvalidInput, "video_merge needs at least two inputs, got %d", n)
 	}
@@ -78,7 +78,7 @@ func (FFmpeg) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (*R
 	var total float64
 	var inputs []string
 	var probes []map[string]any
-	for _, in := range job.Envelope.Inputs {
+	for _, in := range job.Payload.Inputs {
 		path := env.Inputs[in.Name]
 		info, err := Probe(ctx, fp, path)
 		if err != nil {

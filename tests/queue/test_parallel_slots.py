@@ -38,10 +38,10 @@ class ParallelSlots(ServerTestCase):
 
     def test_service_cap(self):
         s = Sampler(self.api)
-        ids = [self.api.submit("sys.compute", {"op": "sleep", "ms": 500, "steps": 5})["job_id"] for _ in range(6)]
+        ids = [self.api.submit("sys.compute", {"op": "sleep", "ms": 500, "steps": 5})["id"] for _ in range(6)]
         jobs = [self.api.wait(i, timeout=30) for i in ids]
         s.stop()
-        self.assertTrue(all(j["state"] == "SUCCEEDED" for j in jobs))
+        self.assertTrue(all(j["state"] == "completed" for j in jobs))
         self.assertEqual(s.peak["sys.compute"], 2, f"peak {s.peak} over {s.samples} samples")
         # Six 0.5 s jobs two at a time take about 1.5 s; one at a time would take 3 s, all at once 0.5 s.
         first = min(datetime.fromisoformat(j["started_at"]) for j in jobs)
@@ -51,10 +51,10 @@ class ParallelSlots(ServerTestCase):
 
     def test_machine_cap_across_services(self):
         s = Sampler(self.api)
-        ids = [self.api.submit(svc, {"op": "sleep", "ms": 600, "steps": 3})["job_id"]
+        ids = [self.api.submit(svc, {"op": "sleep", "ms": 600, "steps": 3})["id"]
                for svc in ("sys.compute", "sys.self_test") for _ in range(4)]
         for i in ids:
-            self.assertEqual(self.api.wait(i, timeout=30)["state"], "SUCCEEDED")
+            self.assertEqual(self.api.wait(i, timeout=30)["state"], "completed")
         s.stop()
         self.assertEqual(s.peak_total, 3, f"machine cap is 3; peaks {s.peak}")
         self.assertLessEqual(s.peak["sys.compute"], 2)
@@ -69,10 +69,10 @@ class ParallelSlots(ServerTestCase):
         self.assertEqual(info["state"], "ONLINE")
 
     def test_busy_state_when_full(self):
-        ids = [self.api.submit("sys.compute", {"op": "sleep", "ms": 800})["job_id"] for _ in range(2)]
-        ids.append(self.api.submit("sys.self_test", {"op": "sleep", "ms": 800})["job_id"])
+        ids = [self.api.submit("sys.compute", {"op": "sleep", "ms": 800})["id"] for _ in range(2)]
+        ids.append(self.api.submit("sys.self_test", {"op": "sleep", "ms": 800})["id"])
         for i in ids:
-            self.api.wait_until(i, lambda j: j["state"] == "RUNNING")
+            self.api.wait_until(i, lambda j: j["state"] == "active")
         self.assertEqual(self.api.health()["state"], "BUSY")
         for i in ids:
             self.api.wait(i)

@@ -37,8 +37,8 @@ class FFmpegJobs(ServerTestCase):
         progress = []
         j = self.api.submit("act3.transcode", {"height": 120, "crf": 28}, inputs=[inp],
                             outputs=[{"name": "video", "upload": {"method": "PUT", "url": self.storage.upload_url("out/a_120p.mp4")}}])
-        done = self.api.wait(j["job_id"], timeout=120, on_poll=lambda s: progress.append(s["progress"]))
-        self.assertEqual(done["state"], "SUCCEEDED", done.get("error_message"))
+        done = self.api.wait(j["id"], timeout=120, on_poll=lambda s: progress.append(s["progress"]))
+        self.assertEqual(done["state"], "completed", done.get("last_err"))
         self.assertEqual(progress, sorted(progress), "progress must never go backwards")
         info = self.probe_upload("out/a_120p.mp4")
         v = info["video"]
@@ -72,11 +72,11 @@ class FFmpegJobs(ServerTestCase):
 
     def test_merge_needs_two_inputs(self):
         a = self.storage.add_file("only.mp4", self.clip_b.read_bytes())
-        j = self.run_job("act3.video_merge", {}, inputs=[a], expect="FAILED")
+        j = self.run_job("act3.video_merge", {}, inputs=[a], expect="archived")
         self.assertEqual(j["error_kind"], "invalid_input")
 
     def test_not_a_video(self):
         bad = self.storage.add_file("notvideo.mp4", b"this is text, not a video\n")
-        j = self.run_job("act3.transcode", {}, inputs=[bad], expect="FAILED", max_attempts=1)
+        j = self.run_job("act3.transcode", {}, inputs=[bad], expect="archived", max_retry=0)
         self.assertEqual(j["error_kind"], "invalid_input")
-        self.assertIn("not a readable video", j["error_message"])
+        self.assertIn("not a readable video", j["last_err"])

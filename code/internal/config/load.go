@@ -22,8 +22,7 @@ type Catalog struct {
 	Dir      string
 	Services map[string]ServiceDef
 	Known    KnownServers
-	Template string        // data/templates/this_server.template.yaml
-	Queue    *QueueCatalog // data/queue/
+	Template string // data/templates/this_server.template.yaml
 }
 
 // IDs returns the service ids sorted.
@@ -82,9 +81,6 @@ func LoadCatalog(dataDir string) (*Catalog, error) {
 		return nil, fmt.Errorf("read template: %w", err)
 	}
 	c.Template = string(tpl)
-	if c.Queue, err = LoadQueueCatalog(dataDir); err != nil {
-		return nil, err
-	}
 	return c, nil
 }
 
@@ -114,9 +110,6 @@ func Parse(b []byte, name string) (*ThisServer, error) {
 	}
 	if ts.SchemaVersion != SchemaVersion {
 		return nil, fmt.Errorf("%s: schema_version %d is not supported by this binary (want %d)", name, ts.SchemaVersion, SchemaVersion)
-	}
-	if ts.Callers == nil { // a file written before the queue sections existed
-		ts.Callers = defaultCallers()
 	}
 	return &ts, nil
 }
@@ -193,8 +186,7 @@ func Validate(ts *ThisServer, cat *Catalog) (errs []string, warns []string) {
 			errs = append(errs, fmt.Sprintf("platforms.%s.share must be within 0..100", name))
 		}
 	}
-	qe, qw := validateQueue(ts, cat)
-	return append(errs, qe...), append(warns, qw...)
+	return errs, warns
 }
 
 func validCaller(id string) bool {

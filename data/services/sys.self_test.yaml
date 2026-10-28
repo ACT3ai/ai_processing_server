@@ -9,4 +9,3 @@ resources_per_job: { cpu_cores: 1, ram_gb: 0.25, vram_gb: 0 }
 max_parallel_default: 4
 timeouts: { stage_inputs: 2m, run: 10m, upload: 5m }
 retry: { max_attempts: 1, retry_on: [transient, infra, timeout] }
-queue: { backoff: [1s, 2s, 4s] }   # short: these are test services

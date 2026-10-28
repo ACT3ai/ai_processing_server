@@ -27,10 +27,7 @@ class HealthAndAuth(ServerTestCase):
         self.assertEqual(info["server"]["key"], "TEST1")
         self.assertEqual(info["limits"]["max_parallel_jobs"], 4)
         self.assertEqual(info["slots"]["cores_total"], min(8, info["slots"]["cores_total"]))
-        self.assertIn("SUBMIT", info["transport"]["intake"])
-        self.assertIn("NATS JetStream", info["transport"]["queue"])
-        self.assertEqual(info["queue"]["role"], "standalone")
-        self.assertEqual(info["broker"]["state"], "ok")
+        self.assertIn("direct", info["transport"]["intake"])
         self.assertNotIn("machine_id", str(info["server"]["bound_to"]))
 
     def test_hardware_min_rule(self):

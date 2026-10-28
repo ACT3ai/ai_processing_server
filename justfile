@@ -62,46 +62,15 @@ run: _binary
     Start-Sleep -Seconds 3
     ./{{bin}} status
 
-# Run in the foreground (development; Ctrl+C stops the controller, running jobs keep going)
+# Run in the foreground (development; Ctrl+C drains and stops)
 run-fg: _binary
     ./{{bin}} run
 
-# Stop the controller. Jobs running in task hosts keep going; the next `just run` re-adopts them (pm/task_queue.mdx §9.5)
+# Drain running jobs, then stop. `just stop force` kills now.
 stop mode="": _binary
     @./{{bin}} stop {{ if mode == "force" { "--force" } else { "" } }}
 
-# Restart the controller only; running jobs are re-adopted, not stopped
-restart: _binary
-    ./{{bin}} stop
-    just run
-
-# git pull, build, restart the controller: a code update that never stops a running job (§9.5)
-update:
-    git pull --ff-only
-    just build
-    just restart
-
-# Jobs running in detached task hosts on this machine: job, service, code snapshot, pid, heartbeat
-runs: _binary
-    ./{{bin}} runs
-
-# Once per machine: install nats-server (pinned in data/queue/broker.yaml) as an OS service on 127.0.0.1:4244
-broker-install: _binary
-    ./{{bin}} broker install
-
-# Regenerate the broker config from this_server.yaml and reload it without dropping connections
-broker-config: _binary
-    ./{{bin}} broker config
-
-# Is the broker service up, which version, work stored, servers seen
-broker-status: _binary
-    ./{{bin}} broker status
-
-# Remove the broker OS service (its stored jobs stay in queue.store_dir)
-broker-uninstall: _binary
-    ./{{bin}} broker uninstall
-
-# Health, services and recent jobs of the server on this machine
+# Health, services and running jobs of the server on this machine
 status: _binary
     @./{{bin}} status
     @echo

@@ -1,6 +1,0 @@
-# Callers that may submit jobs (pm/task_queue.mdx §10, §14.3). Public keys for signed envelopes arrive in phase Q3.
-schema_version: 1
-callers:
-  - { id: local, display_name: "This machine's owner (local API)", max_band: p0 }
-  - { id: act3,  display_name: "ACT3 AI filmmaking platform",      max_band: p0 }
-  - { id: wtc,   display_name: "We The Citizens",                  max_band: p1 }

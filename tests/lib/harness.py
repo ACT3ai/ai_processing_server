@@ -1,13 +1,8 @@
-"""Start and stop a real ai_processing_server for tests, with its own real nats-server.
+"""Start and stop a real ai_processing_server for tests.
 
-Every ServerProcess gets its own temporary state directory (its own this_server.yaml, journal, runs, snapshots, work
-and results dirs), its own token, its own log directory, a free loopback port, and its own nats-server process with
-JetStream on another free port (pm/task_queue.mdx §21.2: tests start the broker as a separate process, as
-production does; they never embed it). Tests never touch the machine's real data/git_ignore/, ~/_act3_logs/, port
-9440 or the broker service on 4244.
-
-Running jobs live in detached task hosts that outlive the controller, so cleanup kills them by the pids in their
-run directories; a task host also stops by itself when its run directory disappears.
+Every ServerProcess gets its own temporary state directory (its own this_server.yaml, journal, work and results
+dirs), its own token, its own log directory and a free loopback port. Tests never touch the machine's real
+data/git_ignore/, ~/_act3_logs/ or port 9440.
 """
 
 import copy
@@ -32,7 +27,6 @@ if "APS_ERROR_DIR" not in os.environ:
     os.environ["APS_ERROR_DIR"] = tempfile.mkdtemp(prefix="aps_test_errors_")
 REPO_ROOT = TESTS_DIR.parent
 BINARY = Path(os.environ.get("APS_BINARY", REPO_ROOT / ("ai_processing_server.exe" if os.name == "nt" else "ai_processing_server")))
-NATS_SERVER = os.environ.get("NATS_SERVER") or shutil.which("nats-server") or str(Path.home() / ".act3_processing/nats/bin/nats-server")
 
 ALL_SERVICES = [
     "sys.self_test", "sys.compute", "sys.render_test",
@@ -56,7 +50,7 @@ def deep_merge(base, over):
     return out
 
 
-def base_config(port, token_file, broker_port, key="TEST1"):
+def base_config(port, token_file, key="TEST1"):
     """A this_server.yaml for tests. JSON is valid YAML, so no YAML library is needed."""
     return {
         "schema_version": 1,
@@ -74,10 +68,6 @@ def base_config(port, token_file, broker_port, key="TEST1"):
                    "disk_min_free_gb": 0, "gpu_temp_max_c": 85, "drain_timeout_s": 30},
         "paths": {"work_dir": "", "cache_dir": "", "cache_max_gb": 10},
         "local_api": {"listen": f"127.0.0.1:{port}", "token_file": str(token_file), "allow_direct_jobs": True},
-        # Short ack wait and heartbeat so redelivery tests take seconds, not minutes.
-        "queue": {"role": "standalone", "broker_url": f"nats://127.0.0.1:{broker_port}"},
-        "continuity": {"ack_wait": "8s", "heartbeat": "1s", "keep_snapshots": 2},
-        "callers": {"local": {"enabled": True, "mode": "first"}},
         "debug": {"keep_work_dirs": False},
     }
 
@@ -92,46 +82,11 @@ def service_settings(overrides):
     return out
 
 
-class Broker:
-    """A nats-server with JetStream, on a free port, storing under dir. Survives controller restarts."""
-
-    def __init__(self, store_dir):
-        if not Path(NATS_SERVER).exists() and not shutil.which(NATS_SERVER):
-            raise RuntimeError("nats-server not found: install it (`just broker-install`, or brew install nats-server) "
-                               "or set NATS_SERVER")
-        self.dir = Path(store_dir)
-        self.port = free_port()
-        self.proc = None
-
-    def start(self):
-        self.dir.mkdir(parents=True, exist_ok=True)
-        log = open(self.dir / "nats.log", "ab")
-        self.proc = subprocess.Popen([NATS_SERVER, "-js", "-a", "127.0.0.1", "-p", str(self.port), "-sd", str(self.dir / "js")],
-                                     stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            with socket.socket() as s:
-                if s.connect_ex(("127.0.0.1", self.port)) == 0:
-                    return self
-            time.sleep(0.05)
-        raise RuntimeError("nats-server did not start; see " + str(self.dir / "nats.log"))
-
-    def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
-
-
 class ServerProcess:
     """One running server. Use start(), stop() (graceful), kill() (SIGKILL), restart()."""
 
-    def __init__(self, config_overrides=None, services=None, name="server", binary=None):
-        self.binary = Path(binary or BINARY)
-        if not self.binary.exists():
+    def __init__(self, config_overrides=None, services=None, name="server"):
+        if not BINARY.exists():
             raise RuntimeError(f"{BINARY} not found: run `just build` in {REPO_ROOT}")
         self.tmp = Path(tempfile.mkdtemp(prefix="aps_test_"))
         self.state_dir = self.tmp / "state"
@@ -139,12 +94,11 @@ class ServerProcess:
         self.error_dir = self.tmp / "errors"
         self.state_dir.mkdir()
         self.port = free_port()
-        self.broker = Broker(self.tmp / "broker")
         self.token = secrets.token_urlsafe(32)
         self.token_file = self.tmp / "local.token"
         self.token_file.write_text(self.token + "\n")
         os.chmod(self.token_file, 0o600)
-        cfg = base_config(self.port, self.token_file, self.broker.port)
+        cfg = base_config(self.port, self.token_file)
         if services:
             cfg["services"] = service_settings(services)
         self.config = deep_merge(cfg, config_overrides)
@@ -158,15 +112,11 @@ class ServerProcess:
         self.config_path.write_text(json.dumps(cfg, indent=2))
 
     def cmd(self, *args):
-        return [str(self.binary), *args, "--root", str(REPO_ROOT), "--state-dir", str(self.state_dir),
+        return [str(BINARY), *args, "--root", str(REPO_ROOT), "--state-dir", str(self.state_dir),
                 "--config", str(self.config_path), "--log-dir", str(self.log_dir),
                 "--error-dir", str(self.error_dir)]
 
-    def start(self, timeout=30, broker=True):
-        """Start the controller (and, the first time, its broker). broker=False starts no broker and returns as soon
-        as the API answers, for broker_missing tests."""
-        if broker and self.broker.proc is None:
-            self.broker.start()
+    def start(self, timeout=30):
         out = open(self.tmp / f"{self.name}.stdout.log", "ab")
         self.proc = subprocess.Popen(self.cmd("run"), stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         deadline = time.time() + timeout
@@ -175,7 +125,7 @@ class ServerProcess:
                 raise RuntimeError(f"server exited with {self.proc.returncode}:\n{self.stdout_tail()}")
             try:
                 h = self.client.health()
-                if h.get("state") not in (None, "STARTING") and (not broker or h.get("broker", {}).get("state") == "ok"):
+                if h.get("state") not in (None, "STARTING"):
                     return self
             except (APIError, OSError):
                 pass
@@ -183,7 +133,7 @@ class ServerProcess:
         raise RuntimeError(f"server did not become healthy in {timeout}s:\n{self.stdout_tail()}")
 
     def stop(self, timeout=60):
-        """Graceful: SIGTERM. The controller stops pulling and exits; running jobs keep going in their task hosts."""
+        """Graceful: SIGTERM, the server drains running jobs, then exits."""
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM if os.name != "nt" else signal.CTRL_BREAK_EVENT)
             try:
@@ -194,7 +144,7 @@ class ServerProcess:
         return self.proc.returncode if self.proc else None
 
     def kill(self):
-        """Crash: SIGKILL the controller only. Task hosts and the broker keep running."""
+        """Crash: SIGKILL, no drain, no cleanup."""
         if self.proc and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
@@ -209,29 +159,8 @@ class ServerProcess:
             return ""
         return "\n".join(p.read_text(errors="replace").splitlines()[-n:])
 
-    def taskhost_pids(self, running_only=False):
-        """Pids of the task hosts recorded in this server's run directories (running_only: jobs not yet handled)."""
-        pids = set()
-        for f in (self.state_dir / "runs").glob("*/run.json"):
-            if running_only and (f.parent / "handled").exists():
-                continue
-            try:
-                pids.add(int(json.loads(f.read_text())["taskhost"]["pid"]))
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
-        return {p for p in pids if p > 0}
-
-    def kill_taskhosts(self):
-        for pid in self.taskhost_pids():
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-
     def cleanup(self):
         self.kill()
-        self.kill_taskhosts()
-        self.broker.stop()
         if os.environ.get("KEEP_TEST_DIRS") != "1":
             shutil.rmtree(self.tmp, ignore_errors=True)
 

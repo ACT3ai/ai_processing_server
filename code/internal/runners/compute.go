@@ -69,7 +69,7 @@ func (Compute) Check(_ context.Context, job *jobs.Job, _ Env) error {
 			return jobs.Errf(jobs.KindInvalidInput, "matrix: n must be within 1..1500")
 		}
 	case "file_stats":
-		if len(job.Envelope.Inputs) == 0 {
+		if len(job.Payload.Inputs) == 0 {
 			return jobs.Errf(jobs.KindInvalidInput, "file_stats: needs one input")
 		}
 	case "sleep", "flaky", "fail", "panic":
@@ -100,13 +100,13 @@ func (c Compute) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) 
 	case "file_stats":
 		name := p.Input
 		if name == "" {
-			name = job.Envelope.Inputs[0].Name
+			name = job.Payload.Inputs[0].Name
 		}
 		data, err = fileStats(ctx, env.Inputs[name], throttle, rep)
 	case "sleep":
 		data, err = sleep(ctx, p.Ms, max(p.Steps, 1), rep)
 	case "flaky":
-		attempt := job.Attempt
+		attempt := job.Retried + 1
 		if attempt < p.FailBeforeAttempt {
 			return nil, jobs.Errf(kindOr(p.Kind, jobs.KindTransient), "flaky: attempt %d fails on purpose (succeeds from attempt %d)", attempt, p.FailBeforeAttempt)
 		}
