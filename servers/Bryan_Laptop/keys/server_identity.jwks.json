@@ -1,0 +1,15 @@
+{
+  "keys": [
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "pmTph8PkrlBV5HTWYmdymMJWNveYOq3zr27sa7iMdxk",
+      "kid": "UsdDOF0UqdA7hg5NU6Pzt6rX6t24kVhbYE4jVTAvu-E",
+      "use": "sig",
+      "alg": "EdDSA",
+      "act3:server_key": "BLAP",
+      "act3:created_at": "2026-10-28T03:26:37-07:00",
+      "act3:status": "current"
+    }
+  ]
+}

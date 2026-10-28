@@ -97,13 +97,13 @@ server:
       just: "1.59.0"
       git: "2.54.0"
       swift: true                        # Command Line Tools active; Xcode.app installed but not selected
-      blender: false                     # not installed
+      blender: "5.2.3"                   # /opt/homebrew/bin/blender (brew cask, 2026-10-27)
       davinci_resolve: false
       final_cut_pro: false
       ipfs: "0.43.1"                     # kubo, Homebrew service, running
       redis: false
       postgres: true                     # listening on localhost:5432
-      pytorch: false                     # not in system Python; only inside the (broken) Whisper pipx venv
+      pytorch: false                     # not in system Python; only inside the Whisper pipx venv (python 3.13)
       mlx: false
       comfyui: false
       ollama: "0.40.11"                  # API on port 19391 (OLLAMA_HOST=0.0.0.0:19391), not 11434
@@ -118,7 +118,7 @@ server:
         - "gemma4:e4b (9.6 GB)"
       docker: "29.9.2"                   # Docker Desktop
       apple_speech_transcription: true   # ~/tools_locked/Transcribe/AppleTranscribe (SpeechAnalyzer, Neural Engine)
-      whisper_transcription: false       # fallback broken: pipx venv points at removed python@3.14
+      whisper_transcription: true        # pipx openai-whisper on python@3.13 (reinstalled 2026-10-27); CPU works, MPS returns empty so Transcribe.js falls back to CPU
       openclaw_agents: true              # Docker gateway container (currently stopped, see constraints)
     job_slots:
       gpu: 1                             # one integrated GPU; heavy jobs serialized
@@ -128,7 +128,7 @@ server:
       cloud_api_jobs: true
       transcode_h264_hevc_prores: true   # [act3.transcode 3, wtc.transcode 3, act3.video_merge 3]
       transcode_av1: decode_only         # no hardware AV1 encode
-      blender_render: false              # Blender not installed (needs >= 4.2)
+      blender_render: false              # Blender 5.2.3 installed; the blender runner is not built yet (TO_DO Phase 4)
       image_generation_local: false      # no ComfyUI / MLX / PyTorch installed yet
       video_generation_local: false      # no CUDA; comfy runner not built yet
       llm_inference_local: true          # Ollama, 512 GB unified memory
@@ -139,7 +139,7 @@ server:
     constraints:
       - "Shares the machine with OpenClaw agents, Ollama and transcription; reserve CPU and memory for them."
       - "10GbE port is linked at 1 Gb/s; large uploads/downloads are limited to 1 Gb/s until the switch/cable is 10G."
-      - "Install Blender >= 4.2 to enable act3.blender_render; install ComfyUI to enable act3.comfy_on_prem."
+      - "act3.blender_render: Blender installed, waiting on the blender runner. act3.comfy_on_prem needs CUDA, so never on this Mac."
       - "Fleet key BMS (data/git_ignore/this_server.yaml, profile bms); platforms act3/wtc not connected yet (phase 3)."
 
   services:
