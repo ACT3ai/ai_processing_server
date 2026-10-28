@@ -195,7 +195,7 @@ turns services off, with reasons. It never breaks the build.
 | `just validate` | check `this_server.yaml` and `data/` without starting |
 | `just test` | `go vet` + `go test ./...`, then the black-box suite in `tests/` |
 | `just cross` | compile check for darwin/arm64, windows/amd64, linux/amd64, linux/arm64 |
-| `just install-service` | *(planned)* launchd (macOS), Windows service, or systemd user unit |
+| `just install-service` | LaunchAgents for the server and nats-server (macOS; `just build` runs it, `APS_NO_SERVICE=1` skips). Windows service / systemd: planned |
 
 Try it:
 

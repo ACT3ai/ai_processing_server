@@ -62,4 +62,5 @@
 * [ ] JSON Schemas in `data/schemas/` for params (today each runner validates its params in Go).
 * [ ] `data/sites/sites.yaml` and the customer-data rule (§16.3).
 * [ ] GPU telemetry (nvidia-smi load, temperature) and the DEGRADED thermal guard (§12.4).
-* [ ] `just install-service` (launchd, Windows service, systemd).
+* [x] `just install-service` on macOS: LaunchAgents `ai.act3.processing_server` + `ai.act3.nats-server`, run by every `just build`.
+* [ ] `just install-service` for Windows service and systemd user unit.

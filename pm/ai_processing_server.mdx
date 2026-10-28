@@ -1213,7 +1213,7 @@ a missing `nvidia-smi`, Blender or ComfyUI only turns services off with reasons,
    `CHANGE_ME`, services, limits, credential paths).
 3. Create the credential files the yaml names (from the platform's admin page after approval).
 4. `just run`, then `just status`. Check the server shows on the ACT3 Render Queue server strip.
-5. `just install-service` so it starts at boot.
+5. `just build` already ran `just install-service` (macOS), so it starts at login and restarts after a crash.
 
 Engine setup (ComfyUI, Blender, Python environments, model downloads) is documented per engine in
 `pm/docs/engines/{engine}.md` (to write). The server detects and reports what is missing; it never fails silently.
