@@ -64,27 +64,38 @@ func setupKey(p paths, ts *config.ThisServer) error {
 		return fmt.Errorf("server identity key: %w", err)
 	}
 	k := res.Key
+	targets := []string{filepath.Join(filepath.Dir(k.Path), keys.PublicFile)}
+	pub := publishDir(p, ts)
+	if pub != "" {
+		targets = append(targets, filepath.Join(pub, keys.PublicFile))
+	}
+	var lines []string
+	quiet := !res.Created && pub != "" // the usual rebuild: same key, already published -> one line
+	for i, path := range targets {
+		msg, err := publish(path, k, ts.Server.Key)
+		if err != nil {
+			return fmt.Errorf("public key %s: %w", path, err)
+		}
+		if msg != "up to date" {
+			quiet = false
+		}
+		if i == 1 && msg == "wrote" {
+			msg += ": commit it and open a pull request; the merge is the approval (pm/security.mdx §5.1)"
+		}
+		lines = append(lines, fmt.Sprintf("  public key %s: %s", rel(p, path), msg))
+	}
+	if quiet {
+		fmt.Printf("server identity key OK: %s, public key published (private key stays in %s)\n", k.Fingerprint(), filepath.Dir(k.Path))
+		return nil
+	}
 	verb := "existing"
 	if res.Created {
 		verb = "created"
 	}
 	fmt.Printf("server identity key: %s %s (private, mode 0600, stays on this machine)\n", verb, k.Path)
 	fmt.Printf("  fingerprint %s  kid %s\n", k.Fingerprint(), k.KID)
-
-	targets := []string{filepath.Join(filepath.Dir(k.Path), keys.PublicFile)}
-	pub := publishDir(p, ts)
-	if pub != "" {
-		targets = append(targets, filepath.Join(pub, keys.PublicFile))
-	}
-	for i, path := range targets {
-		msg, err := publish(path, k, ts.Server.Key)
-		if err != nil {
-			return fmt.Errorf("public key %s: %w", path, err)
-		}
-		if i == 1 && msg == "wrote" {
-			msg += ": commit it and open a pull request; the merge is the approval (pm/security.mdx §5.1)"
-		}
-		fmt.Printf("  public key %s: %s\n", rel(p, path), msg)
+	for _, l := range lines {
+		fmt.Println(l)
 	}
 	if pub == "" {
 		fmt.Println("  not checked in (no servers/ directory for " + ts.Server.Key + "): enroll with a one-time code (pm/security.mdx §5.2)")

@@ -73,15 +73,15 @@ func ComputeOffers(in Input) []Offer {
 		set := in.Server.Service(id)
 		switch {
 		case set == nil:
-			o.Reason = "not listed in this_server.yaml (new services are opt-in)"
+			o.Reason = "not listed in this_server.yaml: opt in under services:"
 			if ok, why := CanRun(def, in.Facts); !ok {
-				o.Reason = "not listed in this_server.yaml: " + why
+				o.Reason = why + " (and not listed in this_server.yaml)"
 			}
 		case !set.Enabled:
 			o.Reason = "off in this_server.yaml"
 		case !in.Runners[def.Runner]:
 			o.Enabled = true
-			o.Reason = fmt.Sprintf("runner %q is not built into this version yet", def.Runner)
+			o.Reason = fmt.Sprintf("not available yet: runner %q is not built into this version", def.Runner)
 		case in.NotInstalled[def.Runner] != "":
 			o.Enabled = true
 			o.Reason = in.NotInstalled[def.Runner]

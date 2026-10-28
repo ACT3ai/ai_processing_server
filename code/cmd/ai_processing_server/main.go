@@ -306,6 +306,9 @@ func cmdInit(p paths) error {
 	for _, e := range res.Errors {
 		fmt.Println("  error:", e)
 	}
+	for _, n := range res.Next {
+		fmt.Println("  next:", n)
+	}
 	tokenFile := "~/.credentials/ai_processing_server_local.token"
 	if ts, err := config.Load(p.Config); err == nil {
 		tokenFile = ts.LocalAPI.TokenFile
@@ -578,23 +581,70 @@ func cmdStatus(p paths) error {
 	if r, ok := info["state_reason"].(string); ok && r != "" {
 		reason = " (" + r + ")"
 	}
-	fmt.Printf("%v (%v): %v%s  version %v  up %vs  local API %s/\n", id["key"], id["display_name"], info["state"],
-		reason, info["version"], info["uptime_s"], c.base)
+	up, _ := info["uptime_s"].(float64)
+	fmt.Printf("%v (%v): %v%s  version %v (git %v)  up %s\n", id["key"], id["display_name"], info["state"],
+		reason, info["version"], info["git_sha"], time.Duration(up)*time.Second)
+	fmt.Printf("  local API   %s/\n", c.base)
+	fmt.Printf("  task queue  %s\n", queueLine(info["broker"]))
 	if w, ok := info["warnings"].([]any); ok {
 		for _, x := range w {
 			fmt.Println("  warning:", x)
 		}
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "SERVICE\tPARALLEL\tRUNNING\tWAITING\tREASON")
+
+	// Offered services first (what this machine will run), then the rest with the one reason each is not offered.
+	var ready, off []scheduler.ServiceView
 	for _, s := range svc.Services {
-		reason := s.Reason
-		if s.PausedBy != "" {
-			reason = "paused by " + s.PausedBy
+		if s.Parallel > 0 && s.PausedBy == "" {
+			ready = append(ready, s)
+		} else {
+			off = append(off, s)
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\n", s.Service, s.Parallel, s.Running, s.Waiting, reason)
 	}
-	return tw.Flush()
+	fmt.Println()
+	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "SERVICE\tPARALLEL\tRUNNING\tWAITING")
+	for _, s := range ready {
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\n", s.Service, s.Parallel, s.Running, s.Waiting)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if len(off) > 0 {
+		fmt.Printf("\nnot offered (%d):\n", len(off))
+		tw = tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+		for _, s := range off {
+			why := s.Reason
+			if s.PausedBy != "" {
+				why = "paused by " + s.PausedBy
+			}
+			fmt.Fprintf(tw, "  %s\t%s\n", s.Service, why)
+		}
+		return tw.Flush()
+	}
+	return nil
+}
+
+// queueLine is the one-line task queue state from GET /v1/server's broker block (pm/task_queue.mdx §8.2).
+func queueLine(v any) string {
+	b, _ := v.(map[string]any)
+	state, _ := b["state"].(string)
+	switch state {
+	case scheduler.BrokerDisabled, "":
+		return "off (queue.enabled is not true in this_server.yaml): direct jobs only. Turn on: ./ai_processing_server enable queue"
+	case scheduler.BrokerMissing:
+		return fmt.Sprintf("broker not reachable at %v: direct jobs only. Fix: just broker-install, then just run", b["url"])
+	case scheduler.BrokerConnecting:
+		return fmt.Sprintf("connecting to %v", b["url"])
+	}
+	if state == "ok" {
+		state = "connected"
+	}
+	line := fmt.Sprintf("%s: nats-server %v at %v", state, b["server_version"], b["url"])
+	if e, _ := b["error"].(string); e != "" {
+		line += " (" + e + ")"
+	}
+	return line
 }
 
 func cmdJobs(p paths, args []string) error {
