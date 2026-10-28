@@ -5,14 +5,27 @@ render-queue server. It does the heavy work behind the [ACT3 AI filmmaking](http
 We The Citizens: image and video generation, upscaling, Blender renders, transcodes, video merges, TTS,
 transcription, OCR and AI descriptions.
 
-**Status (2026-10-27): v0.1.0 plus task queue phase Q1.** `just build` and `just run` work. The task system is
-**NATS JetStream**, run as its own `nats-server` service on 127.0.0.1:4244 ([pm/task_queue.mdx](pm/task_queue.mdx),
-D-Q1). Jobs submitted on the local API go SUBMIT → admission (priority band) → WORK → pulled when a slot is free →
-run in a **detached task host** from a frozen code snapshot, so `just update` (pull, build, restart) never stops a
-running render: the new controller re-adopts it. Platform callers (ACT3, WTC) arrive with the hub in phase Q3. Built
-runners: `compute`, `render` (test render to H.264 MP4) and `ffmpeg` (transcode, merge). The test suite is in
-[tests/](tests/README.md): 86 black-box tests that send real work through a real broker and check the answers. See
-[Build plan](#build-plan).
+**Status (2026-10-27): v0.2.0.** `just build` (it also installs the nats-server broker) and `just run` work. The
+server detects its hardware, computes offers, and runs jobs in parallel slots with priorities, retries, cancel, drain
+and crash recovery. Jobs arrive through the **NATS JetStream task queue** (`POST /v1/queue/jobs`) or by direct mode
+(`POST /v1/jobs`). Built runners: `compute`, `render`, `ffmpeg`, and the model runners `oss_video` (Wan 2.2) and
+`oss_upscale` (SeedVR2), which run in detached task hosts from frozen snapshots so a git pull or a restart never stops
+a render. The test suite is in [tests/](tests/README.md): 99 black-box tests, including the continuity gate G1 to G7.
+
+### Render on the Mac Studio (BMS)
+
+Wan 2.2 and SeedVR2 are installed there (`~/act3_render/wan_2_2`, `~/act3_render/seedvr2`). In
+`~/repos/ai_processing_server/`:
+
+```
+git pull
+just render-setup     # build (+ nats-server), enable queue + both model services, restart, show what is offered
+just render-test      # one real Wan 2.2 clip, then a SeedVR2 upscale of it, through the queue (outputs in ~/T/_ai_processing_server/real_render/)
+```
+
+`just render-check` shows the broker, the config and each model service's offer. A model that is turned on but not
+installed is offered as 0, with the missing path and the install guide, so the machine never claims a job it would
+fail. Details: [pm/task_authoring.mdx §8.1](pm/task_authoring.mdx).
 
 ## What it does
 
@@ -56,10 +69,21 @@ All connections start from the server, so machines behind a home or office NAT w
 | Service weights, pauses, drain | The platform, sent in heartbeat responses. These can never turn on a service the owner turned off. |
 | ACT3 vs WTC share of the machine when both have work | The machine owner (`platforms.*.share`) |
 
-The coordination logic is ours: matching, priority, slots, leases and retries are Go code in this repo. The proposed
-transport is an HTTPS lease API (`POST /processing/lease`, long-poll). A Temporal adapter is optional for migrating off
-today's TypeScript `job_runner`. RabbitMQ is not planned for now. That choice is still **proposed**: decision D-001 in
-the spec waits for Bryan to confirm it.
+The coordination logic is ours: matching, priority, slots, claims and retries are Go code in this repo. The task queue
+is **NATS with JetStream, running as its own `nats-server` process** on every machine (decided 2026-10-27, D-014; see
+[pm/task_queue.mdx](pm/task_queue.mdx)). Our binary is a client of it: it pulls jobs for the services it offers, claims
+them with a fencing token, reports events, and requeues or dead-letters failures. Queued jobs and claims stay in the
+broker while our binary restarts. Set it up once per machine:
+
+```bash
+just broker-install    # nats-server (Homebrew on macOS, winget on Windows)
+just broker-config     # writes ~/.act3_processing/nats/<role>.conf from this_server.yaml
+just broker-run        # starts it in the background (until it is installed as an OS service)
+just broker-status
+```
+
+Without a broker the server still runs direct mode (`POST /v1/jobs`), and `GET /v1/health` reports
+`broker: broker_missing` with the fix. Owners and local software submit to the queue with `POST /v1/queue/jobs`.
 
 ## `this_server.yaml`: what makes a machine a server
 
@@ -115,8 +139,7 @@ ai_processing_server/
 ├── .gitignore                 # binary, build output, /data/git_ignore/, private keys
 ├── pm/                        # specifications only, never code
 │   ├── ai_processing_server.mdx   # the engineering spec
-│   ├── task_queue.mdx             # the task queue: NATS JetStream, continuity, priority, contract
-│   ├── Decisions.yaml             # D-001 … D-017, D-Q1
+│   ├── Decisions.yaml             # D-001 … D-017
 │   └── TO_DO.md
 ├── servers/                   # one server.yaml per known machine (checked in)
 │   ├── Bryan_5090/server.yaml
@@ -126,28 +149,20 @@ ai_processing_server/
 │   ├── templates/this_server.template.yaml
 │   ├── services/*.yaml        # one catalog file per service
 │   ├── servers/known_servers.yaml
-│   ├── queue/                 # streams.yaml, bands.yaml, callers.yaml, categories.yaml, broker.yaml, nats/*.conf.tmpl
-│   ├── schemas/               # task_envelope.v1, task_event.v1, run_record.v1 (JSON Schema)
 │   └── git_ignore/            # per machine, NEVER committed
 │       ├── this_server.yaml   # owner-edited; created once by init, never rewritten
-│       ├── state/             # jobs/<job_id>.json (the local record), server.pid
-│       ├── runs/<job_id>/     # run directory shared with the job's task host (run.json, events.jsonl, ...)
-│       ├── snapshots/<id>/    # frozen code a job runs from: <git_sha>-<binary hash>
+│       ├── state/             # journal/<job_id>.json, server.pid
 │       ├── work/<job_id>/     # scratch per job, deleted after
 │       ├── results/<job_id>/  # outputs kept for GET /v1/jobs/{id}/outputs/{name} (24 h)
 │       └── logs/jobs/         # per-job logs (7 days)
 ├── code/                      # all Go source (module root: code/go.mod)
 │   ├── cmd/ai_processing_server/main.go
-│   └── internal/{api,brokerctl,capability,config,errlog,hardware,jobs,logging,priority,procs,queue,
-│                 redact,runners,runs,scheduler,security,snapshot,storage,taskhost}/
+│   └── internal/{api,capability,config,hardware,jobs,logging,procs,runners,scheduler,storage}/
 ├── tests/                     # black-box suite (Python, stdlib only): see tests/README.md
 └── justfile
 ```
 
-Still planned under `data/`: `models/`, `sites/sites.yaml`, and JSON Schemas for each service's params.
-
-The broker's own files live outside the repo, in `~/.act3_processing/nats/` (generated `nats.conf`, its log, the
-JetStream store).
+Still planned under `data/`: `models/`, `sites/sites.yaml` and `schemas/`.
 
 ## Known machines
 
@@ -170,13 +185,9 @@ turns services off, with reasons. It never breaks the build.
 
 | Command | Does |
 | --- | --- |
-| `just broker-install` | **once per machine**: install `nats-server` (pinned in `data/queue/broker.yaml`, sha256-checked) as an OS service (launchd, systemd --user, Windows service) |
-| `just broker-config` · `broker-status` · `broker-uninstall` | regenerate and reload its config · is it up, which version, work stored · remove the service (stored jobs stay) |
 | `just build` | compile `code/` into `./ai_processing_server` (git-ignored), then `init` |
-| `just run` / `just run-fg` | start the controller in the background / foreground; without a broker it starts and reports `broker_missing` with the fix |
-| `just stop` | stop the controller; running jobs keep going in their task hosts |
-| `just restart` · `just update` | restart the controller (running jobs are re-adopted) · `git pull`, build, restart |
-| `just runs` | jobs running in task hosts: service, code snapshot, pid, last heartbeat |
+| `just run` / `just run-fg` | start in the background / foreground; prints `Local API: http://127.0.0.1:9440/` |
+| `just stop` | drain (wait up to 10 min for running jobs), then stop |
 | `just status` | health plus a table of services and jobs |
 | `just logs` | tail `~/_act3_logs/processing_server.info` and `.err` |
 | `just detect` | print detected hardware and offers without starting |
@@ -184,26 +195,23 @@ turns services off, with reasons. It never breaks the build.
 | `just validate` | check `this_server.yaml` and `data/` without starting |
 | `just test` | `go vet` + `go test ./...`, then the black-box suite in `tests/` |
 | `just cross` | compile check for darwin/arm64, windows/amd64, linux/amd64, linux/arm64 |
-| `just install-service` | *(planned)* the controller itself as a launchd / Windows / systemd service |
+| `just install-service` | *(planned)* launchd (macOS), Windows service, or systemd user unit |
 
 Try it:
 
 ```bash
-just broker-install          # once per machine
 just build && just run
 TOKEN=$(cat ~/.credentials/ai_processing_server_local.token)
 curl -s -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:9440/v1/jobs \
   -d '{"service":"sys.compute","priority":50,"params":{"op":"primes","limit":10000000,"segments":20}}'
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9440/v1/jobs     # state, band, attempt, progress, result
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9440/v1/jobs/<job_id>/events   # the caller's events
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9440/v1/jobs     # state, stage, progress, result
 open http://127.0.0.1:9440/                                                  # plain status page
 just stop
 ```
 
-The job record passes the task queue's own contract through (`pm/Decisions.yaml` D-014): the envelope v1
-(`data/schemas/task_envelope.v1.schema.json`), the states `SUBMITTED · QUEUED · CLAIMED · STAGING · RUNNING ·
-UPLOADING · SUCCEEDED · FAILED · CANCELLED · EXPIRED · REJECTED` (task_queue.mdx §13.4), and the events on
-`evt.<caller>.<job_id>` (§13.5).
+The job record mirrors Asynq's `TaskInfo` (`id, queue, type, payload, state, max_retry, retried, last_err,
+completed_at, result`, states `pending · active · retry · completed · archived`, plus `cancelled`), so a real task
+system can sit behind the server later with the API passing its data through (`pm/Decisions.yaml` D-008).
 
 Build targets: `darwin/arm64`, `windows/amd64`, `linux/amd64` and `linux/arm64`. The default build is pure Go
 (`CGO_ENABLED=0`). GPU facts come from vendor command-line tools (`nvidia-smi`, `system_profiler`).
@@ -238,7 +246,7 @@ Each job also gets its own log at `data/git_ignore/logs/jobs/<job_id>.log`. That
 | 0. Specs and scaffold | `pm/Goal.md`, `pm/TO_DO.md`, `pm/Decisions.yaml`; `code/go.mod`; justfile `build`/`run` |
 | 1. Identity and hardware | config, hardware detection, capability offers, `init`, `detect`, local API read routes, logging |
 | 2. Jobs locally | job state machine, scheduler, `selftest` and `ffmpeg` runners, direct mode |
-| 3. ACT3 connected | HTTPS lease broker; appsrv lease endpoints; heartbeat feeds the admin Server page |
+| 3. ACT3 connected | ACT3 submits through the NATS task queue (task_queue.mdx §20, §22); queue v1 built in v0.2.0 |
 | 4. GPU services | `comfy` and `python` runners, model cache, `b5090` / `bpc` / `bms` profiles |
 | 5. WTC connected | `wtc.transcription`, `wtc.transcode`, `wtc.ocr` |
 | 6. Fleet | service install, metrics, automated updates, Nepal and cloud machines |

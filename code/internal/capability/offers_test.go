@@ -86,3 +86,20 @@ func TestMissingEngineReason(t *testing.T) {
 		t.Fatalf("missing ffmpeg must say so: %+v", o)
 	}
 }
+
+// problems 2026_oct_27 #7: a model service the owner turned on before installing its weights offers nothing,
+// with the install problem as the reason, so it never claims a fleet job it would fail.
+func TestEnabledButNotInstalledOffersNothing(t *testing.T) {
+	f := hardware.Facts{CPU: hardware.CPU{LogicalCores: 32}, RAMGB: 512, Engines: ff,
+		GPUs: []hardware.GPU{{Index: 0, Vendor: "apple", UnifiedMemoryGB: 512, Compute: "metal"}}}
+	in := setup(t, f, "act3.video_gen_open_source")
+	in.Runners["oss_video"] = true
+	if o := find(ComputeOffers(in), "act3.video_gen_open_source"); o.Parallel != 1 {
+		t.Fatalf("installed Wan on a 512 GB Mac should offer 1: %+v", o)
+	}
+	in.NotInstalled = map[string]string{"oss_video": "Wan 2.2 is not installed on this server: missing x"}
+	o := find(ComputeOffers(in), "act3.video_gen_open_source")
+	if o.Parallel != 0 || !o.Enabled || !strings.Contains(o.Reason, "not installed") {
+		t.Fatalf("not-installed Wan must offer 0 with the reason: %+v", o)
+	}
+}

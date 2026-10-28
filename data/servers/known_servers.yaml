@@ -1,35 +1,73 @@
 # Presets that let `init` name known machines without typing (pm/ai_processing_server.mdx §6.6).
-# Identity hints only: detection is truth for hardware. Hostnames marked "guess" need confirming (§23 Q2).
+# Identity hints only: detection is truth for hardware. Hostnames marked "guess" are corrected by the first `init` on
+# the machine: it reports the real hostname, and that line is fixed here by pull request (§23 Q2, D-022).
+# local_mode = callers.local.mode init writes (task_queue.mdx §14.5, §24 Q3, D-021): first on the owner's workstations,
+# share on the GPU render boxes, idle_only on dedicated office and cloud machines.
 schema_version: 1
 servers:
   - key: BLAP
     display_name: "Bryan Laptop"
+    servers_dir: Bryan_Laptop
     match: { hostname: ["Bry-MacBook-Pro-2025b", "Bry-MacBook-Pro-2025b.local"] }   # detected 2026-10-27
     profile: generic
     family: bryan
     site: bryan_office
+    local_mode: first
   - key: B5090
     display_name: "Bryan 5090"
+    servers_dir: Bryan_5090
     match: { hostname: ["bryan-5090", "DESKTOP-B5090"], gpu_name_contains: "RTX 5090" }   # hostnames: guess
     profile: b5090
     family: bryan
     site: bryan_office
+    local_mode: share
   - key: BPC
     display_name: "Bryan PC"
     match: { hostname: ["BRYAN-PC"], gpu_count_min: 2 }          # guess
     profile: bpc
     family: bryan
     site: bryan_office
+    local_mode: share
   - key: BMT
     display_name: "Bryan Mac Tower"
-    match: { hostname: ["Bryan-Mac-Tower"] }                     # guess
+    match: { hostname: ["Bryans-Mac-Pro-2024", "Bryans-Mac-Pro-2024.local", "Bryan-Mac-Tower"] }   # Mac Pro 2024 (M2 Ultra, 192 GB): detected 2026-10-27
     profile: bmt
     family: bryan
     site: bryan_office
+    local_mode: first
   - key: BMS
     display_name: "Bryan Mac Studio"
-    match: { hostname: ["Bryan-Mac-Studio"] }                    # guess
+    servers_dir: Bryan_Mac_Studio
+    match: { hostname: ["BryansMacStudio.home", "Bryans-Mac-Studio", "Bryans-Mac-Studio.local"] }   # detected 2026-10-27
     profile: bms
     family: bryan
     site: bryan_office
-    services_off: [act3.video_gen_open_source]                  # OpenClaw is the tenant here
+    local_mode: share
+    # Wan 2.2 and SeedVR2 are installed here (~/act3_render/wan_2_2, ~/act3_render/seedvr2), so init turns both model
+    # services on; on any other machine they stay off until the owner installs the weights and runs `just enable`.
+    # The bms profile yields to OpenClaw when it is busy.
+    services_on: [act3.video_gen_open_source, act3.upscale_open_source]
+  # The three Nepal office machines (task_authoring.mdx §2, §10 Q1, D-020). Hostnames are placeholders until `init`
+  # runs on each; the hardware is detected there, never guessed here. Customer data is allowed for site nepal_office
+  # once the machine's disk encryption and server key are verified at enrollment (security.mdx, D-020).
+  - key: NPL1
+    display_name: "Nepal 1"
+    match: { hostname: ["NPL1", "nepal-1"] }                     # placeholder
+    profile: generic
+    family: office
+    site: nepal_office
+    local_mode: idle_only
+  - key: NPL2
+    display_name: "Nepal 2"
+    match: { hostname: ["NPL2", "nepal-2"] }                     # placeholder
+    profile: generic
+    family: office
+    site: nepal_office
+    local_mode: idle_only
+  - key: NPL3
+    display_name: "Nepal 3"
+    match: { hostname: ["NPL3", "nepal-3"] }                     # placeholder
+    profile: generic
+    family: office
+    site: nepal_office
+    local_mode: idle_only

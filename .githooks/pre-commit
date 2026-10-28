@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Refuse a commit that would record unresolved merge conflicts or a private key (pm/security.mdx §4.4).
+# Installed by `just build` (git config core.hooksPath .githooks). Bypass only on purpose: git commit --no-verify.
+set -uo pipefail
+
+added() { git diff --cached -U0 --no-color --diff-filter=ACMR "$@" | grep -E '^\+[^+]' ; }
+
+if git ls-files -u | grep -q .; then
+  echo "pre-commit: unmerged paths remain; resolve them and git add each file first:" >&2
+  git diff --name-only --diff-filter=U >&2
+  exit 1
+fi
+markers=$(git diff --cached --name-only -G '^(<<<<<<< |>>>>>>> )' --diff-filter=ACMR)
+if [ -n "$markers" ] && added -- $markers | grep -qE '^\+(<<<<<<< |>>>>>>> )'; then
+  echo "pre-commit: conflict markers (<<<<<<< / >>>>>>>) in staged files; finish the merge first:" >&2
+  echo "$markers" >&2
+  exit 1
+fi
+if added -- . ':!*_test.go' | grep -qE '^\+-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' ||
+   added -- '*.json' '*.jwk' | grep -qE '"d"[[:space:]]*:'; then
+  echo "pre-commit: a PRIVATE KEY is staged. Unstage it; if it was ever pushed, revoke that key (pm/security.mdx §10.3)." >&2
+  exit 1
+fi
+exit 0

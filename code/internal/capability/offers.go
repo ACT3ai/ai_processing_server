@@ -32,6 +32,9 @@ type Input struct {
 	Server  *config.ThisServer
 	Facts   hardware.Facts
 	Runners map[string]bool // runner names built into this binary
+	// NotInstalled: runner name -> why its model is not installed here (runners.InstallProblems). An enabled
+	// service whose runner is listed offers 0 parallel with that reason, so it never claims a job it would fail.
+	NotInstalled map[string]string
 }
 
 // CanRun checks hard hardware and engine requirements only (used by init to propose the service list).
@@ -70,15 +73,18 @@ func ComputeOffers(in Input) []Offer {
 		set := in.Server.Service(id)
 		switch {
 		case set == nil:
-			o.Reason = "not listed in this_server.yaml (new services are opt-in)"
+			o.Reason = "not listed in this_server.yaml: opt in under services:"
 			if ok, why := CanRun(def, in.Facts); !ok {
-				o.Reason = "not listed in this_server.yaml: " + why
+				o.Reason = why + " (and not listed in this_server.yaml)"
 			}
 		case !set.Enabled:
 			o.Reason = "off in this_server.yaml"
 		case !in.Runners[def.Runner]:
 			o.Enabled = true
-			o.Reason = fmt.Sprintf("runner %q is not built into this version yet", def.Runner)
+			o.Reason = fmt.Sprintf("not available yet: runner %q is not built into this version", def.Runner)
+		case in.NotInstalled[def.Runner] != "":
+			o.Enabled = true
+			o.Reason = in.NotInstalled[def.Runner]
 		default:
 			o.Enabled = true
 			o.LocalBias = set.LocalBias

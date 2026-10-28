@@ -4,6 +4,8 @@ package config
 
 import (
 	"fmt"
+	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,10 +29,102 @@ type ThisServer struct {
 	Limits        Limits                     `yaml:"limits" json:"limits"`
 	Paths         Paths                      `yaml:"paths" json:"paths"`
 	LocalAPI      LocalAPI                   `yaml:"local_api" json:"local_api"`
-	Queue         QueueSettings              `yaml:"queue" json:"queue"`
+	Queue         Queue                      `yaml:"queue" json:"queue"`
 	Continuity    Continuity                 `yaml:"continuity" json:"continuity"`
 	Callers       map[string]CallerSetting   `yaml:"callers" json:"callers"`
+	Models        ModelRules                 `yaml:"models" json:"models"`
+	Security      Security                   `yaml:"security" json:"-"`
 	Debug         Debug                      `yaml:"debug" json:"debug"`
+}
+
+// Queue is the connection to the task system: NATS JetStream in its own nats-server process (pm/task_queue.mdx
+// §8.2, §17.1, D-014). A file without a queue section has it off, so existing machines keep running direct mode.
+type Queue struct {
+	Enabled         bool    `yaml:"enabled" json:"enabled"`
+	Role            string  `yaml:"role" json:"role"`             // standalone | worker | hub
+	BrokerURL       string  `yaml:"broker_url" json:"broker_url"` // this machine's own nats-server
+	HubURL          string  `yaml:"hub_url" json:"hub_url"`       // used by broker-config for a worker's leaf node
+	CredentialsFile string  `yaml:"credentials_file" json:"-"`
+	BrokerVersion   string  `yaml:"broker_version" json:"broker_version"` // supported nats-server line; others warn
+	StoreDir        string  `yaml:"store_dir" json:"store_dir"`           // JetStream store, outside the repo
+	StoreMaxGB      float64 `yaml:"store_max_gb" json:"store_max_gb"`
+}
+
+// Continuity holds the claim timing (pm/task_queue.mdx §9).
+type Continuity struct {
+	AckWait   Duration `yaml:"ack_wait" json:"ack_wait"`   // a claim not extended for this long goes to another worker
+	Heartbeat Duration `yaml:"heartbeat" json:"heartbeat"` // InProgress interval per held job
+}
+
+// CallerSetting says whether this machine pulls a caller's jobs at all (pm/task_queue.mdx §17.1). Mode is read only
+// for the local caller (§14.5). Shares and category accept/deny are build phase Q2.
+type CallerSetting struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	Mode    string `yaml:"mode,omitempty" json:"mode,omitempty"` // local only: first | share | idle_only
+}
+
+// Local job modes (pm/task_queue.mdx §14.5; defaults per machine decided in §24 Q3, D-021).
+const (
+	LocalFirst    = "first"     // the owner's jobs are pulled before any platform job
+	LocalShare    = "share"     // the owner's jobs take their turn inside each band
+	LocalIdleOnly = "idle_only" // the owner's jobs run only when no platform job waits
+)
+
+// LocalMode is how this machine ranks its owner's queued jobs; share when unset.
+func (t *ThisServer) LocalMode() string {
+	if m := t.Callers["local"].Mode; m != "" {
+		return m
+	}
+	return LocalShare
+}
+
+// ModelRules is the owner's model fence (pm/task_queue.mdx §11.2): deny wins; an empty allow list allows every model.
+// Patterns use path.Match syntax ("wan2.*", "seedvr2-*"). Vendor models are refused everywhere (D-021).
+type ModelRules struct {
+	Allow []string `yaml:"allow" json:"allow"`
+	Deny  []string `yaml:"deny" json:"deny"`
+}
+
+// Allowed reports whether this machine may run model, and why not. A job with no model is allowed.
+func (m ModelRules) Allowed(model string) (bool, string) {
+	if model == "" {
+		return true, ""
+	}
+	if strings.HasPrefix(model, "vendor:") {
+		return false, "vendor API models never run on processing servers"
+	}
+	for _, p := range m.Deny {
+		if ok, _ := path.Match(p, model); ok {
+			return false, "models.deny has " + p
+		}
+	}
+	if len(m.Allow) == 0 {
+		return true, ""
+	}
+	for _, p := range m.Allow {
+		if ok, _ := path.Match(p, model); ok {
+			return true, ""
+		}
+	}
+	return false, "not in models.allow"
+}
+
+// DefaultCallers are the callers pulled when the file has no callers section.
+var DefaultCallers = []string{"act3", "wtc", "local"}
+
+// EnabledCallers returns the callers this machine pulls for, sorted.
+func (t *ThisServer) EnabledCallers() []string {
+	if len(t.Callers) == 0 {
+		return append([]string(nil), DefaultCallers...)
+	}
+	var out []string
+	for id, c := range t.Callers {
+		if c.Enabled {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 type Identity struct {
@@ -39,6 +133,7 @@ type Identity struct {
 	Profile     string  `yaml:"profile" json:"profile"`
 	Family      string  `yaml:"family" json:"family"`
 	Site        string  `yaml:"site" json:"site"`
+	ServersDir  string  `yaml:"servers_dir" json:"servers_dir,omitempty"` // servers/{dir}/ in this repo; "" = not checked in
 	BoundTo     BoundTo `yaml:"bound_to" json:"bound_to"`
 }
 
@@ -85,6 +180,11 @@ type LocalAPI struct {
 	AllowDirectJobs bool   `yaml:"allow_direct_jobs" json:"allow_direct_jobs"`
 }
 
+// Security holds where this machine keeps its identity key (pm/security.mdx §4.2).
+type Security struct {
+	KeyDir string `yaml:"key_dir"` // private key directory; "" = data/git_ignore/keys
+}
+
 type Debug struct {
 	KeepWorkDirs bool `yaml:"keep_work_dirs" json:"keep_work_dirs"`
 }
@@ -97,11 +197,12 @@ func DefaultLimits() Limits {
 
 func defaults() ThisServer {
 	return ThisServer{
-		Limits:     DefaultLimits(),
-		LocalAPI:   LocalAPI{Listen: "127.0.0.1:9440", TokenFile: "~/.credentials/ai_processing_server_local.token"},
-		Paths:      Paths{CacheMaxGB: 200},
-		Queue:      defaultQueue(),
-		Continuity: defaultContinuity(),
+		Limits:   DefaultLimits(),
+		LocalAPI: LocalAPI{Listen: "127.0.0.1:9440", TokenFile: "~/.credentials/ai_processing_server_local.token"},
+		Paths:    Paths{CacheMaxGB: 200},
+		Queue: Queue{Role: "standalone", BrokerURL: "nats://127.0.0.1:4222", BrokerVersion: "2.15",
+			StoreDir: "~/.act3_processing/nats/jetstream", StoreMaxGB: 20},
+		Continuity: Continuity{AckWait: Duration{5 * time.Minute}, Heartbeat: Duration{20 * time.Second}},
 	}
 }
 
@@ -130,7 +231,6 @@ type ServiceDef struct {
 	MaxParallelDefault int             `yaml:"max_parallel_default" json:"max_parallel_default"`
 	Timeouts           ServiceTimeouts `yaml:"timeouts" json:"timeouts"`
 	Retry              RetryPolicy     `yaml:"retry" json:"retry"`
-	Queue              ServiceQueue    `yaml:"queue" json:"queue"`
 	PlatformJobTypes   []string        `yaml:"platform_job_types" json:"platform_job_types,omitempty"`
 }
 
@@ -155,20 +255,6 @@ type ServiceTimeouts struct {
 	Upload      Duration `yaml:"upload" json:"upload"`
 }
 
-// ServiceQueue is a service's queue settings (pm/task_queue.mdx §16.1, §17.2).
-type ServiceQueue struct {
-	Backoff []Duration `yaml:"backoff" json:"backoff,omitempty"` // delay before attempt 2, 3, ...; default 30s, 2m, 10m
-}
-
-// BackoffFor returns the delay before attempt next (2 for the first retry).
-func (q ServiceQueue) BackoffFor(next int) time.Duration {
-	b := q.Backoff
-	if len(b) == 0 {
-		b = []Duration{{30 * time.Second}, {2 * time.Minute}, {10 * time.Minute}}
-	}
-	return b[min(max(next-2, 0), len(b)-1)].Duration
-}
-
 type RetryPolicy struct {
 	MaxAttempts int      `yaml:"max_attempts" json:"max_attempts"`
 	RetryOn     []string `yaml:"retry_on" json:"retry_on"`
@@ -186,8 +272,13 @@ type KnownServer struct {
 	Profile     string   `yaml:"profile"`
 	Family      string   `yaml:"family"`
 	Site        string   `yaml:"site"`
+	ServersDir  string   `yaml:"servers_dir"` // its directory under servers/, when checked in
 	Match       Match    `yaml:"match"`
 	ServicesOff []string `yaml:"services_off"`
+	// ServicesOn: services init writes enabled: true on this machine even when the catalog defaults them off (the
+	// model services on the box whose weights are installed: BMS Wan 2.2 + SeedVR2, problems 2026_oct_27 #2).
+	ServicesOn []string `yaml:"services_on"`
+	LocalMode  string   `yaml:"local_mode"` // callers.local.mode init writes; share when empty
 }
 
 type Match struct {
@@ -212,19 +303,6 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 }
 
 func (d Duration) MarshalJSON() ([]byte, error) { return []byte(`"` + d.String() + `"`), nil }
-
-func (d *Duration) UnmarshalJSON(b []byte) error {
-	s := strings.Trim(string(b), `"`)
-	if s == "" || s == "null" {
-		return nil
-	}
-	v, err := time.ParseDuration(s)
-	if err != nil {
-		return fmt.Errorf("%q is not a duration like 10m or 90s", s)
-	}
-	d.Duration = v
-	return nil
-}
 
 // Or returns d, or def when d is zero.
 func (d Duration) Or(def time.Duration) time.Duration {

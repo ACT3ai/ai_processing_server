@@ -1,15 +1,10 @@
-# The nats-server this repo supports (pm/task_queue.mdx §8.2, §18). `just broker-install` uses a nats-server already
-# on PATH when its version is supported, otherwise downloads the pinned release below and checks its sha256.
-# Checksums are from https://github.com/nats-io/nats-server/releases/download/v2.15.2/SHA256SUMS (fetched 2026-10-27).
+# The task queue broker: NATS JetStream in its own nats-server process (pm/task_queue.mdx §8.2, pm/Decisions.yaml D-014).
+# `just broker-install` installs this line; `ai_processing_server broker status` warns on any other line and
+# refuses anything older than min_version. As of 2026-10-27 the Bryan laptop runs nats-server v2.15.2 (Homebrew).
 schema_version: 1
-supported: ">=2.10.0"
-pinned: "2.15.2"
-port: 4244            # not 4222: other apps on our machines run their own nats-server there
-monitor_port: 8244
-downloads:
-  darwin-arm64:  { file: nats-server-v2.15.2-darwin-arm64.tar.gz,  sha256: cbd2219d01502c38733485ac684269da585ee479fa3b1377264beecdefdf9e9d }
-  darwin-amd64:  { file: nats-server-v2.15.2-darwin-amd64.tar.gz,  sha256: 9c45b23c19498692e81cd39c75e8382f0e6ff59c0d5b9470e32fe6640afa4446 }
-  linux-amd64:   { file: nats-server-v2.15.2-linux-amd64.tar.gz,   sha256: 67cb8e10bc6f0c4b47f75a728529a20953dbae2a4f9a4a52ae8517d65ae303ff }
-  linux-arm64:   { file: nats-server-v2.15.2-linux-arm64.tar.gz,   sha256: bc2c788dcbf2849af749564e06a0d48c19bced851f2d68a2e21c54d078949b28 }
-  windows-amd64: { file: nats-server-v2.15.2-windows-amd64.zip,    sha256: f6398d5d11093778f870db70242cb50d20a58134c937c805ba8d114e7e398766 }
-base_url: "https://github.com/nats-io/nats-server/releases/download/v2.15.2/"
+supported_line: "2.15"
+min_version: "2.10.0"
+install:
+  darwin: "brew install nats-server"
+  linux: "download the nats-server release tarball for your arch from https://github.com/nats-io/nats-server/releases (2.15.x) and put nats-server on PATH"
+  windows: "winget install NATS.Server (or download the 2.15.x zip from https://github.com/nats-io/nats-server/releases) and put nats-server.exe on PATH"

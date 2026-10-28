@@ -23,7 +23,7 @@ from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
 ROOT = TESTS.parent
-SUITES = ["api", "compute", "render", "queue", "lifecycle", "continuity", "stress"]
+SUITES = ["api", "compute", "render", "queue", "broker", "lifecycle", "stress"]
 sys.path.insert(0, str(TESTS))
 
 from lib.harness import BINARY  # noqa: E402

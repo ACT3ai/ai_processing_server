@@ -1,0 +1,388 @@
+---
+title: "Task authoring: how ACT3 builds tasks that run on our render queue servers"
+description: "The contract every task must meet to run on the render queue servers (B5090, the Mac Studio, the three Nepal machines): callers only talk to ai_processing_server through its APIs, jobs travel on NATS JetStream (its own nats-server process), and every task survives a git pull and a controller restart while it runs, whether it takes 30 seconds or 30 minutes. Written for the ACT3 engineers who will create the tasks (upscale first, then image generation, Wan 2.2 video, transcription), with the rules, the checklist for a new task type and the continuity gate it must pass before going live."
+---
+
+{/* Written 2026-10-27 from Bryan's third dictation of the day (§0). Companion to ./task_queue.mdx (the queue, NATS, task hosts and snapshots: the HOW) and ./ai_processing_server.mdx (the server on one machine). This file is the WHAT-A-TASK-MUST-DO view, for the people writing tasks. Where this file and task_queue.mdx disagree, task_queue.mdx wins and this file is fixed. */}
+
+# Task authoring: how ACT3 builds tasks that run on our render queue servers
+
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** specified; the queue adapter is being written, task hosts and
+snapshots are not built yet
+· **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
+· **Read with:** [task_queue.mdx](./task_queue.mdx) (§9 continuity, §13 the task contract),
+[ai_processing_server.mdx](./ai_processing_server.mdx) (runners, service catalogs), [apis.mdx](./apis.mdx)
+
+## 0. The request, verbatim in intent
+
+Bryan's third dictation (2026-10-27), cleaned of transcription noise ("X3" is ACT3; "1, 2.2" is read as Wan 2.1 and
+Wan 2.2, see §10 Q3):
+
+> Render queue servers: these are the computers in Bryan's office, like the 5090 PC with the NVIDIA card and the Bryan
+> Mac Studio, and there are also the three in Nepal. They all use this repo; it has the render server software, and
+> every one of those servers has to have it.
+>
+> Even our software that runs locally, all of our internal software, will call the APIs of this ai_processing_server
+> code. It feeds in our tasks and reads the data back out.
+>
+> NATS with JetStream, as a separate nats-server process.
+>
+> We need to make our tasks work with NATS and JetStream. The tasks we run on these servers are things like upscaling
+> videos; eventually image generation and GenAI video with Wan 2.1, 2.2 and more; later transcription and other
+> things.
+>
+> A task may take 30 seconds, or 30 minutes for a video upscale. We will upgrade our code, even the task code, very
+> often. Even though git pulls come down to the server, they must not break a task that is underway: it must be able
+> to finish processing. Every task we run on those computers is designed to run there, run well, and be resilient in
+> this way.
+>
+> ACT3 will be creating its tasks to work with us.
+
+Requirements derived from it:
+
+* **A1. The fleet runs this repo.** Every render queue server (§2) runs `ai_processing_server` from a checkout of
+  this repo, updated by `git pull`.
+* **A2. Everything goes through our API.** No caller, including software on the same machine, starts a runner, writes
+  into a run directory or reads results from disk. It submits through the API and reads events and outputs back (§3).
+* **A3. NATS JetStream as its own `nats-server` process** is the transport. This confirms task_queue.mdx D-Q1 (§3.1
+  there) and settles the open conflict with D-001 (pm/Decisions.yaml D-014).
+* **A4. Tasks are built for NATS JetStream:** they follow the task contract (task_queue.mdx §13) and the rules in §5.
+* **A5. Task types, in order:** video upscale first; image generation; GenAI video (Wan 2.1, Wan 2.2, more later);
+  transcription and others later (§4).
+* **A6. Continuity:** a task of 30 seconds to 30+ minutes finishes on the code it started with, even when `git pull`
+  and a restart happen while it runs, and even when the pull changes that task's own code (§5, §8).
+* **A7. ACT3 writes the tasks.** ACT3 engineers create task types against this spec; this repo gives them the
+  contract, the runtime and the gate (§7, §8).
+
+## 1. Who this is for
+
+* **ACT3 engineers** adding a job type that runs on our machines (the first audience).
+* **WTC engineers** doing the same for transcription, OCR and transcodes; nothing here is ACT3-only.
+* **Whoever reviews a task** before it goes live: §8 is the gate.
+
+A **task** in this file means one job type end to end: the service catalog entry, the runner code that does the work,
+the params schema, and the caller code that submits it and reads its result.
+
+## 2. The render queue servers
+
+**As of 2026-10-27.** Hardware facts live in `servers/<Name>/server.yaml` and each machine's detected
+`data/git_ignore/this_server.yaml`; this table is only the map.
+
+| Key | Machine | Site | OS | Main use |
+| --- | --- | --- | --- | --- |
+| `B5090` | Bryan's RTX 5090 PC (32 GB VRAM, CUDA) | `bryan_office` | Windows | video upscale, Wan video, image gen: the main GPU box |
+| `BMS` | Bryan's Mac Studio (Apple GPU, large unified memory) | `bryan_office` | macOS | Metal-capable work, transcription, CPU work; shared with OpenClaw (parent spec §15.3 `bms` profile) |
+| `NPL1`, `NPL2`, `NPL3` (decided, D-020) | the three Nepal machines | `nepal_office` | to be detected | GPU and CPU work; behind NAT, outbound connections only |
+| `BPC`, `BMT`, `BLAP` | Bryan's two-GPU PC, Mac Tower, laptop | `bryan_office` | Windows / macOS | also in the fleet per bryan_servers.mdx; not named in this dictation |
+
+Every one of them:
+
+* has a checkout of this repo and builds its own binary (`just build`);
+* runs its own `nats-server` as an OS service (a leaf node to the hub; task_queue.mdx §8);
+* runs `ai_processing_server` as the controller, which restarts on every update;
+* runs each job in a detached task host from a frozen copy of the task's code (task_queue.mdx §9).
+
+The three Nepal machines need keys, hardware detection and a `site` row before they join (§10 Q1).
+
+## 3. Everything goes through the API
+
+### 3.1 The doors
+
+| Caller | Door | Reads results from |
+| --- | --- | --- |
+| ACT3 appsrv, job_runner (cloud) | NATS: publish to `submit.act3.<category>` (`nats.js`), or the HTTPS gateway `POST /v1/jobs` | events on `evt.act3.<job_id>`, or webhooks; outputs at the presigned URLs it gave |
+| WTC backend (cloud) | NATS (`nats.go`) or the gateway | `evt.wtc.<job_id>` |
+| Internal software on a server itself (Bryan's scripts, the CLI, tools on BMS) | the **local API** on `127.0.0.1:9440` (parent spec §13), caller `local` | the local API's job and event endpoints; outputs where the envelope said |
+
+Rules:
+
+* **Same contract on every door.** Each door accepts the same envelope (task_queue.mdx §13.2) and produces the same
+  events (§13.5). There is one admission path.
+* **Local software is not special.** A script on B5090 that wants an upscale submits a `local` job like ACT3 would.
+  It never runs the upscaler binary directly, never writes into `data/git_ignore/runs/`, and never reads another job's
+  files. That way local jobs get the same slots, priority (`callers.local`, task_queue.mdx §14.5), continuity and logs
+  as platform jobs, and never fight them for a GPU.
+* **Media never rides on the bus.** Inputs and outputs are URLs with sha256 and size; envelopes stay under 256 KB.
+
+### 3.2 The transport
+
+NATS with JetStream, as its own long-lived `nats-server` process on every machine, never inside our binary (D-014).
+`ai_processing_server` is only a client. Queued jobs and running jobs' claims live in the broker and survive any
+restart of our code. Why NATS, and the 14 alternatives, are in task_queue.mdx §1 to §3.
+
+## 4. Task types
+
+**As of 2026-10-27.** In the order Bryan named them. Service ids follow the catalog rules (parent spec §8).
+
+| Order | Task type | Category | Service id | Typical length | Status |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Video upscale (SeedVR2 now; FlashVSR later) | `upscale` | `act3.upscale_open_source` | 30 s for a short clip, 30+ min for a long shot at 4K | **built 2026-10-27:** runner `oss_upscale` (SeedVR2 standard / best / sharp, Metal or CUDA), in a task host; off by default |
+| 2 | Image generation (FLUX, SDXL via ComfyUI) | `image_gen` | `act3.image_gen_open_source`, `act3.comfy_on_prem` | 10 s to 2 min | catalog for `act3.comfy_on_prem` exists |
+| 3 | GenAI video: Wan 2.1, Wan 2.2, LTX, Hunyuan, later others | `video_gen` | `act3.video_gen_open_source` | 5 to 30+ min | **Wan 2.2 built 2026-10-27:** runner `oss_video`, model `wan2.2-a14b` (t2v, i2v), in a task host; off by default. LTX, Kandinsky, Hunyuan: not yet |
+| 4 | Transcription (Whisper) | `transcription` | `wtc.transcription` (ACT3 may add `act3.transcription`) | seconds to minutes | catalog exists |
+| later | merges, transcodes, Blender renders, TTS, OCR, descriptions | various | see task_queue.mdx §11.1 | | |
+
+A new model inside an existing type (Wan 2.3, a new upscaler) is a new `model` value and, if it needs one, a new
+graph or script in the runner. It is not a new task type and needs no queue change.
+
+## 5. The rules every task follows
+
+These are what "designed to run there, run well, and be resilient" means in practice. **Must** rules are checked by
+the gate (§8); **should** rules are checked in review.
+
+### 5.1 Survive code updates (the core of A6)
+
+* **R1. Run only from the snapshot. (must)** The task host starts the runner from
+  `data/git_ignore/snapshots/<git_sha>/` and passes it its paths. Runner code never builds a path into the working
+  tree (`~/BGit/act3/ai_processing_server/...`, `../data/...`, `__file__/../..` that escapes the snapshot). Everything
+  it reads from this repo (scripts, graph templates, Blender scripts, catalogs, schemas) it reads through the
+  snapshot path it was given. A `git pull` mid-run then cannot change what the task sees.
+* **R2. Task code lives in this repo. (must)** Runner scripts, ComfyUI graph templates and Blender scripts that a task
+  runs are checked in here (under `code/` for Go, under the runner script directories the build plan names), so they
+  are snapshotted. Code that lives only in an ACT3 repo and is fetched at run time would bypass the snapshot. ACT3
+  contributes task code to this repo by pull request (§7).
+* **R3. TypeScript is bundled, Python is pinned. (must)** A TypeScript runner is bundled into one `.mjs` at snapshot
+  time and runs on the pinned Node; it never reads `node_modules` or source at run time. A Python runner runs with the
+  snapshot as its only path into this repo and an environment (venv or conda) that is installed outside the repo and
+  changed only by a drain.
+* **R4. No state in the controller. (must)** A task never relies on anything held in the `ai_processing_server`
+  process. Its truth is its run directory: progress to `events.jsonl`, result to `result.json`, exit code to
+  `exit.json`. The controller can die and come back at any moment; the task does not notice.
+* **R5. Engines and models are not code. (must)** ComfyUI, Blender, CUDA, Python environments and model weights are
+  installed outside the repo and upgraded only with a drain (task_queue.mdx §9.6). A task never upgrades, downloads
+  into, or pip-installs into a shared engine while it runs.
+
+### 5.2 Run well for 30 seconds or 30 minutes
+
+* **R6. Report progress. (must)** Write a `progress` line to `events.jsonl` at least every 30 s while working
+  (fraction plus a human note: "frame 1210/2880", "segment 3/6"), and a `stage` line on each stage change. The
+  controller forwards them at most every 5 s. Silence for longer than the service's `stall_after` (default 10 min)
+  is treated as a hang.
+* **R7. Declare time and resources honestly. (must)** The service catalog states `timeouts` per stage,
+  `resources_per_job` (VRAM, RAM, cores) and `max_parallel_default`, measured on the slowest machine that will run
+  it. The scheduler uses them to fit jobs side by side; a task that takes more than it declared is killed as
+  `infra`.
+* **R8. Checkpoint long work. (should, for tasks over 5 minutes)** An upscale processes in chunks (frame ranges); a
+  video render in segments. After each chunk, write it to `runs/<job_id>/work/` and record it in a checkpoint line.
+  A retry of the same job on the same machine (after a reboot) resumes from the last checkpoint instead of frame 0.
+  Checkpoints are only an optimisation: the job must still be correct if it starts over.
+* **R9. Honor cancel. (must)** Check for `runs/<job_id>/cancel` at every checkpoint and at least every 30 s; on cancel,
+  stop, upload nothing, exit with the cancelled code. Child processes (ffmpeg, Python, ComfyUI client) must be in the
+  task host's process group so they die with it.
+* **R10. Clean up what it made. (must)** Scratch files under `runs/<job_id>/work/` only, never elsewhere on disk;
+  deleted after a successful upload unless `data_rules.retain_after_upload` is true.
+
+### 5.3 Be safe to run twice
+
+* **R11. Idempotent by `job_id`. (must)** A job can run twice: a machine reboots mid-render and the broker redelivers it,
+  or a network split lets two machines finish. Outputs go to the presigned URLs in the envelope (same key every
+  attempt); the task has no other side effects (no database writes, no emails, no credit charges). The fencing
+  token (task_queue.mdx §16.3) makes sure only one result is reported.
+* **R12. Classify every failure. (must)** Exit with one of the error kinds: `invalid_input`, `content_policy` (never
+  retried), `transient`, `infra`, `timeout` (retried), `internal` (alert). Out of VRAM is `infra` so another machine
+  with more VRAM can try; a corrupt input file is `invalid_input`.
+* **R13. Inputs are untrusted. (must)** Verify sha256 and size of every input; probe media with ffprobe; never execute
+  anything from an input; no shell strings (argv arrays only). The task host enforces URL allow-lists before the
+  runner sees a URL.
+* **R14. No secrets in task code or logs. (must)** A task never reads `this_server.yaml` or a credentials file. If it
+  needs a key (only `vendor_api` tasks do), the task host passes it in the environment, and the redactor strips it
+  from logs and event `detail`.
+
+### 5.4 Never price
+
+* **R15.** A task reports what it did (`timings`, output seconds, resolution, GPU-seconds). It never computes or
+  hard-codes credits; pricing lives in the ACT3 web app backend.
+
+## 6. What a task looks like on disk
+
+```
+data/git_ignore/
+├── snapshots/3f2a9c1/                    # frozen at the first job after a pull; read-only
+│   ├── ai_processing_server              # the task host shim (same binary, --role taskhost)
+│   ├── runners/upscale/upscale.py        # what R1–R3 protect
+│   ├── runners/video_gen/graphs/wan22_i2v.json
+│   └── data/services/act3.upscale_open_source.yaml
+└── runs/7c0e6f0a-…/                      # one per job; survives controller restarts
+    ├── run.json                          # controller's record: snapshot, ack subject, fence, task host pid
+    ├── envelope.json                     # the job as admitted
+    ├── events.jsonl                      # progress, stage, checkpoint lines written by the runner (R6, R8)
+    ├── heartbeat.json                    # task host liveness, every 5 s
+    ├── work/                             # scratch and checkpoints (R8, R10)
+    ├── cancel                            # appears when the caller cancels (R9)
+    ├── result.json                       # outputs, sha256, timings (R11, R15)
+    └── exit.json                         # exit code and error kind (R12)
+```
+
+The run directory contract is versioned (`run_version` in `run.json`); task_queue.mdx §9.6 says how a new controller
+reads the previous version.
+
+## 7. Adding a task type: the checklist
+
+### 7.1 In this repo (ai_processing_server), by pull request
+
+1. **Catalog:** `data/services/<service_id>.yaml`: category, runner, requirements, `resources_per_job`, `timeouts`,
+   retry, and a `queue:` block (ack wait, max deliveries) if the defaults do not fit (R7).
+2. **Params schema:** `data/schemas/params/<service_id>.v1.schema.json`. Admission rejects anything that does not
+   match.
+3. **Runner:** Python, TypeScript or Go, following §5 and the run directory contract (§6). Reuse an existing runner
+   (`comfy`, `ffmpeg`, `python`) with a new script or graph where you can.
+4. **Category and models:** add the service to `data/queue/categories.yaml`; list the model ids it can run.
+5. **Tests:** a unit test of the runner's params handling, plus the continuity gate (§8) as an integration test.
+6. **Off by default.** A new service is off on every machine until its owner turns it on in `this_server.yaml`.
+
+### 7.2 In ACT3 (appsrv, job_runner)
+
+1. Build the envelope (task_queue.mdx §13.2): ACT3's job id as `job_id`, `caller: act3`, category, service, model,
+   priority on the 0..300 scale, presigned input and output URLs, `data_rules`.
+2. Sign it (Ed25519, task_queue.mdx §15.3) and submit through NATS or the gateway.
+3. Follow `evt.act3.<job_id>`; treat events as at least once, deduped by `(job_id, seq)`; update the `job` row from
+   them. The Render Queue page keeps reading the `job` table.
+4. Charge credits from the `succeeded` event's facts, in appsrv, never on our side (R15).
+5. Handle `rejected` at once in the UI (`no_capable_server`, `model_not_allowed`), and `requeued` as "still working".
+
+## 8. The continuity gate
+
+No task type is turned on in production until it passes all of these on at least one real machine that will run it
+(B5090 for GPU types):
+
+| # | Test | Pass when |
+| --- | --- | --- |
+| G1 | **Restart storm.** Run a long job (at least 10 minutes; 30 for upscale and video). Restart the controller every 2 minutes, half by stop signal, half by `kill -9`. | finishes once, attempt 1, no redelivery, no gap in events |
+| G2 | **Pull under a running task.** While it runs, change the runner's own script and graph files, `git pull` a newer commit and `just update`. | finishes on the old code (`code_version` = the old commit); the next job runs the new code |
+| G3 | **Broker restart.** Restart the machine's `nats-server` mid-job. | claim survives, job finishes |
+| G4 | **Reboot.** Power-cycle the machine mid-job. | redelivered after the ack wait, resumes from its checkpoint if it has one (R8), one result |
+| G5 | **Cancel.** Cancel mid-job. | stops within 30 s, nothing uploaded, children gone |
+| G6 | **Twice.** Force a duplicate delivery to two machines. | one `succeeded` event; the fenced-off machine uploads nothing |
+| G7 | **Short job.** A 30-second job under the same restart storm. | finishes once; restart overhead under 2 s per job |
+
+These are task_queue.mdx §21.2 and acceptance Q9 to Q11, applied per task type.
+
+**Built so far (2026-10-27):** `tests/broker/test_task_continuity.py` runs against a real `nats-server` and the real
+binary, with `APS_FAKE_MODELS=on` so no weights are needed. The tests skip on a machine whose GPU is not detected.
+
+* **G1 and G2 together:** a Wan job runs, the controller is killed with SIGKILL mid-render, and the runner script on
+  disk is rewritten so that it would fail. After the restart the job is `SUCCEEDED` once, on attempt 1, with no
+  requeue, and `code_version` names the old snapshot.
+* **G5:** a SeedVR2 upscale is cancelled mid-render. It ends `CANCELLED`, and no task host or render process is left.
+* Both pass 3 runs out of 3.
+* **G3, G4, G6, G7** (2026-10-27, `tests/broker/test_task_gates.py`, same setup):
+  * G3: nats-server stopped and restarted mid-render. The render keeps going; `SUCCEEDED` once, attempt 1, no requeue.
+  * G4: a simulated power cut (controller SIGKILL, task host and render killed, broker restarted, then broker and
+    server back in boot order). Redelivered, run again, `SUCCEEDED` on attempt 2 with exactly one `succeeded` event.
+    Wan and SeedVR2 have no checkpoint (R8), so they restart from the beginning.
+  * G6: two servers on one broker. The worker holding the job is frozen with SIGSTOP past the ack wait, the other
+    worker gets the job too, then the frozen one wakes and its render finishes. Exactly one `succeeded` event, from
+    the claim holder, and still one after the fenced worker has had time to report.
+  * G7: five short jobs while the controller is restarted every 4 s (stop signal and SIGKILL in turn). Each is
+    `SUCCEEDED` once on attempt 1, with no requeue. Overhead is 0.2 s per job once controller downtime is taken out
+    (limit 2 s).
+  * Whole black-box suite: 99 of 99.
+* **Still to do:** real-weight runs on the Mac Studio (`just render-setup`, then `just render-test`; see §8.1) and
+  on B5090. A real power cycle stays a manual check.
+
+### 8.1 Real renders on the Mac Studio (problems 2026_oct_27)
+
+* `just build` installs nats-server when it is missing (Homebrew on macOS), creates this_server.yaml once, and
+  writes the broker config. `just run` starts the broker first if nothing answers on its URL.
+* `just render-setup` runs `build`, `enable queue act3.video_gen_open_source act3.upscale_open_source`, `validate`,
+  then stops and restarts the server on the new build, and ends with `render-check`.
+  * `ai_processing_server enable|disable <service-id|queue>...` is the owner's switch. It edits this_server.yaml as
+    text, keeping comments, and saves a .bak-<time> copy first. init still never rewrites the file.
+  * Implemented in: ~/BGit/act3/ai_processing_server/code/internal/config/enable.go, `SetEnabled`.
+* known_servers.yaml `services_on` makes a fresh init on BMS write both model services as `enabled: true`.
+* A machine that has a model service turned on but the model NOT installed offers 0 parallel for it, with the
+  reason (the missing path and the install guide). It never claims a fleet job it would fail.
+  * Implemented in: ~/BGit/act3/ai_processing_server/code/internal/runners/install.go, `InstallProblems`, read by
+    code/internal/capability/offers.go `ComputeOffers` (`Input.NotInstalled`).
+* `just render-test [all|wan|upscale]` sends one small real job through the queue, the same way the internal web app
+  does: Wan 480x272 with 17 frames and Lightning, then a SeedVR2 3B upscale of that clip to 960x544. It saves both
+  under ~/T/_ai_processing_server/real_render/<time>/ and checks them with ffprobe.
+  * Implemented in: ~/BGit/act3/ai_processing_server/tests/real_render.py, `main`.
+
+## 9. Order of work
+
+1. **Queue adapter** (`code/internal/queue/natsq`, in progress) and `just broker-install` for `nats-server` on B5090,
+   BMS and a Nepal machine.
+2. **Task hosts, snapshots, re-adoption** (task_queue.mdx §9): without them no task can pass G1 or G2, so they come
+   before any real task type.
+3. **First task type: video upscale** on B5090, with `sys.self_test` in TypeScript as the gate rehearsal.
+4. Image generation, then Wan 2.2 video, on B5090; Metal-capable variants on BMS where the models allow.
+5. Nepal machines join (keys, detection, site), then transcription.
+
+## 10. Decisions on the open questions
+
+**Answered 2026-10-27** by the CTO pass, at Bryan's request ("decide all decisions the best you can"). Recorded as
+D-020 in pm/Decisions.yaml. Bryan can overrule any line; each is one config or catalog change to reverse.
+
+1. **Q1. Nepal machines: keys `NPL1`, `NPL2`, `NPL3`**, display names "Nepal 1" to "Nepal 3", `family: office`,
+   `site: nepal_office`, `local_mode: idle_only` (they are dedicated render boxes). Presets are in
+   `data/servers/known_servers.yaml` with placeholder hostnames; hardware is detected by `init` on each machine, never
+   guessed. **Customer data: allowed** for `nepal_office`, because it is ACT3's own office run by our staff, but only
+   after enrollment has verified that the machine has full-disk encryption and its own server key (security.mdx). Until
+   that is verified, the machine runs with `customer_data_allowed: false`.
+2. **Q2. First task: video upscale.** It is what Bryan named, and it is built: `act3.upscale_open_source`, runner
+   `oss_upscale`. `act3.video_merge` is not a gate. It already runs on the v0.1 ffmpeg runner and serves as the
+   CPU smoke test.
+3. **Q3. Wan:** "1, 2.2" means Wan 2.1 and Wan 2.2. **Wan 2.2 A14B (`wan2.2-a14b`) is the built model and the
+   default.** Wan 2.1 is not built and will not be built: 2.2 replaces it at the same VRAM. A job asking for Wan 2.1 is
+   refused as `invalid_input` ("model not built on this server yet"). The next models are LTX and Hunyuan.
+4. **Q4. Task code lives in this repo,** copied in and snapshotted (rule R2). We do not use pinned packages for now:
+   they would add a second versioning system for no gain while ACT3 and this repo are run by the same team. The Wan
+   render script, for example, is copied from `~/BGit/all/film/code/subp/video_gen_ai/` by
+   `code/scripts/sync_from_all.sh`. Heavy engines (the SeedVR2 install, Wan weights, Python environments) stay outside
+   the repo under `~/act3_render/` and change only by a drain (R5).
+5. **Q5. Upscaler: SeedVR2 first** (numz `inference_cli.py`). It has three qualities: `standard` (3B), `best` (7B) and
+   `sharp` (7B Sharp). It runs on CUDA (B5090) and Metal (the Mac Studio), with model id `seedvr2` or
+   `seedvr2-<quality>`. **FlashVSR second**, as a fast preview upscaler on CUDA machines only. **Real-ESRGAN third**, as
+   the cheap fallback for machines under 16 GB VRAM. **Topaz and other vendor upscalers: no** on our servers, because
+   vendor API jobs stay in ACT3 (D-021).
+
+## 11. Source code map
+
+The task contract (envelope, events, job state, claims) and the broker seam are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/queue/queue.go` — `Envelope`, `Event`, `Queue`, `Delivery`, `ClaimHandle`
+
+The NATS JetStream client adapter, including resuming a saved claim after a restart, is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/queue/natsq/natsq.go` — `Open`, `Queue.Pull`, `Queue.Resume`
+
+Running a job in a detached task host that outlives the controller (task.json in, events.jsonl, heartbeat.json and
+exit.json out; a `cancel` file stops the tree) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `Main` (the `taskhost` subcommand), `Launch`, `Watch`, `Alive`, `Cancel`
+
+Freezing the binary, `code/scripts/` and `data/services/` into a content-keyed read-only snapshot before a job starts
+(R1, R2) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/snapshot/snapshot.go` — `Ensure`, `Prune`
+
+When a model runner's job starts, restarts or is re-dispatched after a controller restart: launch a task host from the
+snapshot, re-attach to the live one, or collect what it finished while the controller was down. On a cancel or
+timeout it stops the task; on a controller shutdown it leaves it running. Implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss.go` — `runDetached`, `stopsTheTask` (the `Reattacher` hook is in runner.go)
+
+Wan 2.2 A14B (t2v, i2v; Lightning when installed) for act3.video_gen_open_source is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss_video.go` — `OSSVideo.Check`, `OSSVideo.Run`, `wanTask`
+and the script it runs, a synced copy of the ACT3 original (`code/scripts/sync_from_all.sh`):
+`~/BGit/act3/ai_processing_server/code/scripts/video_gen/wan22/render_wan.py`
+
+SeedVR2 upscaling for act3.upscale_open_source (Mac Studio profile on Metal, RTX 5090 profile on CUDA) is
+implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss_upscale.go` — `OSSUpscale.Check`, `OSSUpscale.Run`, `seedvr2Task`
+
+With `APS_FAKE_MODELS=on` both runners run `code/scripts/fake/fake_render.py` instead of a model (tests, machines
+without weights). Not built: re-adoption of a task host whose job came by direct mode (only queue claims are
+re-dispatched at boot), checkpoints (R8), the G1–G7 gate as integration tests.
+
+The caller side for ACT3 render jobs (the internal web app on a render server) is
+`~/BGit/all/app/code/film/servers/src/processing/` (spec ~/BGit/all/film/pm/subp/backend/servers/servers.mdx §45).
+
+## 12. Upgrade log
+
+* 2026-10-27 (afternoon, problems 2026_oct_27): `just build` installs nats-server; `enable`/`disable` command;
+  `just render-setup`, `render-check`, `render-test`; BMS `services_on`; a not-installed model offers 0 with the reason;
+  gate tests G3, G4, G6, G7 written and green (§8, §8.1). The key git guard ignores a stray `.git` git does not
+  recognise.
+* 2026-10-27 (later): first task types built for the Mac Studio and B5090: `oss_video` (Wan 2.2) and `oss_upscale`
+  (SeedVR2), both in detached task hosts from frozen snapshots (`taskhost`, `snapshot` packages). Both services off by
+  default. §4 status and §11 code map updated.
+* 2026-10-27: written from Bryan's third dictation. Fleet map, API-only rule, task types in order, rules R1 to R15,
+  disk layout, checklist, continuity gate G1 to G7, order of work. D-014 recorded: NATS JetStream as a separate
+  `nats-server` process is decided.

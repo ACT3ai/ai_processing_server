@@ -6,39 +6,55 @@ import (
 	"testing"
 )
 
-func TestEnsureReusesAndGCKeepsInUse(t *testing.T) {
-	dir := t.TempDir()
-	data := filepath.Join(dir, "data")
-	for _, d := range []string{"services", "queue"} {
-		os.MkdirAll(filepath.Join(data, d), 0o700)
-		os.WriteFile(filepath.Join(data, d, "x.yaml"), []byte("a: 1\n"), 0o600)
+func write(t *testing.T, p, s string) {
+	t.Helper()
+	os.MkdirAll(filepath.Dir(p), 0o700)
+	if err := os.WriteFile(p, []byte(s), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	exe := filepath.Join(dir, "bin_a")
-	os.WriteFile(exe, []byte("binary A"), 0o700)
-	root := filepath.Join(dir, "snapshots")
-	a, err := Ensure(root, exe, "abc1234", data)
+}
+
+// A pull that changes a runner script makes a new snapshot; the old one keeps the old script byte for byte.
+func TestPullDoesNotChangeARunningSnapshot(t *testing.T) {
+	root, base := t.TempDir(), t.TempDir()
+	bin := filepath.Join(root, "ai_processing_server")
+	script := filepath.Join(root, "code", "scripts", "video_gen", "wan22", "render_wan.py")
+	write(t, bin, "binary v1")
+	write(t, script, "print('v1')")
+	write(t, filepath.Join(root, "data", "services", "act3.x.yaml"), "id: act3.x")
+	write(t, filepath.Join(root, "code", "scripts", "video_gen", "__pycache__", "x.pyc"), "junk")
+
+	s1, err := Ensure(root, bin, base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b, err := os.ReadFile(a.Binary); err != nil || string(b) != "binary A" {
-		t.Fatalf("snapshot binary %q %v", b, err)
+	again, _ := Ensure(root, bin, base)
+	if again.Key != s1.Key {
+		t.Fatal("same tree, different key")
 	}
-	if _, err := os.Stat(filepath.Join(a.Dir, "data", "services", "x.yaml")); err != nil {
-		t.Fatal("catalogs not copied")
+	write(t, script, "print('v2')") // the git pull
+	s2, err := Ensure(root, bin, base)
+	if err != nil || s2.Key == s1.Key {
+		t.Fatalf("pull not detected: %v", err)
 	}
-	again, err := Ensure(root, exe, "abc1234", data)
-	if err != nil || again.ID != a.ID || !again.CreatedAt.Equal(a.CreatedAt) {
-		t.Fatalf("same binary did not reuse the snapshot: %+v %v", again, err)
+	if b, _ := os.ReadFile(s1.Path("code/scripts/video_gen/wan22/render_wan.py")); string(b) != "print('v1')" {
+		t.Fatalf("old snapshot changed: %q", b)
 	}
-	os.WriteFile(exe, []byte("binary B"), 0o700) // a rebuild on the same commit (dirty tree)
-	b, err := Ensure(root, exe, "abc1234", data)
-	if err != nil || b.ID == a.ID {
-		t.Fatalf("a different binary must get its own snapshot: %v", err)
+	if b, _ := os.ReadFile(s2.Binary()); string(b) != "binary v1" {
+		t.Fatal("binary not copied")
 	}
-	if removed := GC(root, 0, map[string]bool{a.ID: true}); len(removed) != 1 || removed[0] != b.ID {
-		t.Fatalf("GC removed %v; must keep the one in use", removed)
+	if _, err := os.Stat(s1.Path("code/scripts/video_gen/__pycache__/x.pyc")); err == nil {
+		t.Fatal("pycache copied")
 	}
-	if _, err := os.Stat(a.Binary); err != nil {
-		t.Fatal("the in-use snapshot was deleted")
+	if _, err := os.Stat(s1.Path("data/services/act3.x.yaml")); err != nil {
+		t.Fatal("catalog not copied")
+	}
+	write(t, bin, "binary v2") // a rebuild alone is also a new snapshot
+	s3, _ := Ensure(root, bin, base)
+	if s3.Key == s2.Key {
+		t.Fatal("rebuild not detected")
+	}
+	if got := Prune(base, 1, map[string]bool{s1.Key: true}); len(got) != 1 || got[0] != s2.Key {
+		t.Fatalf("prune removed %v", got)
 	}
 }

@@ -1,9 +1,11 @@
-// Package jobs defines a job as this server keeps and reports it: the task envelope it was submitted with, its
-// state, error kinds, outputs, and the on-disk journal (spec §9, §12).
+// Package jobs defines a job on this server: the envelope a platform (or the owner, in direct mode) sends, the
+// record the server keeps, the state machine, error kinds and the on-disk journal (spec §9, §12).
 //
-// The record is a projection of the task queue's own data (pm/task_queue.mdx §13, D-Q1): the envelope is the
-// broker message, the state names and fields are the job_state KV and the events callers read on
-// evt.<caller>.<job_id>. The local API passes them through with no renames (D-008).
+// The local record keeps Asynq's TaskInfo field and state names (id, queue, type, payload, state, max_retry,
+// retried, last_err, ...; pm/Decisions.yaml D-008). The task system is NATS JetStream (D-014), which has no job
+// model of its own, so the caller-facing contract is pm/task_queue.mdx §13.4: every record also carries
+// caller_state (QUEUED, CLAIMED, STAGING, RUNNING, UPLOADING, SUCCEEDED, FAILED, CANCELLED), the same value the
+// queue's job_state and events use. Server-specific fields (stage, progress, priority, outputs) sit alongside.
 package jobs
 
 import (
@@ -15,59 +17,119 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/queue"
 )
 
-// State is the lifecycle state callers see (pm/task_queue.mdx §13.4).
+// State is the task-system state (Asynq names, plus "cancelled").
 type State string
 
 const (
-	Submitted State = queue.StateSubmitted // stored on SUBMIT, waiting for admission
-	Admitted  State = queue.StateAdmitted  // passed admission (momentary; then QUEUED)
-	Queued    State = queue.StateQueued    // on WORK in a band, waiting for a worker with a free slot
-	Claimed   State = queue.StateClaimed   // a worker holds it; its task host is starting
-	Staging   State = queue.StateStaging   // fetching inputs
-	Running   State = queue.StateRunning   // the runner is working
-	Uploading State = queue.StateUploading // delivering outputs
-	Succeeded State = queue.StateSucceeded
-	Failed    State = queue.StateFailed
-	Cancelled State = queue.StateCancelled
-	Expired   State = queue.StateExpired
-	Rejected  State = queue.StateRejected
+	Pending   State = "pending"   // waiting for a slot
+	Active    State = "active"    // holding a slot: staging, running, uploading
+	Retry     State = "retry"     // failed, will run again at next_process_at
+	Completed State = "completed" // done; result and outputs available
+	Archived  State = "archived"  // failed for good (Asynq's name for a dead task)
+	Cancelled State = "cancelled" // stopped on request; nothing uploaded
 )
 
 // Final reports whether no more work will happen for this job.
-func (s State) Final() bool { return queue.FinalState(string(s)) }
+func (s State) Final() bool { return s == Completed || s == Archived || s == Cancelled }
 
-// Holding reports whether the job holds a slot on this machine.
-func (s State) Holding() bool { return s == Claimed || s == Staging || s == Running || s == Uploading }
+// Stage is the server lifecycle position inside a state (spec §9.2).
+type Stage string
 
-// Waiting reports whether the job is in the queue, not yet on a machine.
-func (s State) Waiting() bool { return s == Submitted || s == Admitted || s == Queued }
+const (
+	StageLeased    Stage = "LEASED"
+	StageStaging   Stage = "STAGING"
+	StageRunning   Stage = "RUNNING"
+	StageUploading Stage = "UPLOADING"
+	StageReporting Stage = "REPORTING"
+	StageDone      Stage = "DONE"
+	StageFailed    Stage = "FAILED"
+	StageCancelled Stage = "CANCELLED"
+)
 
 // PlatformStatus maps to ACT3's JobStatus (spec §9.2 table).
-func PlatformStatus(st State) string {
-	switch {
-	case st.Waiting():
+func PlatformStatus(st State, sg Stage) string {
+	switch st {
+	case Pending, Retry:
 		return "INQUEUE"
-	case st.Holding():
+	case Active:
 		return "PROGRESS"
-	case st == Succeeded:
+	case Completed:
 		return "COMPLETED"
-	case st == Cancelled:
+	case Cancelled:
 		return "CANCELLED"
 	default:
 		return "ERROR"
 	}
 }
 
-// The envelope types live in package queue; these names keep runners and storage readable.
-type (
-	Envelope   = queue.Envelope
-	Input      = queue.Input
-	OutputSpec = queue.OutputSpec
-	Upload     = queue.Upload
-	DataRules  = queue.DataRules
-)
+// CallerState maps the local state and stage to the caller-facing lifecycle (pm/task_queue.mdx §13.4).
+func CallerState(st State, sg Stage) string {
+	switch st {
+	case Pending, Retry:
+		return queue.StateQueued
+	case Completed:
+		return queue.StateSucceeded
+	case Cancelled:
+		return queue.StateCancelled
+	case Archived:
+		return queue.StateFailed
+	}
+	switch sg {
+	case StageStaging:
+		return queue.StateStaging
+	case StageRunning:
+		return queue.StateRunning
+	case StageUploading, StageReporting:
+		return queue.StateUploading
+	}
+	return queue.StateClaimed
+}
 
-// Output is one produced file, as reported in the job record and the `succeeded` event.
+// Envelope is what a platform sends (spec §9.1). In direct mode the owner sends the same shape.
+type Envelope struct {
+	JobID           string          `json:"job_id,omitempty"`
+	Platform        string          `json:"platform,omitempty"`
+	Service         string          `json:"service"`
+	PlatformJobType string          `json:"platform_job_type,omitempty"`
+	Priority        int             `json:"priority"`
+	TraceID         string          `json:"trace_id,omitempty"`
+	Tenant          map[string]any  `json:"tenant,omitempty"`
+	Deadline        *time.Time      `json:"deadline,omitempty"`
+	TimeoutSeconds  int64           `json:"timeout_seconds,omitempty"`
+	MaxRetry        *int            `json:"max_retry,omitempty"` // nil: the service catalog's retry.max_attempts − 1
+	Inputs          []Input         `json:"inputs,omitempty"`
+	Params          json.RawMessage `json:"params,omitempty"`
+	Outputs         []OutputSpec    `json:"outputs,omitempty"`
+	DataRules       DataRules       `json:"data_rules"`
+}
+
+// Input is a file the job needs. URL is http(s); Path is a local file (direct mode only).
+type Input struct {
+	Name   string `json:"name"`
+	URL    string `json:"url,omitempty"`
+	Path   string `json:"path,omitempty"`
+	SHA256 string `json:"sha256,omitempty"`
+	Bytes  int64  `json:"bytes,omitempty"`
+}
+
+// OutputSpec says where a named output goes. No Upload: the server keeps it for GET /v1/jobs/{id}/outputs/{name}.
+type OutputSpec struct {
+	Name        string  `json:"name"`
+	ContentType string  `json:"content_type,omitempty"`
+	Upload      *Upload `json:"upload,omitempty"`
+}
+
+type Upload struct {
+	Method string `json:"method"`
+	URL    string `json:"url"`
+}
+
+type DataRules struct {
+	CustomerData      bool `json:"customer_data"`
+	RetainAfterUpload bool `json:"retain_after_upload"`
+}
+
+// Output is one produced file, as reported in the job record.
 type Output struct {
 	Name        string         `json:"name"`
 	File        string         `json:"file"`
@@ -91,56 +153,59 @@ type Slot struct {
 
 // Transition is one entry of a job's history.
 type Transition struct {
-	At      time.Time `json:"at"`
-	State   State     `json:"state"`
-	Attempt int       `json:"attempt,omitempty"`
-	Note    string    `json:"note,omitempty"`
+	At    time.Time `json:"at"`
+	State State     `json:"state"`
+	Stage Stage     `json:"stage"`
+	Note  string    `json:"note,omitempty"`
 }
 
-// Job is the record this server keeps for every job it accepted or claimed, and what the local API returns.
+// Job is the record the server keeps and the API returns.
 type Job struct {
-	ID          string `json:"job_id"`
-	Caller      string `json:"caller"`
-	Category    string `json:"category"`
-	Service     string `json:"service"`
-	Model       string `json:"model,omitempty"`
-	Priority    int    `json:"priority"`
-	Band        string `json:"band,omitempty"`
-	State       State  `json:"state"`
-	Attempt     int    `json:"attempt"`      // deliveries so far (1 while the first attempt runs)
-	MaxAttempts int    `json:"max_attempts"` // from the envelope, else the service catalog
-	Server      string `json:"server,omitempty"`
+	// Asynq TaskInfo-compatible fields.
+	ID            string          `json:"id"`
+	Queue         string          `json:"queue"` // platform: act3 | wtc | direct
+	Type          string          `json:"type"`  // service id
+	Payload       Envelope        `json:"payload"`
+	State         State           `json:"state"`
+	MaxRetry      int             `json:"max_retry"`
+	Retried       int             `json:"retried"`
+	LastErr       string          `json:"last_err,omitempty"`
+	LastFailedAt  *time.Time      `json:"last_failed_at,omitempty"`
+	Timeout       int64           `json:"timeout_seconds"`
+	Deadline      *time.Time      `json:"deadline,omitempty"`
+	NextProcessAt *time.Time      `json:"next_process_at,omitempty"`
+	CompletedAt   *time.Time      `json:"completed_at,omitempty"`
+	Result        json.RawMessage `json:"result,omitempty"`
 
-	PlatformStatus string  `json:"platform_status"`
-	Step           string  `json:"step,omitempty"` // the runner's own step: compute:primes, render, encode
-	Progress       float64 `json:"progress"`
-	Note           string  `json:"note,omitempty"`
+	// Server fields.
+	PlatformStatus    string       `json:"platform_status"`
+	CallerState       string       `json:"caller_state"` // pm/task_queue.mdx §13.4
+	Priority          int          `json:"priority"`
+	EffectivePriority int          `json:"effective_priority"`
+	Stage             Stage        `json:"stage"`
+	Step              string       `json:"step,omitempty"` // the runner's own step: compute:primes, render, encode
+	Progress          float64      `json:"progress"`
+	Note              string       `json:"note,omitempty"`
+	ErrorKind         ErrorKind    `json:"error_kind,omitempty"`
+	ErrorStage        Stage        `json:"error_stage,omitempty"`
+	CreatedAt         time.Time    `json:"created_at"`
+	StartedAt         *time.Time   `json:"started_at,omitempty"`
+	FinishedAt        *time.Time   `json:"finished_at,omitempty"`
+	Slot              *Slot        `json:"slot,omitempty"`
+	Outputs           []Output     `json:"outputs,omitempty"`
+	History           []Transition `json:"history"`
 
-	ErrorKind    ErrorKind `json:"error_kind,omitempty"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	ErrorStage   State     `json:"error_stage,omitempty"`
-
-	CreatedAt        time.Time  `json:"created_at"`
-	StartedAt        *time.Time `json:"started_at,omitempty"`
-	FinishedAt       *time.Time `json:"finished_at,omitempty"`
-	NextAttemptAfter *time.Time `json:"next_attempt_after,omitempty"`
-	Deadline         *time.Time `json:"deadline,omitempty"`
-	TimeoutSeconds   int64      `json:"timeout_seconds"`
-
-	CodeVersion string          `json:"code_version,omitempty"` // the snapshot that ran it (§9.2)
-	Outputs     []Output        `json:"outputs,omitempty"`
-	Result      json.RawMessage `json:"result,omitempty"`
-	Seq         int64           `json:"events_seq"` // last event seq published for this job
-	Slot        *Slot           `json:"slot,omitempty"`
-	Envelope    Envelope        `json:"envelope"`
-	History     []Transition    `json:"history"`
+	// Claim is set when the job came from the task queue: the broker claim this server holds, saved in the
+	// journal so a restarted process can settle it at once instead of waiting out the ack wait (task_queue.mdx §9.4).
+	Claim *queue.ClaimHandle `json:"claim,omitempty"`
 }
 
-// Move records a state change in the history.
-func (j *Job) Move(st State, note string) {
-	j.State = st
-	j.PlatformStatus = PlatformStatus(st)
-	j.History = append(j.History, Transition{At: time.Now().UTC(), State: st, Attempt: j.Attempt, Note: note})
+// Move records a state/stage change in the history.
+func (j *Job) Move(st State, sg Stage, note string) {
+	j.State, j.Stage = st, sg
+	j.PlatformStatus = PlatformStatus(st, sg)
+	j.CallerState = CallerState(st, sg)
+	j.History = append(j.History, Transition{At: time.Now().UTC(), State: st, Stage: sg, Note: note})
 }
 
 // Clone returns a deep-enough copy for handing out of the scheduler lock.
@@ -148,11 +213,15 @@ func (j *Job) Clone() *Job {
 	c := *j
 	c.Outputs = append([]Output(nil), j.Outputs...)
 	c.History = append([]Transition(nil), j.History...)
-	c.Envelope.Inputs = append([]Input(nil), j.Envelope.Inputs...)
-	c.Envelope.Outputs = append([]OutputSpec(nil), j.Envelope.Outputs...)
+	c.Payload.Inputs = append([]Input(nil), j.Payload.Inputs...)
+	c.Payload.Outputs = append([]OutputSpec(nil), j.Payload.Outputs...)
 	if j.Slot != nil {
 		s := *j.Slot
 		c.Slot = &s
+	}
+	if j.Claim != nil {
+		h := *j.Claim
+		c.Claim = &h
 	}
 	return &c
 }
@@ -160,23 +229,18 @@ func (j *Job) Clone() *Job {
 // Redacted strips signed query strings from every URL, for the API and logs (spec §16.1).
 func (j *Job) Redacted() *Job {
 	c := j.Clone()
-	RedactEnvelope(&c.Envelope)
+	for i := range c.Payload.Inputs {
+		c.Payload.Inputs[i].URL = logging.RedactURL(c.Payload.Inputs[i].URL)
+	}
+	for i := range c.Payload.Outputs {
+		if u := c.Payload.Outputs[i].Upload; u != nil {
+			c.Payload.Outputs[i].Upload = &Upload{Method: u.Method, URL: logging.RedactURL(u.URL)}
+		}
+	}
 	return c
 }
 
-// RedactEnvelope strips signed query strings from an envelope's URLs in place.
-func RedactEnvelope(e *Envelope) {
-	for i := range e.Inputs {
-		e.Inputs[i].URL = logging.RedactURL(e.Inputs[i].URL)
-	}
-	for i := range e.Outputs {
-		if u := e.Outputs[i].Upload; u != nil {
-			e.Outputs[i].Upload = &Upload{Method: u.Method, URL: logging.RedactURL(u.URL)}
-		}
-	}
-}
-
-// ErrorKind classifies every failure once, at the runner boundary (spec §12.2, pm/task_queue.mdx §13.6).
+// ErrorKind classifies every failure once, at the runner boundary (spec §12.2).
 type ErrorKind string
 
 const (
@@ -187,11 +251,6 @@ const (
 	KindInfra         ErrorKind = "infra"
 	KindInternal      ErrorKind = "internal"
 	KindCancelled     ErrorKind = "cancelled"
-	KindExpired       ErrorKind = "expired"
-	// Admission rejections (§13.6).
-	KindNotAllowed   ErrorKind = "caller_not_allowed"
-	KindNoCapable    ErrorKind = "no_capable_server"
-	KindBadSignature ErrorKind = "bad_signature"
 )
 
 // Error is a classified job failure.

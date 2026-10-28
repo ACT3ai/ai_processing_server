@@ -1,9 +1,6 @@
-// Package natsq is the NATS JetStream adapter behind queue.Queue (pm/task_queue.mdx §13). It is only a client: the
-// nats-server runs as its own OS service (§8.2) and outlives this process, so queued jobs and claims survive every
-// controller restart.
-//
-// Claims are held through ack subjects ($JS.ACK...), which are not tied to the connection that received the job:
-// a restarted controller keeps the same claim by publishing to the stored subject (§9.4).
+// Package natsq is the NATS JetStream adapter behind queue.Queue (pm/task_queue.mdx §13, D-014). It is a client of
+// this machine's own nats-server service; it never embeds a server. Streams and KV buckets follow §13.1 and are
+// created (or updated) on Open, so a fresh nats-server needs nothing but JetStream turned on.
 package natsq
 
 import (
@@ -11,400 +8,322 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/queue"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-var elog = errlog.For("natsq")
+// Stream and bucket names (§13.1).
+const (
+	StreamWork    = "WORK"
+	StreamEvents  = "EVENTS"
+	StreamDead    = "DEAD"
+	BucketState   = "job_state"
+	BucketControl = "job_control"
+	BucketServers = "servers"
+)
 
-// StreamDef and KVDef mirror data/queue/streams.yaml.
-type StreamDef struct {
-	Name            string        `yaml:"name"`
-	Subjects        []string      `yaml:"subjects"`
-	Retention       string        `yaml:"retention"` // workqueue | limits
-	MaxAge          time.Duration `yaml:"max_age"`
-	DuplicateWindow time.Duration `yaml:"duplicate_window"`
-}
+// MinServerVersion is the oldest nats-server this adapter supports (work-queue streams, KV, NAK with delay).
+const MinServerVersion = "2.10.0"
 
-type KVDef struct {
-	Bucket  string        `yaml:"bucket"`
-	TTL     time.Duration `yaml:"ttl"`
-	History int           `yaml:"history"`
-}
-
-// Options open a connection.
+// Options configure Open.
 type Options struct {
-	URL        string
-	Name       string // connection name, shown by the broker's monitoring
-	CredsFile  string // optional NATS .creds file (phase Q3 accounts)
-	AckWait    time.Duration
-	MaxDeliver int
-	Streams    []StreamDef
-	KV         []KVDef
-	Logger     *slog.Logger
+	URL             string        // nats://127.0.0.1:4222
+	CredentialsFile string        // NATS .creds file (decentralized auth, §15.2); empty for a local standalone broker
+	Name            string        // connection name, shows in nats-server's connz
+	AckWait         time.Duration // how long a claim lasts without InProgress (continuity.ack_wait, default 5m)
+	Replicas        int           // stream replicas (1 standalone, 3 on a hub cluster)
+	ConnectTimeout  time.Duration
 }
 
-// Q implements queue.Queue over one NATS connection.
-type Q struct {
-	o    Options
-	nc   *nats.Conn
-	js   jetstream.JetStream
-	kv   map[string]jetstream.KeyValue
-	log  *slog.Logger
-	mu   sync.Mutex
-	cons map[string]jetstream.Consumer
-	adm  jetstream.Consumer
+// Queue is a connected adapter. It is safe for concurrent use.
+type Queue struct {
+	opt      Options
+	nc       *nats.Conn
+	js       jetstream.JetStream
+	work     jetstream.Stream
+	state    jetstream.KeyValue
+	control  jetstream.KeyValue
+	servers  jetstream.KeyValue
+	mu       sync.Mutex
+	consumer map[string]jetstream.Consumer
 }
 
-var _ queue.Queue = (*Q)(nil)
-
-// Open connects, checks JetStream, and creates or updates every stream and bucket in o. It fails fast (2 s) when
-// the broker is not running, wrapping queue.ErrBrokerAbsent, so the caller can report `broker_missing`.
-func Open(ctx context.Context, o Options) (*Q, error) {
+// Open connects to the broker, checks its version and JetStream, and makes sure every stream and bucket exists.
+func Open(ctx context.Context, o Options) (*Queue, error) {
 	if o.AckWait <= 0 {
 		o.AckWait = 5 * time.Minute
 	}
-	if o.MaxDeliver == 0 {
-		o.MaxDeliver = 10
+	if o.Replicas <= 0 {
+		o.Replicas = 1
 	}
-	if o.Logger == nil {
-		o.Logger = slog.Default()
+	if o.ConnectTimeout <= 0 {
+		o.ConnectTimeout = 3 * time.Second
 	}
-	log := o.Logger.With("ctx", "natsq")
-	opts := []nats.Option{
-		nats.Name(o.Name), nats.Timeout(2 * time.Second), nats.MaxReconnects(-1), nats.ReconnectWait(time.Second),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			if err != nil {
-				log.Warn("broker connection lost; reconnecting", "error", err)
-			}
-		}),
-		nats.ReconnectHandler(func(c *nats.Conn) { log.Info("broker reconnected", "url", c.ConnectedUrlRedacted()) }),
-	}
-	if o.CredsFile != "" {
-		opts = append(opts, nats.UserCredentials(o.CredsFile))
+	opts := []nats.Option{nats.Name(o.Name), nats.Timeout(o.ConnectTimeout), nats.MaxReconnects(-1),
+		nats.ReconnectWait(time.Second), nats.RetryOnFailedConnect(false)}
+	if o.CredentialsFile != "" {
+		opts = append(opts, nats.UserCredentials(o.CredentialsFile))
 	}
 	nc, err := nats.Connect(o.URL, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("%w at %s: %v", queue.ErrBrokerAbsent, o.URL, err)
+		return nil, fmt.Errorf("%w: cannot connect to nats-server at %s: %v", queue.ErrUnavailable, o.URL, err)
 	}
-	js, err := jetstream.New(nc)
-	if err != nil {
-		nc.Close()
-		return nil, err
-	}
-	q := &Q{o: o, nc: nc, js: js, kv: map[string]jetstream.KeyValue{}, log: log, cons: map[string]jetstream.Consumer{}}
-	if err := q.ensure(ctx); err != nil {
+	q := &Queue{opt: o, nc: nc, consumer: map[string]jetstream.Consumer{}}
+	if err := q.setup(ctx); err != nil {
 		nc.Close()
 		return nil, err
 	}
 	return q, nil
 }
 
-func (q *Q) ensure(ctx context.Context) error {
-	if _, err := q.js.AccountInfo(ctx); err != nil {
-		return fmt.Errorf("the broker at %s has no JetStream (start it with the config from `just broker-config`): %w", q.o.URL, err)
+func (q *Queue) setup(ctx context.Context) error {
+	if v := q.nc.ConnectedServerVersion(); !VersionAtLeast(v, MinServerVersion) {
+		return fmt.Errorf("%w: nats-server %s at %s is older than %s", queue.ErrUnavailable, v, q.opt.URL, MinServerVersion)
 	}
-	for _, s := range q.o.Streams {
-		cfg := jetstream.StreamConfig{Name: s.Name, Subjects: s.Subjects, Storage: jetstream.FileStorage,
-			MaxAge: s.MaxAge, Duplicates: s.DuplicateWindow, MaxMsgSize: 1 << 20}
-		if s.Retention == "workqueue" {
-			cfg.Retention = jetstream.WorkQueuePolicy
-		}
-		if _, err := q.js.CreateOrUpdateStream(ctx, cfg); err != nil {
-			return fmt.Errorf("stream %s: %w", s.Name, err)
-		}
+	js, err := jetstream.New(q.nc)
+	if err != nil {
+		return err
 	}
-	for _, k := range q.o.KV {
-		kv, err := q.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: k.Bucket, TTL: k.TTL,
-			History: uint8(max(k.History, 1)), Storage: jetstream.FileStorage})
+	if _, err := js.AccountInfo(ctx); err != nil {
+		return fmt.Errorf("%w: JetStream is not enabled on nats-server at %s (start it with -js or jetstream {} in its config): %v",
+			queue.ErrUnavailable, q.opt.URL, err)
+	}
+	q.js = js
+	streams := []jetstream.StreamConfig{
+		{Name: StreamWork, Subjects: []string{"work.>"}, Retention: jetstream.WorkQueuePolicy,
+			Duplicates: 2 * time.Hour, MaxMsgSize: queue.MaxEnvelopeBytes + 4096, Replicas: q.opt.Replicas,
+			Description: "admitted jobs waiting for a worker (task_queue.mdx §13.1)"},
+		{Name: StreamEvents, Subjects: []string{"evt.>"}, Retention: jetstream.LimitsPolicy, MaxAge: 7 * 24 * time.Hour,
+			Replicas: q.opt.Replicas, Description: "lifecycle events and results per job"},
+		{Name: StreamDead, Subjects: []string{"dead.>"}, Retention: jetstream.LimitsPolicy, MaxAge: 30 * 24 * time.Hour,
+			Replicas: q.opt.Replicas, Description: "jobs that exhausted their attempts or failed for good"},
+	}
+	for _, cfg := range streams {
+		s, err := js.CreateOrUpdateStream(ctx, cfg)
 		if err != nil {
-			return fmt.Errorf("kv %s: %w", k.Bucket, err)
+			return fmt.Errorf("creating stream %s: %w", cfg.Name, err)
 		}
-		q.kv[k.Bucket] = kv
+		if cfg.Name == StreamWork {
+			q.work = s
+		}
+	}
+	kvs := []struct {
+		dst *jetstream.KeyValue
+		cfg jetstream.KeyValueConfig
+	}{
+		{&q.state, jetstream.KeyValueConfig{Bucket: BucketState, TTL: 30 * 24 * time.Hour, History: 1, Replicas: q.opt.Replicas}},
+		{&q.control, jetstream.KeyValueConfig{Bucket: BucketControl, TTL: 7 * 24 * time.Hour, History: 1, Replicas: q.opt.Replicas}},
+		{&q.servers, jetstream.KeyValueConfig{Bucket: BucketServers, TTL: 90 * time.Second, History: 1, Replicas: q.opt.Replicas}},
+	}
+	for _, k := range kvs {
+		kv, err := js.CreateOrUpdateKeyValue(ctx, k.cfg)
+		if err != nil {
+			return fmt.Errorf("creating KV bucket %s: %w", k.cfg.Bucket, err)
+		}
+		*k.dst = kv
 	}
 	return nil
 }
 
-func (q *Q) bucket(name string) (jetstream.KeyValue, error) {
-	kv := q.kv[name]
-	if kv == nil {
-		return nil, fmt.Errorf("kv bucket %s is not in data/queue/streams.yaml", name)
-	}
-	return kv, nil
-}
-
-// Info implements queue.Queue.
-func (q *Q) Info() queue.BrokerInfo {
-	return queue.BrokerInfo{Kind: "nats", URL: q.o.URL, Connected: q.nc.IsConnected(), Version: q.nc.ConnectedServerVersion()}
-}
-
-func (q *Q) Close() error {
-	// Drain would nack nothing either way; Close leaves every held claim with the broker (§9.5).
+// Close drains nothing: claims are kept by the broker until their ack wait, which is the point (§9).
+func (q *Queue) Close() error {
 	q.nc.Close()
 	return nil
 }
 
-// ---- submission and admission ----
-
-func headers(env *queue.Envelope) nats.Header {
-	h := nats.Header{}
-	h.Set("X-Caller", env.Caller)
-	h.Set("X-Category", env.Category)
-	h.Set("X-Service", env.Service)
-	h.Set("X-Model", env.Model)
-	h.Set("X-Priority", strconv.Itoa(env.Priority))
-	h.Set("X-Trace-Id", env.TraceID)
-	h.Set("X-Envelope-Version", strconv.Itoa(env.EnvelopeVersion))
-	return h
-}
-
-func (q *Q) Submit(ctx context.Context, env *queue.Envelope) (queue.SubmitAck, error) {
-	if err := env.Validate(); err != nil {
+// Submit publishes the envelope to its lane. Standalone admission is inline: the band comes from the priority
+// (§14.2). Hub admission (signatures, caller policy, SUBMIT stream) is build phase Q2/Q3.
+func (q *Queue) Submit(ctx context.Context, env *queue.Envelope) (queue.SubmitAck, error) {
+	if err := env.Normalize(time.Now()); err != nil {
 		return queue.SubmitAck{}, err
 	}
-	b, err := json.Marshal(env)
+	data, err := json.Marshal(env)
 	if err != nil {
 		return queue.SubmitAck{}, err
 	}
-	m := &nats.Msg{Subject: queue.SubmitSubject(env.Caller, env.Category), Data: b, Header: headers(env)}
-	ack, err := q.js.PublishMsg(ctx, m, jetstream.WithMsgID(env.JobID))
-	if err != nil {
-		return queue.SubmitAck{}, err
+	if len(data) > queue.MaxEnvelopeBytes {
+		return queue.SubmitAck{}, fmt.Errorf("%w: envelope is %d bytes; the limit is %d (pass big params by URL)", queue.ErrInvalid, len(data), queue.MaxEnvelopeBytes)
 	}
-	return queue.SubmitAck{Stream: ack.Stream, Seq: ack.Sequence, Duplicate: ack.Duplicate}, nil
+	ref := queue.ConsumerRef{Band: queue.BandFor(env.Priority), Caller: env.Caller, Service: env.Service}
+	m := nats.NewMsg(ref.Subject())
+	m.Data = data
+	m.Header.Set(jetstream.MsgIDHeader, env.JobID)
+	m.Header.Set("X-Caller", env.Caller)
+	m.Header.Set("X-Category", env.Category)
+	m.Header.Set("X-Service", env.Service)
+	m.Header.Set("X-Model", env.Model)
+	m.Header.Set("X-Priority", strconv.Itoa(env.Priority))
+	m.Header.Set("X-Trace-Id", env.TraceID)
+	m.Header.Set("X-Envelope-Version", strconv.Itoa(env.EnvelopeVersion))
+	m.Header.Set("X-Band", ref.Band)
+	m.Header.Set("X-Admitted-At", time.Now().UTC().Format(time.RFC3339Nano))
+	ack, err := q.js.PublishMsg(ctx, m)
+	if err != nil {
+		return queue.SubmitAck{}, q.unavailable("publishing a job", err)
+	}
+	return queue.SubmitAck{JobID: env.JobID, Band: ref.Band, Subject: ref.Subject(), Sequence: ack.Sequence, Duplicate: ack.Duplicate}, nil
 }
 
-func (q *Q) admission(ctx context.Context) (jetstream.Consumer, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.adm != nil {
-		return q.adm, nil
-	}
-	c, err := q.js.CreateOrUpdateConsumer(ctx, "SUBMIT", jetstream.ConsumerConfig{Durable: "admission",
-		AckPolicy: jetstream.AckExplicitPolicy, AckWait: 30 * time.Second, FilterSubject: "submit.>", MaxDeliver: -1})
-	if err != nil {
-		return nil, err
-	}
-	q.adm = c
-	return c, nil
-}
-
-type submission struct{ m jetstream.Msg }
-
-func (s submission) Envelope() (*queue.Envelope, error) {
-	var env queue.Envelope
-	if err := json.Unmarshal(s.m.Data(), &env); err != nil {
-		return nil, err
-	}
-	return &env, nil
-}
-func (s submission) Ack(ctx context.Context) error  { return s.m.DoubleAck(ctx) }
-func (s submission) Term(ctx context.Context) error { return s.m.Term() }
-
-func (q *Q) NextSubmission(ctx context.Context, wait time.Duration) (queue.Submission, error) {
-	c, err := q.admission(ctx)
-	if err != nil {
-		return nil, err
-	}
-	batch, err := c.Fetch(1, jetstream.FetchMaxWait(max(wait, 10*time.Millisecond)))
-	if err != nil {
-		return nil, err
-	}
-	for m := range batch.Messages() {
-		return submission{m}, nil
-	}
-	if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
-		return nil, err
-	}
-	return nil, queue.ErrNoWork
-}
-
-func (q *Q) Enqueue(ctx context.Context, env *queue.Envelope, band string) error {
-	b, err := json.Marshal(env)
-	if err != nil {
-		return err
-	}
-	ref := queue.ConsumerRef{Band: band, Caller: env.Caller, Service: env.Service}
-	if _, err := q.consumer(ctx, ref); err != nil {
-		return err
-	}
-	h := headers(env)
-	h.Set("X-Band", band)
-	h.Set("X-Admitted-At", time.Now().UTC().Format(time.RFC3339Nano))
-	_, err = q.js.PublishMsg(ctx, &nats.Msg{Subject: ref.Subject(), Data: b, Header: h}, jetstream.WithMsgID(env.JobID+".w"))
-	return err
-}
-
-// ---- work ----
-
-func (q *Q) consumer(ctx context.Context, ref queue.ConsumerRef) (jetstream.Consumer, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if c := q.cons[ref.Name()]; c != nil {
-		return c, nil
-	}
-	c, err := q.js.CreateOrUpdateConsumer(ctx, "WORK", jetstream.ConsumerConfig{Durable: ref.Name(), FilterSubject: ref.Subject(),
-		AckPolicy: jetstream.AckExplicitPolicy, AckWait: q.o.AckWait, MaxDeliver: q.o.MaxDeliver, MaxAckPending: -1})
-	if err != nil {
-		return nil, fmt.Errorf("work consumer %s: %w", ref.Name(), err)
-	}
-	q.cons[ref.Name()] = c
-	return c, nil
-}
-
-func (q *Q) Depth(ctx context.Context) (map[queue.ConsumerRef]int, error) {
-	s, err := q.js.Stream(ctx, "WORK")
-	if err != nil {
-		return nil, err
-	}
-	info, err := s.Info(ctx, jetstream.WithSubjectFilter("work.>"))
-	if err != nil {
-		return nil, err
-	}
-	out := map[queue.ConsumerRef]int{}
-	for subj, n := range info.State.Subjects {
-		if ref, ok := queue.ParseWorkSubject(subj); ok {
-			out[ref] = int(n)
+// Pull looks at which lanes hold messages (one stream info call), then fetches from the first lane in order that
+// has work. A lane whose messages are all claimed by other workers returns nothing and the next lane is tried.
+func (q *Queue) Pull(ctx context.Context, order []queue.ConsumerRef, wait time.Duration) (queue.Delivery, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		d, err := q.pullOnce(ctx, order)
+		if d != nil || err != nil || wait <= 0 || time.Now().After(deadline) {
+			return d, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(min(250*time.Millisecond, time.Until(deadline))):
 		}
 	}
-	return out, nil
 }
 
-func (q *Q) Pull(ctx context.Context, order []queue.ConsumerRef, wait time.Duration) (queue.Delivery, error) {
-	depth, err := q.Depth(ctx)
+func (q *Queue) pullOnce(ctx context.Context, order []queue.ConsumerRef) (queue.Delivery, error) {
+	waiting, err := q.waiting(ctx)
 	if err != nil {
 		return nil, err
 	}
 	for _, ref := range order {
-		if depth[ref] == 0 {
+		if waiting[ref.Subject()] == 0 {
 			continue
 		}
-		c, err := q.consumer(ctx, ref)
+		c, err := q.consumerFor(ctx, ref)
 		if err != nil {
 			return nil, err
 		}
 		batch, err := c.FetchNoWait(1)
 		if err != nil {
-			return nil, err
+			return nil, q.unavailable("fetching from "+ref.Durable(), err)
 		}
-		for m := range batch.Messages() {
-			md, err := m.Metadata()
-			if err != nil {
-				return nil, err
-			}
-			var env queue.Envelope
-			if err := json.Unmarshal(m.Data(), &env); err != nil {
-				// Not ours to run: stop it being delivered again, and say so.
-				elog.Error("decoding a work message", err, "subject", m.Subject())
-				_ = m.Term()
-				continue
-			}
-			return &delivery{q: q, env: &env, h: queue.ClaimHandle{JobID: env.JobID, AckSubject: m.Reply(), Attempt: int(md.NumDelivered)}}, nil
+		for msg := range batch.Messages() {
+			return q.toDelivery(msg)
+		}
+		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, jetstream.ErrNoMessages) {
+			return nil, q.unavailable("fetching from "+ref.Durable(), err)
 		}
 	}
-	return nil, queue.ErrNoWork
+	return nil, nil
 }
 
-func (q *Q) Resume(_ context.Context, h queue.ClaimHandle, env *queue.Envelope) (queue.Delivery, error) {
-	if !strings.HasPrefix(h.AckSubject, "$JS.ACK.") {
-		return nil, fmt.Errorf("claim handle for %s has no ack subject", h.JobID)
-	}
-	return &delivery{q: q, env: env, h: h}, nil
-}
-
-// delivery works only through the ack subject, so a fresh delivery and a resumed one behave the same.
-type delivery struct {
-	q   *Q
-	env *queue.Envelope
-	h   queue.ClaimHandle
-}
-
-func (d *delivery) Envelope() *queue.Envelope { return d.env }
-func (d *delivery) Attempt() int              { return d.h.Attempt }
-func (d *delivery) Handle() queue.ClaimHandle { return d.h }
-
-func (d *delivery) InProgress(context.Context) error {
-	return d.q.nc.Publish(d.h.AckSubject, []byte("+WPI"))
-}
-
-// ack sends a control payload and waits for the broker's confirmation (a double ack).
-func (d *delivery) ack(ctx context.Context, payload string) error {
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-	}
-	_, err := d.q.nc.RequestWithContext(ctx, d.h.AckSubject, []byte(payload))
-	return err
-}
-
-func (d *delivery) Ack(ctx context.Context) error { return d.ack(ctx, "+ACK") }
-
-func (d *delivery) Requeue(ctx context.Context, delay time.Duration) error {
-	if delay <= 0 {
-		return d.ack(ctx, "-NAK")
-	}
-	return d.ack(ctx, fmt.Sprintf(`-NAK {"delay": %d}`, delay.Nanoseconds()))
-}
-
-func (d *delivery) Dead(ctx context.Context, reason string) error {
-	b, err := json.Marshal(d.env)
+// waiting returns work subject → stored messages (queued or claimed but not yet acked).
+func (q *Queue) waiting(ctx context.Context) (map[string]uint64, error) {
+	info, err := q.work.Info(ctx, jetstream.WithSubjectFilter("work.>"))
 	if err != nil {
-		return err
+		return nil, q.unavailable("reading the WORK stream", err)
 	}
-	h := headers(d.env)
-	h.Set("X-Dead-Reason", reason)
-	h.Set("X-Attempts", strconv.Itoa(d.h.Attempt))
-	if _, err := d.q.js.PublishMsg(ctx, &nats.Msg{Subject: queue.DeadSubject(d.env.Caller, d.env.Service), Data: b, Header: h},
-		jetstream.WithMsgID(d.env.JobID+".dead")); err != nil {
-		return err
-	}
-	return d.ack(ctx, "+TERM "+reason)
+	return info.State.Subjects, nil
 }
 
-// ---- events ----
-
-func (q *Q) Publish(ctx context.Context, ev *queue.Event) error {
-	b, err := json.Marshal(ev)
+func (q *Queue) consumerFor(ctx context.Context, ref queue.ConsumerRef) (jetstream.Consumer, error) {
+	q.mu.Lock()
+	c, ok := q.consumer[ref.Durable()]
+	q.mu.Unlock()
+	if ok {
+		return c, nil
+	}
+	c, err := q.work.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable: ref.Durable(), FilterSubject: ref.Subject(), AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait: q.opt.AckWait, MaxDeliver: -1, MaxAckPending: 10000, InactiveThreshold: 0,
+		Description: "shared work lane " + ref.Subject(),
+	})
 	if err != nil {
-		return err
+		return nil, q.unavailable("creating consumer "+ref.Durable(), err)
 	}
-	_, err = q.js.PublishMsg(ctx, &nats.Msg{Subject: queue.EventSubject(ev.Caller, ev.JobID), Data: b},
-		jetstream.WithMsgID(ev.JobID+"."+strconv.FormatInt(ev.Seq, 10)))
-	return err
+	q.mu.Lock()
+	q.consumer[ref.Durable()] = c
+	q.mu.Unlock()
+	return c, nil
 }
 
-func (q *Q) Events(ctx context.Context, caller, jobID string) ([]queue.Event, error) {
-	subj := queue.EventSubject(caller, jobID)
-	s, err := q.js.Stream(ctx, "EVENTS")
+func (q *Queue) toDelivery(msg jetstream.Msg) (queue.Delivery, error) {
+	var env queue.Envelope
+	if err := json.Unmarshal(msg.Data(), &env); err != nil {
+		// A message nobody can read must not loop forever: terminate it and say so.
+		_ = msg.Term()
+		return nil, fmt.Errorf("work message on %s is not a task envelope (terminated): %w", msg.Subject(), err)
+	}
+	attempt := 1
+	if md, err := msg.Metadata(); err == nil {
+		attempt = int(md.NumDelivered)
+	}
+	return &delivery{q: q, env: &env, data: msg.Data(), h: queue.ClaimHandle{JobID: env.JobID, Caller: env.Caller,
+		Service: env.Service, AckSubject: msg.Reply(), Attempt: attempt}}, nil
+}
+
+// Resume rebuilds a delivery from its ack subject: the stream sequence in it locates the original message.
+func (q *Queue) Resume(ctx context.Context, h queue.ClaimHandle) (queue.Delivery, error) {
+	ack, err := ParseAckSubject(h.AckSubject)
 	if err != nil {
 		return nil, err
+	}
+	raw, err := q.work.GetMsg(ctx, ack.StreamSeq)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			return nil, fmt.Errorf("%w: job %s is no longer in the WORK stream (acked, or redelivered and finished elsewhere)", queue.ErrNotFound, h.JobID)
+		}
+		return nil, q.unavailable("reading a claimed job", err)
+	}
+	var env queue.Envelope
+	if err := json.Unmarshal(raw.Data, &env); err != nil {
+		return nil, err
+	}
+	if env.JobID != h.JobID {
+		return nil, fmt.Errorf("%w: WORK sequence %d holds job %s, not %s", queue.ErrNotFound, ack.StreamSeq, env.JobID, h.JobID)
+	}
+	return &delivery{q: q, env: &env, data: raw.Data, h: h}, nil
+}
+
+// Publish writes one event to evt.<caller>.<job_id>. The message id (job, seq) makes a repeated final event a no-op.
+func (q *Queue) Publish(ctx context.Context, ev *queue.Event) error {
+	if ev.At.IsZero() {
+		ev.At = time.Now().UTC()
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	m := nats.NewMsg(queue.EventSubject(ev.Caller, ev.JobID))
+	m.Data = data
+	m.Header.Set(jetstream.MsgIDHeader, ev.JobID+"#"+strconv.FormatInt(ev.Seq, 10))
+	if _, err := q.js.PublishMsg(ctx, m); err != nil {
+		return q.unavailable("publishing an event", err)
+	}
+	return nil
+}
+
+// Events reads the job's events with an ordered consumer from the start of its subject.
+func (q *Queue) Events(ctx context.Context, caller, jobID string) ([]queue.Event, error) {
+	subj := queue.EventSubject(caller, jobID)
+	s, err := q.js.Stream(ctx, StreamEvents)
+	if err != nil {
+		return nil, q.unavailable("opening the EVENTS stream", err)
 	}
 	info, err := s.Info(ctx, jetstream.WithSubjectFilter(subj))
 	if err != nil {
-		return nil, err
+		return nil, q.unavailable("reading the EVENTS stream", err)
 	}
 	n := int(info.State.Subjects[subj])
 	if n == 0 {
-		return []queue.Event{}, nil
+		return nil, nil
 	}
-	c, err := s.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{FilterSubjects: []string{subj}})
+	c, err := q.js.OrderedConsumer(ctx, StreamEvents, jetstream.OrderedConsumerConfig{FilterSubjects: []string{subj}})
 	if err != nil {
-		return nil, err
+		return nil, q.unavailable("reading events", err)
 	}
-	out := make([]queue.Event, 0, n)
+	var out []queue.Event
 	for len(out) < n {
 		batch, err := c.Fetch(n-len(out), jetstream.FetchMaxWait(2*time.Second))
 		if err != nil {
-			return out, err
+			return out, q.unavailable("reading events", err)
 		}
 		got := 0
 		for m := range batch.Messages() {
@@ -421,103 +340,99 @@ func (q *Q) Events(ctx context.Context, caller, jobID string) ([]queue.Event, er
 	return out, nil
 }
 
-// ---- job_state and job_control ----
-
-func (q *Q) CreateState(ctx context.Context, s queue.JobState) (uint64, error) {
-	kv, err := q.bucket("job_state")
-	if err != nil {
-		return 0, err
-	}
-	b, _ := json.Marshal(s)
-	rev, err := kv.Create(ctx, s.JobID, b)
-	if errors.Is(err, jetstream.ErrKeyExists) {
-		return 0, queue.ErrExists
-	}
-	return rev, err
-}
-
-func (q *Q) State(ctx context.Context, jobID string) (queue.JobState, uint64, error) {
-	kv, err := q.bucket("job_state")
-	if err != nil {
-		return queue.JobState{}, 0, err
-	}
-	e, err := kv.Get(ctx, jobID)
+// State reads job_state.
+func (q *Queue) State(ctx context.Context, jobID string) (queue.JobState, uint64, error) {
+	e, err := q.state.Get(ctx, jobID)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
 		return queue.JobState{}, 0, queue.ErrNotFound
 	}
 	if err != nil {
-		return queue.JobState{}, 0, err
+		return queue.JobState{}, 0, q.unavailable("reading job_state", err)
 	}
 	var s queue.JobState
 	if err := json.Unmarshal(e.Value(), &s); err != nil {
-		return queue.JobState{}, 0, err
+		return queue.JobState{}, 0, fmt.Errorf("job_state %s is not JSON: %w", jobID, err)
 	}
 	return s, e.Revision(), nil
 }
 
-func (q *Q) CASState(ctx context.Context, s queue.JobState, rev uint64) (uint64, error) {
-	kv, err := q.bucket("job_state")
+// CASState writes job_state only if its revision is still rev (0: only if absent).
+func (q *Queue) CASState(ctx context.Context, s queue.JobState, rev uint64) (uint64, error) {
+	if s.UpdatedAt.IsZero() {
+		s.UpdatedAt = time.Now().UTC()
+	}
+	data, err := json.Marshal(s)
 	if err != nil {
 		return 0, err
 	}
-	s.UpdatedAt = time.Now().UTC()
-	b, _ := json.Marshal(s)
-	n, err := kv.Update(ctx, s.JobID, b, rev)
+	var n uint64
+	if rev == 0 {
+		n, err = q.state.Create(ctx, s.JobID, data)
+	} else {
+		n, err = q.state.Update(ctx, s.JobID, data, rev)
+	}
 	if err != nil {
 		var apiErr *jetstream.APIError
-		if errors.Is(err, jetstream.ErrKeyExists) || (errors.As(err, &apiErr) && apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence) {
-			return 0, queue.ErrRevision
+		if errors.Is(err, jetstream.ErrKeyExists) || errors.As(err, &apiErr) && apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence {
+			return 0, queue.ErrFenced
 		}
-		return 0, err
+		return 0, q.unavailable("writing job_state", err)
 	}
 	return n, nil
 }
 
-func (q *Q) SetControl(ctx context.Context, jobID string, c queue.Control) error {
-	kv, err := q.bucket("job_control")
-	if err != nil {
-		return err
+// SetControl writes the job's control flags.
+func (q *Queue) SetControl(ctx context.Context, jobID string, c queue.Control) error {
+	data, _ := json.Marshal(c)
+	if _, err := q.control.Put(ctx, jobID, data); err != nil {
+		return q.unavailable("writing job_control", err)
 	}
-	b, _ := json.Marshal(c)
-	_, err = kv.Put(ctx, jobID, b)
-	return err
+	return nil
 }
 
-func (q *Q) GetControl(ctx context.Context, jobID string) (queue.Control, error) {
-	kv, err := q.bucket("job_control")
-	if err != nil {
-		return queue.Control{}, err
-	}
-	e, err := kv.Get(ctx, jobID)
+// GetControl reads the job's control flags (zero when none were set).
+func (q *Queue) GetControl(ctx context.Context, jobID string) (queue.Control, error) {
+	e, err := q.control.Get(ctx, jobID)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		return queue.Control{}, queue.ErrNotFound
+		return queue.Control{}, nil
 	}
 	if err != nil {
-		return queue.Control{}, err
+		return queue.Control{}, q.unavailable("reading job_control", err)
 	}
 	var c queue.Control
-	return c, json.Unmarshal(e.Value(), &c)
+	_ = json.Unmarshal(e.Value(), &c)
+	return c, nil
 }
 
-func (q *Q) WatchControl(ctx context.Context) (<-chan queue.ControlChange, error) {
-	kv, err := q.bucket("job_control")
+// WatchControl streams changes to job_control made after the call. The channel closes when ctx ends.
+func (q *Queue) WatchControl(ctx context.Context, jobIDs []string) (<-chan queue.ControlChange, error) {
+	w, err := q.control.WatchAll(ctx, jetstream.UpdatesOnly())
 	if err != nil {
-		return nil, err
+		return nil, q.unavailable("watching job_control", err)
 	}
-	w, err := kv.WatchAll(ctx, jetstream.UpdatesOnly())
-	if err != nil {
-		return nil, err
+	want := map[string]bool{}
+	for _, id := range jobIDs {
+		want[id] = true
 	}
 	out := make(chan queue.ControlChange, 64)
-	elog.Go("watching job_control", func() {
+	go func() {
 		defer close(out)
-		defer w.Stop()
-		for e := range w.Updates() {
-			if e == nil || e.Operation() != jetstream.KeyValuePut {
-				continue
-			}
-			var c queue.Control
-			if json.Unmarshal(e.Value(), &c) == nil {
+		defer func() { _ = w.Stop() }()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case e, ok := <-w.Updates():
+				if !ok {
+					return
+				}
+				if e == nil || e.Operation() != jetstream.KeyValuePut || (len(want) > 0 && !want[e.Key()]) {
+					continue
+				}
+				var c queue.Control
+				if json.Unmarshal(e.Value(), &c) != nil {
+					continue
+				}
 				select {
 				case out <- queue.ControlChange{JobID: e.Key(), Control: c}:
 				case <-ctx.Done():
@@ -525,42 +440,212 @@ func (q *Q) WatchControl(ctx context.Context) (<-chan queue.ControlChange, error
 				}
 			}
 		}
-	})
+	}()
 	return out, nil
 }
 
-// ---- servers ----
-
-func (q *Q) PutServer(ctx context.Context, rec queue.ServerRecord) error {
-	kv, err := q.bucket("servers")
-	if err != nil {
-		return err
+// PutServer writes this server's capability record (TTL 90 s on the bucket).
+func (q *Queue) PutServer(ctx context.Context, rec queue.ServerRecord) error {
+	if rec.UpdatedAt.IsZero() {
+		rec.UpdatedAt = time.Now().UTC()
 	}
-	b, _ := json.Marshal(rec)
-	_, err = kv.Put(ctx, rec.Key, b)
-	return err
+	data, _ := json.Marshal(rec)
+	if _, err := q.servers.Put(ctx, rec.Key, data); err != nil {
+		return q.unavailable("writing the servers record", err)
+	}
+	return nil
 }
 
-func (q *Q) Servers(ctx context.Context) ([]queue.ServerRecord, error) {
-	kv, err := q.bucket("servers")
-	if err != nil {
-		return nil, err
-	}
-	keys, err := kv.Keys(ctx)
+// Servers lists every live capability record.
+func (q *Queue) Servers(ctx context.Context) ([]queue.ServerRecord, error) {
+	keys, err := q.servers.Keys(ctx)
 	if errors.Is(err, jetstream.ErrNoKeysFound) {
-		return []queue.ServerRecord{}, nil
+		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, q.unavailable("listing servers", err)
 	}
-	out := []queue.ServerRecord{}
+	var out []queue.ServerRecord
 	for _, k := range keys {
-		if e, err := kv.Get(ctx, k); err == nil {
-			var r queue.ServerRecord
-			if json.Unmarshal(e.Value(), &r) == nil {
-				out = append(out, r)
-			}
+		e, err := q.servers.Get(ctx, k)
+		if err != nil {
+			continue
+		}
+		var r queue.ServerRecord
+		if json.Unmarshal(e.Value(), &r) == nil {
+			out = append(out, r)
 		}
 	}
 	return out, nil
+}
+
+// Status reports the connection, server version and stream sizes.
+func (q *Queue) Status(ctx context.Context) queue.Status {
+	st := queue.Status{Kind: "nats", URL: q.opt.URL, Connected: q.nc.IsConnected(), ServerVersion: q.nc.ConnectedServerVersion()}
+	if !st.Connected {
+		st.Error = "not connected to nats-server (reconnecting)"
+		return st
+	}
+	st.Streams = map[string]uint64{}
+	for _, name := range []string{StreamWork, StreamEvents, StreamDead} {
+		s, err := q.js.Stream(ctx, name)
+		if err != nil {
+			st.Error = err.Error()
+			return st
+		}
+		info, err := s.Info(ctx)
+		if err != nil {
+			st.Error = err.Error()
+			return st
+		}
+		st.Streams[name] = info.State.Msgs
+	}
+	st.JetStream = true
+	if w, err := q.waiting(ctx); err == nil {
+		st.Waiting = w
+	}
+	return st
+}
+
+func (q *Queue) unavailable(what string, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if !q.nc.IsConnected() || errors.Is(err, nats.ErrConnectionClosed) || errors.Is(err, nats.ErrNoResponders) || errors.Is(err, nats.ErrTimeout) {
+		return fmt.Errorf("%w: %s: %v", queue.ErrUnavailable, what, err)
+	}
+	return fmt.Errorf("%s: %w", what, err)
+}
+
+// delivery is one held job. Acks are published to the delivery's ack subject, which is not tied to the connection
+// that received the job, so a restarted process holding the saved handle keeps the same claim (§9.4).
+type delivery struct {
+	q    *Queue
+	env  *queue.Envelope
+	data []byte
+	mu   sync.Mutex
+	h    queue.ClaimHandle
+	done bool
+}
+
+func (d *delivery) Envelope() *queue.Envelope { return d.env }
+func (d *delivery) Attempt() int              { return d.h.Attempt }
+func (d *delivery) Handle() queue.ClaimHandle {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.h
+}
+func (d *delivery) SetFence(rev uint64) {
+	d.mu.Lock()
+	d.h.FenceRev = rev
+	d.mu.Unlock()
+}
+
+func (d *delivery) InProgress(ctx context.Context) error {
+	return d.send(ctx, []byte("+WPI"), false, false)
+}
+
+func (d *delivery) Ack(ctx context.Context) error { return d.send(ctx, []byte("+ACK"), true, true) }
+
+func (d *delivery) Requeue(ctx context.Context, delay time.Duration) error {
+	body := []byte("-NAK")
+	if delay > 0 {
+		body = fmt.Appendf(nil, `-NAK {"delay": %d}`, delay.Nanoseconds())
+	}
+	return d.send(ctx, body, false, true)
+}
+
+func (d *delivery) Dead(ctx context.Context, reason string) error {
+	m := nats.NewMsg(queue.DeadSubject(d.env.Caller, d.env.Service))
+	m.Data = d.data
+	m.Header.Set("X-Job-Id", d.env.JobID)
+	m.Header.Set("X-Reason", reason)
+	m.Header.Set("X-Attempt", strconv.Itoa(d.h.Attempt))
+	m.Header.Set(jetstream.MsgIDHeader, "dead#"+d.env.JobID+"#"+strconv.Itoa(d.h.Attempt))
+	if _, err := d.q.js.PublishMsg(ctx, m); err != nil {
+		return d.q.unavailable("copying a job to DEAD", err)
+	}
+	return d.send(ctx, []byte("+TERM "+reason), false, true)
+}
+
+// send publishes an ack body. final marks the delivery settled; confirm waits for the server's reply.
+func (d *delivery) send(ctx context.Context, body []byte, confirm, final bool) error {
+	d.mu.Lock()
+	if d.done {
+		d.mu.Unlock()
+		return nil
+	}
+	if final {
+		d.done = true
+	}
+	subj := d.h.AckSubject
+	d.mu.Unlock()
+	if subj == "" {
+		return errors.New("delivery has no ack subject")
+	}
+	if confirm {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if _, err := d.q.nc.RequestWithContext(cctx, subj, body); err != nil {
+			return d.q.unavailable("acknowledging job "+d.env.JobID, err)
+		}
+		return nil
+	}
+	if err := d.q.nc.Publish(subj, body); err != nil {
+		return d.q.unavailable("acknowledging job "+d.env.JobID, err)
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return d.q.nc.FlushWithContext(fctx)
+}
+
+// AckInfo is what an ack subject says about its message.
+type AckInfo struct {
+	Stream, Consumer string
+	Delivered        uint64
+	StreamSeq        uint64
+}
+
+// ParseAckSubject reads both ack subject formats:
+// $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending> and
+// $JS.ACK.<domain>.<account hash>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>[.<token>].
+func ParseAckSubject(s string) (AckInfo, error) {
+	t := strings.Split(s, ".")
+	if len(t) < 9 || t[0] != "$JS" || t[1] != "ACK" {
+		return AckInfo{}, fmt.Errorf("%q is not a JetStream ack subject", s)
+	}
+	if len(t) > 9 {
+		if len(t) < 11 {
+			return AckInfo{}, fmt.Errorf("%q is not a JetStream ack subject", s)
+		}
+		t = append(t[:2], t[4:]...) // drop domain and account hash
+	}
+	del, err1 := strconv.ParseUint(t[4], 10, 64)
+	seq, err2 := strconv.ParseUint(t[5], 10, 64)
+	if err1 != nil || err2 != nil {
+		return AckInfo{}, fmt.Errorf("%q has no numeric delivery and sequence tokens", s)
+	}
+	return AckInfo{Stream: t[2], Consumer: t[3], Delivered: del, StreamSeq: seq}, nil
+}
+
+// VersionAtLeast compares dotted versions ("2.15.2" >= "2.10.0"); a leading v and a -suffix are ignored.
+func VersionAtLeast(have, want string) bool {
+	parse := func(v string) [3]int {
+		v = strings.TrimPrefix(v, "v")
+		if i := strings.IndexAny(v, "-+"); i >= 0 {
+			v = v[:i]
+		}
+		var out [3]int
+		for i, p := range strings.SplitN(v, ".", 3) {
+			out[i], _ = strconv.Atoi(p)
+		}
+		return out
+	}
+	h, w := parse(have), parse(want)
+	for i := range h {
+		if h[i] != w[i] {
+			return h[i] > w[i]
+		}
+	}
+	return true
 }

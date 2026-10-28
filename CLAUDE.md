@@ -19,10 +19,10 @@ On every machine it runs on, it:
    jobs on two GPUs, or several CPU-only jobs side by side).
 4. **Reports status and results** back: progress, logs, output files, success/failure.
 
-Coordination is **ours**. We can use RabbitMQ (or another message broker) internally for
-transport, but the scheduling rules (which machine takes which job, priority, retries, how
-capabilities are matched) are our own logic, written in this repo and specified in `pm/`. The
-broker is decided: NATS JetStream, as its own `nats-server` service (`pm/task_queue.mdx`, D-Q1).
+Coordination is **ours**. The transport is NATS JetStream in its own nats-server process
+(pm/Decisions.yaml D-014); our binary is only a client. The scheduling rules (which machine takes
+which job, priority, retries, how capabilities are matched) are our own logic, written in this repo
+and specified in `pm/`.
 
 ## Language and build
 
@@ -75,11 +75,12 @@ code/
     ├── capability/   # Turn hardware into "job types I can run, and how many"
     ├── jobs/         # Job definitions, intake, lifecycle (queued → running → done/failed)
     ├── scheduler/    # Our coordination: matching, priority, parallel slots, retries
-    ├── queue/        # The broker seam (Queue, Delivery); queue/natsq is the NATS JetStream client
-    ├── brokerctl/    # Installs and configures the separate nats-server service
-    ├── taskhost/     # Detached process that owns one running job; survives controller restarts
-    ├── runs/ snapshot/  # Run directory contract; frozen code snapshots
+    ├── queue/        # Task queue transport: NATS JetStream (queue/natsq), contract tests
+    ├── brokerctl/    # This machine's nats-server: config, status
     ├── runners/      # One runner per job type (image, video, upscale, Blender, ...)
+    ├── taskhost/     # Detached task host: a render outlives a controller restart
+    ├── snapshot/     # Frozen, content-keyed copy of the task code a job runs
+    ├── scripts/      # (code/scripts/) task code that gets snapshotted
     └── report/       # Progress, logs, and result reporting back to the platform
 ```
 
@@ -98,11 +99,10 @@ code/
 
 ## Current state (2026-10-27)
 
-v0.1.0 plus task queue phase Q1 is built: Go code in `code/`, the `justfile`, `data/` catalogs (including
-`data/queue/` and `data/schemas/`), Go unit tests, and the black-box suite in `tests/` (Python standard library;
-`cd tests && just`; it needs `nats-server`). The broker is decided: **NATS JetStream as its own `nats-server`
-service** on 127.0.0.1:4244 (`pm/task_queue.mdx`, D-Q1); install it once per machine with `just broker-install`.
-Running jobs live in detached task hosts started from frozen code snapshots. A controller restart, `just stop` or
-`just update` must never stop a running job: the next controller re-adopts it (task_queue.mdx §9). Next: task queue
-phase Q2 (priority and policy), then Q3 (hub, workers, ACT3/WTC callers). Builds use `GOWORK=off` because the parent
-`~/BGit/act3/go.work` would otherwise capture this module. See `pm/TO_DO.md` and `pm/Decisions.yaml`.
+v0.2.0: jobs arrive through NATS JetStream (POST /v1/queue/jobs, or NATS directly) or direct mode.
+Model runners oss_video (Wan 2.2) and oss_upscale (SeedVR2) run in detached task hosts from frozen
+snapshots (data/git_ignore/runs/, snapshots/), so a git pull and a restart never stop a render. Task
+scripts live in code/scripts/ (copies from ~/BGit/all; refresh with code/scripts/sync_from_all.sh).
+`just build` also installs nats-server; on the Mac Studio, `just render-setup` then `just render-test`. Builds use `GOWORK=off` because the
+parent `~/BGit/act3/go.work` would otherwise capture this module. See `pm/TO_DO.md` and
+`pm/Decisions.yaml`.

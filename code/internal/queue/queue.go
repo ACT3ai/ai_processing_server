@@ -1,9 +1,9 @@
-// Package queue is the only door between our code and the task system (pm/task_queue.mdx §13.7). Everything above
-// it (admission, the scheduler, the local API) uses these types; only queue/natsq knows NATS JetStream exists, and
-// queue/queuetest is an in-memory implementation that passes the same contract tests.
+// Package queue is the broker seam (pm/task_queue.mdx §13): the task contract every job follows (envelope, events,
+// job state, claims) and the Queue interface that is the only door between our code and the task system.
 //
-// The broker owns transport and durability: storing jobs, one delivery per worker, redelivery, KV with
-// compare-and-set. Our code owns coordination: admission, priority, slots, retry policy (§8.3).
+// The task system is NATS JetStream running as its own nats-server process (pm/Decisions.yaml D-014). Only
+// queue/natsq knows that; queue/queuetest is an in-memory implementation that passes the same contract tests.
+// Coordination stays ours: the scheduler decides what to pull and in which order, the queue only stores and delivers.
 package queue
 
 import (
@@ -15,25 +15,26 @@ import (
 	"time"
 )
 
-// EnvelopeVersion is the task envelope this binary writes and reads (data/schemas/task_envelope.v1.schema.json).
+// EnvelopeVersion is the task envelope version this binary writes and accepts (§13.2).
 const EnvelopeVersion = 1
+
+// MaxEnvelopeBytes caps an envelope (§13.2); media never rides on the bus.
+const MaxEnvelopeBytes = 256 << 10
 
 // Errors every implementation returns for the same situations.
 var (
-	ErrNotFound     = errors.New("not found")
-	ErrExists       = errors.New("already exists")
-	ErrRevision     = errors.New("revision moved: another claim owns this job") // fencing failed (§16.3)
-	ErrNoWork       = errors.New("no work")
-	ErrBrokerAbsent = errors.New("broker not reachable")
+	ErrNotFound    = errors.New("not found")
+	ErrFenced      = errors.New("job_state changed since it was read (fencing token is stale)")
+	ErrInvalid     = errors.New("invalid envelope")
+	ErrUnavailable = errors.New("broker unavailable")
 )
 
-// Envelope is one job as callers submit it (§13.2). Media never rides on the bus: inputs and outputs are URLs
-// (or local paths, for the local caller only).
+// Envelope is the task envelope v1 (§13.2).
 type Envelope struct {
 	EnvelopeVersion int             `json:"envelope_version"`
 	JobID           string          `json:"job_id"`
 	Caller          string          `json:"caller"`
-	Category        string          `json:"category"`
+	Category        string          `json:"category,omitempty"`
 	Service         string          `json:"service"`
 	Model           string          `json:"model,omitempty"`
 	CallerJobType   string          `json:"caller_job_type,omitempty"`
@@ -41,85 +42,163 @@ type Envelope struct {
 	IssuedAt        time.Time       `json:"issued_at"`
 	ExpiresAt       time.Time       `json:"expires_at"`
 	Deadline        *time.Time      `json:"deadline,omitempty"`
+	TimeoutSeconds  int64           `json:"timeout_seconds,omitempty"`
+	MaxAttempts     int             `json:"max_attempts,omitempty"` // 0: the service catalog's retry.max_attempts; at most 10
 	TraceID         string          `json:"trace_id,omitempty"`
 	Tenant          map[string]any  `json:"tenant,omitempty"`
 	Estimate        map[string]any  `json:"estimate,omitempty"`
-	TimeoutSeconds  int64           `json:"timeout_seconds,omitempty"` // 0: the service catalog's timeouts.run
-	MaxAttempts     int             `json:"max_attempts,omitempty"`    // 0: the service catalog's retry.max_attempts
-	Inputs          []Input         `json:"inputs,omitempty"`
+	Inputs          json.RawMessage `json:"inputs,omitempty"`
 	Params          json.RawMessage `json:"params,omitempty"`
-	Outputs         []OutputSpec    `json:"outputs,omitempty"`
-	DataRules       DataRules       `json:"data_rules"`
+	Outputs         json.RawMessage `json:"outputs,omitempty"`
+	DataRules       json.RawMessage `json:"data_rules,omitempty"`
 	Reply           Reply           `json:"reply"`
 }
 
-// Input is a file the job needs. URL is http(s); Path is a local file (caller `local` only).
-type Input struct {
-	Name   string `json:"name"`
-	URL    string `json:"url,omitempty"`
-	Path   string `json:"path,omitempty"`
-	SHA256 string `json:"sha256,omitempty"`
-	Bytes  int64  `json:"bytes,omitempty"`
-}
-
-// OutputSpec says where a named output goes. No Upload: the server keeps it for GET /v1/jobs/{id}/outputs/{name}.
-type OutputSpec struct {
-	Name        string  `json:"name"`
-	ContentType string  `json:"content_type,omitempty"`
-	Upload      *Upload `json:"upload,omitempty"`
-}
-
-type Upload struct {
-	Method string `json:"method"`
-	URL    string `json:"url"`
-}
-
-type DataRules struct {
-	CustomerData      bool `json:"customer_data"`
-	RetainAfterUpload bool `json:"retain_after_upload"`
-}
-
+// Reply says where the caller listens.
 type Reply struct {
-	Events  string  `json:"events"`
-	Webhook *string `json:"webhook"`
+	Events  string `json:"events"`
+	Webhook string `json:"webhook,omitempty"`
 }
 
-// Validate checks what every implementation and admission rely on.
-func (e *Envelope) Validate() error {
-	switch {
-	case e.EnvelopeVersion != EnvelopeVersion:
-		return fmt.Errorf("envelope_version %d is not supported (want %d)", e.EnvelopeVersion, EnvelopeVersion)
-	case !ValidToken(e.JobID, 64):
-		return errors.New("job_id must be 1-64 characters of A-Z a-z 0-9 - _")
-	case !ValidToken(e.Caller, 32):
-		return errors.New("caller must be 1-32 characters of A-Z a-z 0-9 - _")
-	case e.Service == "" || strings.ContainsAny(e.Service, " *>"):
-		return errors.New("service is required and may not contain spaces, * or >")
-	case e.IssuedAt.IsZero() || e.ExpiresAt.IsZero():
-		return errors.New("issued_at and expires_at are required")
-	case e.ExpiresAt.Sub(e.IssuedAt) > 7*24*time.Hour:
-		return errors.New("expires_at may be at most 7 days after issued_at")
+// Normalize fills defaults and checks the rules of §13.2. now is the submission time.
+func (e *Envelope) Normalize(now time.Time) error {
+	if e.EnvelopeVersion == 0 {
+		e.EnvelopeVersion = EnvelopeVersion
+	}
+	if e.EnvelopeVersion != EnvelopeVersion {
+		return fmt.Errorf("%w: envelope_version %d is not supported (want %d)", ErrInvalid, e.EnvelopeVersion, EnvelopeVersion)
+	}
+	if !ValidToken(e.JobID, 64) {
+		return fmt.Errorf("%w: job_id must be 1-64 characters of A-Z a-z 0-9 - _", ErrInvalid)
+	}
+	if !ValidToken(e.Caller, 32) {
+		return fmt.Errorf("%w: caller must be 1-32 characters of A-Z a-z 0-9 - _", ErrInvalid)
+	}
+	if e.Service == "" || strings.ContainsAny(e.Service, " *>\t\r\n") {
+		return fmt.Errorf("%w: service is required and may not contain spaces, * or >", ErrInvalid)
+	}
+	if e.IssuedAt.IsZero() {
+		e.IssuedAt = now.UTC()
+	}
+	if e.ExpiresAt.IsZero() {
+		e.ExpiresAt = e.IssuedAt.Add(24 * time.Hour)
+	}
+	if e.ExpiresAt.Sub(e.IssuedAt) > 7*24*time.Hour {
+		return fmt.Errorf("%w: expires_at may be at most 7 days after issued_at", ErrInvalid)
+	}
+	if VendorModel(e.Model) || e.Category == "vendor_api" {
+		return fmt.Errorf("%w: vendor API jobs (%s) run in ACT3 job_runner and appsrv, never on processing servers", ErrInvalid, e.Model)
+	}
+	e.Priority = ClampPriority(e.Caller, min(max(e.Priority, 0), 300))
+	e.MaxAttempts = min(max(e.MaxAttempts, 0), 10)
+	if e.Reply.Events == "" {
+		e.Reply.Events = EventSubject(e.Caller, e.JobID)
 	}
 	return nil
 }
 
-// ValidToken reports whether s is 1..max characters of A-Z a-z 0-9 - _ (safe as a subject token and a KV key).
-func ValidToken(s string, max int) bool {
-	if len(s) == 0 || len(s) > max {
-		return false
-	}
-	for _, r := range s {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
-			return false
-		}
-	}
-	return true
+// Expired reports whether the envelope may no longer start.
+func (e *Envelope) Expired(now time.Time) bool {
+	return !e.ExpiresAt.IsZero() && now.After(e.ExpiresAt)
 }
 
-// States as callers see them (§13.4).
+// ValidToken is the character rule for ids that become subject tokens and KV keys.
+func ValidToken(s string, maxLen int) bool {
+	if len(s) == 0 || len(s) > maxLen {
+		return false
+	}
+	return strings.IndexFunc(s, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_')
+	}) < 0
+}
+
+// Bands, highest first (§14.2).
+var Bands = []string{"p0", "p1", "p2", "p3", "p4"}
+
+// bandFloor is the lowest priority in each band (§14.2).
+var bandFloor = map[string]int{"p0": 150, "p1": 75, "p2": 50, "p3": 25, "p4": 0}
+
+// CallerCeilings is the highest band each caller may use (§14.3, decided 2026-10-27 in §24 Q4, D-021): p0 is for ACT3
+// users watching a render and for the machine's own owner; WTC tops out at p1; any caller not listed at p3.
+var CallerCeilings = map[string]string{"act3": "p0", "local": "p0", "wtc": "p1"}
+
+// CeilingFor returns the highest band a caller may use.
+func CeilingFor(caller string) string {
+	if b, ok := CallerCeilings[caller]; ok {
+		return b
+	}
+	return "p3"
+}
+
+// ClampBand returns band, lowered to the caller's ceiling when it is above it.
+func ClampBand(caller, band string) string {
+	if c := CeilingFor(caller); bandFloor[band] > bandFloor[c] {
+		return c
+	}
+	return band
+}
+
+// ClampPriority lowers a priority to the top of the caller's ceiling band (§14.3).
+func ClampPriority(caller string, priority int) int {
+	c := CeilingFor(caller)
+	i := slicesIndex(Bands, c)
+	if i <= 0 || priority < bandFloor[Bands[i-1]] {
+		return priority
+	}
+	return bandFloor[Bands[i-1]] - 1
+}
+
+func slicesIndex(s []string, v string) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return -1
+}
+
+// VendorModel reports a hosted-AI model ("vendor:veo3"). Vendor API jobs stay in ACT3 job_runner and appsrv; processing
+// servers never run them (task_queue.mdx §24 Q5, D-021).
+func VendorModel(model string) bool { return strings.HasPrefix(model, "vendor:") }
+
+// BandFor maps a 0..300 priority to its band (§14.2).
+func BandFor(priority int) string {
+	switch {
+	case priority >= 150:
+		return "p0"
+	case priority >= 75:
+		return "p1"
+	case priority >= 50:
+		return "p2"
+	case priority >= 25:
+		return "p3"
+	default:
+		return "p4"
+	}
+}
+
+// ConsumerRef names one work consumer: one (band, caller, service) lane (§13.1).
+type ConsumerRef struct {
+	Band, Caller, Service string
+}
+
+// Subject is the work subject of the lane: work.<band>.<caller>.<service>.
+func (c ConsumerRef) Subject() string { return "work." + c.Band + "." + c.Caller + "." + c.Service }
+
+// Durable is the shared durable consumer name of the lane (no dots allowed in consumer names).
+func (c ConsumerRef) Durable() string {
+	return "w_" + c.Band + "_" + c.Caller + "_" + strings.NewReplacer(".", "_", "-", "_").Replace(c.Service)
+}
+
+// EventSubject is evt.<caller>.<job_id> (§13.1).
+func EventSubject(caller, jobID string) string { return "evt." + caller + "." + jobID }
+
+// DeadSubject is dead.<caller>.<service> (§13.1).
+func DeadSubject(caller, service string) string { return "dead." + caller + "." + service }
+
+// Caller-visible lifecycle states (§13.4).
 const (
 	StateSubmitted = "SUBMITTED"
-	StateAdmitted  = "ADMITTED"
 	StateQueued    = "QUEUED"
 	StateClaimed   = "CLAIMED"
 	StateStaging   = "STAGING"
@@ -132,7 +211,7 @@ const (
 	StateRejected  = "REJECTED"
 )
 
-// FinalState reports whether no more work will happen for a job in state s.
+// FinalState reports whether nothing more will happen to a job in this state.
 func FinalState(s string) bool {
 	switch s {
 	case StateSucceeded, StateFailed, StateCancelled, StateExpired, StateRejected:
@@ -141,155 +220,145 @@ func FinalState(s string) bool {
 	return false
 }
 
-// Event types (§13.5).
-const (
-	EvAdmitted  = "admitted"
-	EvRejected  = "rejected"
-	EvClaimed   = "claimed"
-	EvStage     = "stage"
-	EvProgress  = "progress"
-	EvRequeued  = "requeued"
-	EvSucceeded = "succeeded"
-	EvFailed    = "failed"
-	EvCancelled = "cancelled"
-	EvExpired   = "expired"
-)
-
-// Event is one lifecycle message on evt.<caller>.<job_id>. Callers dedupe by (job_id, seq): delivery is at least once.
-type Event struct {
-	JobID            string             `json:"job_id"`
-	Caller           string             `json:"caller"`
-	Seq              int64              `json:"seq"`
-	Type             string             `json:"type"`
-	State            string             `json:"state"`
-	Attempt          int                `json:"attempt,omitempty"`
-	Server           string             `json:"server,omitempty"`
-	Band             string             `json:"band,omitempty"`
-	Stage            string             `json:"stage,omitempty"`
-	Step             string             `json:"step,omitempty"`
-	Progress         *float64           `json:"progress,omitempty"`
-	Note             string             `json:"note,omitempty"`
-	Reason           string             `json:"reason,omitempty"`
-	Kind             string             `json:"kind,omitempty"`
-	Message          string             `json:"message,omitempty"`
-	NextAttemptAfter *time.Time         `json:"next_attempt_after,omitempty"`
-	Outputs          json.RawMessage    `json:"outputs,omitempty"`
-	Result           json.RawMessage    `json:"result,omitempty"`
-	Timings          map[string]float64 `json:"timings,omitempty"`
-	CodeVersion      string             `json:"code_version,omitempty"`
-	By               string             `json:"by,omitempty"`
-	Detail           string             `json:"detail,omitempty"`
-	At               time.Time          `json:"at"`
+// JobState is the job_state KV record. Its KV revision is the fencing token (§16.3).
+type JobState struct {
+	JobID     string    `json:"job_id"`
+	Caller    string    `json:"caller"`
+	Service   string    `json:"service"`
+	State     string    `json:"state"`
+	Band      string    `json:"band,omitempty"`
+	Attempt   int       `json:"attempt"`
+	Server    string    `json:"server,omitempty"`
+	Kind      string    `json:"kind,omitempty"`
+	Message   string    `json:"message,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Final reports whether this event ends the job.
+// Event is one lifecycle event on evt.<caller>.<job_id> (§13.5).
+type Event struct {
+	JobID            string          `json:"job_id"`
+	Caller           string          `json:"caller"`
+	Seq              int64           `json:"seq"`
+	Type             string          `json:"type"`
+	State            string          `json:"state"`
+	Attempt          int             `json:"attempt,omitempty"`
+	Server           string          `json:"server,omitempty"`
+	Band             string          `json:"band,omitempty"`
+	Stage            string          `json:"stage,omitempty"`
+	Progress         float64         `json:"progress,omitempty"`
+	Note             string          `json:"note,omitempty"`
+	Kind             string          `json:"kind,omitempty"`
+	Message          string          `json:"message,omitempty"`
+	By               string          `json:"by,omitempty"`
+	NextAttemptAfter *time.Time      `json:"next_attempt_after,omitempty"`
+	Outputs          json.RawMessage `json:"outputs,omitempty"`
+	Result           json.RawMessage `json:"result,omitempty"`
+	At               time.Time       `json:"at"`
+}
+
+// Final reports whether this event ends the job for the caller.
 func (e *Event) Final() bool {
 	switch e.Type {
-	case EvRejected, EvSucceeded, EvFailed, EvCancelled, EvExpired:
+	case "succeeded", "failed", "cancelled", "expired", "rejected":
 		return true
 	}
 	return false
 }
 
-// JobState is the job_state KV value. Its KV revision is the fencing token (§16.3).
-type JobState struct {
-	JobID       string    `json:"job_id"`
-	Caller      string    `json:"caller"`
-	Service     string    `json:"service"`
-	State       string    `json:"state"`
-	Band        string    `json:"band,omitempty"`
-	Attempt     int       `json:"attempt"`
-	Server      string    `json:"server,omitempty"`
-	CodeVersion string    `json:"code_version,omitempty"`
-	Reason      string    `json:"reason,omitempty"`
-	Seq         int64     `json:"seq"` // last event seq published, so the next holder continues the sequence
-	UpdatedAt   time.Time `json:"updated_at"`
-}
-
-// Control is the job_control KV value: flags a caller or the owner sets on a live job (§16.5).
-type Control struct {
-	Cancel bool      `json:"cancel"`
-	By     string    `json:"by,omitempty"`
-	At     time.Time `json:"at"`
-}
-
-// ControlChange is one update seen by WatchControl.
-type ControlChange struct {
-	JobID   string
-	Control Control
-}
-
-// ServerRecord is one machine's entry in the `servers` KV (§12.1).
-type ServerRecord struct {
-	Key         string         `json:"key"`
-	Role        string         `json:"role"`
-	Version     string         `json:"version"`
-	CodeVersion string         `json:"code_version"`
-	State       string         `json:"state"`
-	Services    []ServiceOffer `json:"services"`
-	At          time.Time      `json:"at"`
-}
-
-type ServiceOffer struct {
-	Service  string `json:"service"`
-	Category string `json:"category"`
-	Parallel int    `json:"parallel"`
-	Running  int    `json:"running"`
-}
-
-// ConsumerRef names one work consumer: one per (band, caller, service) (§13.1).
-type ConsumerRef struct {
-	Band    string `json:"band"`
-	Caller  string `json:"caller"`
-	Service string `json:"service"`
-}
-
-// Subject is the work subject this consumer reads.
-func (c ConsumerRef) Subject() string { return WorkSubject(c.Band, c.Caller, c.Service) }
-
-// Name is the durable consumer name (subject tokens joined by _, since names may not hold dots).
-func (c ConsumerRef) Name() string {
-	return "w_" + c.Band + "_" + c.Caller + "_" + strings.ReplaceAll(c.Service, ".", "_")
-}
-
-// Subject helpers (§13.1).
-func SubmitSubject(caller, category string) string { return "submit." + caller + "." + category }
-func WorkSubject(band, caller, service string) string {
-	return "work." + band + "." + caller + "." + service
-}
-func EventSubject(caller, jobID string) string    { return "evt." + caller + "." + jobID }
-func DeadSubject(caller, service string) string   { return "dead." + caller + "." + service }
-
-// ParseWorkSubject splits work.<band>.<caller>.<service> (the service id itself holds dots).
-func ParseWorkSubject(subj string) (ConsumerRef, bool) {
-	parts := strings.SplitN(subj, ".", 4)
-	if len(parts) != 4 || parts[0] != "work" {
-		return ConsumerRef{}, false
-	}
-	return ConsumerRef{Band: parts[1], Caller: parts[2], Service: parts[3]}, true
-}
-
-// SubmitAck says the job is durably stored.
+// SubmitAck is returned once the job is durably stored.
 type SubmitAck struct {
-	Stream    string `json:"stream"`
-	Seq       uint64 `json:"seq"`
+	JobID     string `json:"job_id"`
+	Band      string `json:"band"`
+	Subject   string `json:"subject"`
+	Sequence  uint64 `json:"sequence"`
 	Duplicate bool   `json:"duplicate"`
 }
 
-// ClaimHandle is everything needed to keep holding a job after a controller restart: for NATS, the ack subject.
-// It is stored on disk in run.json, never only in memory (§9.4).
+// Control is the job_control record for one job.
+type Control struct {
+	Cancel bool   `json:"cancel,omitempty"`
+	Pause  bool   `json:"pause,omitempty"`
+	By     string `json:"by,omitempty"`
+}
+
+// ControlChange is one change seen by WatchControl.
+type ControlChange struct {
+	JobID string
+	Control
+}
+
+// ServerRecord is a worker's capability record in the servers KV (§12), refreshed well inside its TTL.
+type ServerRecord struct {
+	Key       string         `json:"key"`
+	Role      string         `json:"role"`
+	Version   string         `json:"version"`
+	State     string         `json:"state"`
+	Offers    map[string]int `json:"offers"` // service → parallel slots offered
+	Free      map[string]int `json:"free"`   // service → slots free now
+	UpdatedAt time.Time      `json:"updated_at"`
+}
+
+// Status describes the broker connection for /v1/health and /v1/queue.
+type Status struct {
+	Kind          string            `json:"kind"` // nats | memory
+	URL           string            `json:"url,omitempty"`
+	Connected     bool              `json:"connected"`
+	ServerVersion string            `json:"server_version,omitempty"`
+	JetStream     bool              `json:"jetstream"`
+	Streams       map[string]uint64 `json:"streams,omitempty"` // stream → messages stored
+	Waiting       map[string]uint64 `json:"waiting,omitempty"` // work subject → messages (queued or claimed)
+	Error         string            `json:"error,omitempty"`
+}
+
+// Queue is the only door between our code and the task system (§13.7).
+type Queue interface {
+	// Submit stores a job (normalized envelope) and returns after it is durable. Re-submitting a job_id inside the
+	// dedupe window is a no-op that reports Duplicate.
+	Submit(ctx context.Context, env *Envelope) (SubmitAck, error)
+
+	// Pull fetches at most one job from the first lane in order that has work. The scheduler computes the order
+	// (§14.4); the queue never decides priority. With wait 0 it does not block. No work is (nil, nil).
+	Pull(ctx context.Context, order []ConsumerRef, wait time.Duration) (Delivery, error)
+
+	// Publish writes an event for the caller. Final events are written before Ack.
+	Publish(ctx context.Context, ev *Event) error
+
+	// Events reads every stored event of one job, in order.
+	Events(ctx context.Context, caller, jobID string) ([]Event, error)
+
+	// State reads job_state; a job never written is (JobState{}, 0, ErrNotFound). CASState writes it only if the
+	// revision is still rev (0 = create), returning the new revision, the fencing token (§16.3).
+	State(ctx context.Context, jobID string) (JobState, uint64, error)
+	CASState(ctx context.Context, s JobState, rev uint64) (uint64, error)
+
+	// SetControl and WatchControl carry cancel and pause flags for live jobs. jobIDs nil watches every job.
+	SetControl(ctx context.Context, jobID string, c Control) error
+	GetControl(ctx context.Context, jobID string) (Control, error)
+	WatchControl(ctx context.Context, jobIDs []string) (<-chan ControlChange, error)
+
+	// PutServer writes this server's capability record; Servers reads the fleet's live records.
+	PutServer(ctx context.Context, rec ServerRecord) error
+	Servers(ctx context.Context) ([]ServerRecord, error)
+
+	// Resume rebuilds a Delivery from a handle a previous process saved, so the claim is kept (or released at
+	// once) without waiting for the ack wait to expire (§9.4).
+	Resume(ctx context.Context, h ClaimHandle) (Delivery, error)
+
+	// Status reports the broker connection; it never blocks longer than ctx.
+	Status(ctx context.Context) Status
+
+	Close() error
+}
+
+// ClaimHandle is everything needed to keep holding a job after a restart: for NATS, the ack subject and the
+// fencing revision. It is stored on disk (the job journal), never only in memory.
 type ClaimHandle struct {
 	JobID      string `json:"job_id"`
+	Caller     string `json:"caller"`
+	Service    string `json:"service"`
 	AckSubject string `json:"ack_subject"`
 	FenceRev   uint64 `json:"fence_rev"`
 	Attempt    int    `json:"attempt"`
-}
-
-// Submission is one raw job on SUBMIT waiting for admission. Exactly one of Ack, Term must be called.
-type Submission interface {
-	Envelope() (*Envelope, error) // a decode error means the message is garbage: Term it
-	Ack(ctx context.Context) error
-	Term(ctx context.Context) error
 }
 
 // Delivery is one job held by this worker. Exactly one of Ack, Requeue, Dead must be called.
@@ -297,59 +366,9 @@ type Delivery interface {
 	Envelope() *Envelope
 	Attempt() int
 	InProgress(ctx context.Context) error                   // extends the ack wait; called every heartbeat
-	Ack(ctx context.Context) error                          // done (succeeded, failed for good, or cancelled)
+	Ack(ctx context.Context) error                          // done: succeeded, failed for good, or cancelled
 	Requeue(ctx context.Context, delay time.Duration) error // let a worker try again after delay
 	Dead(ctx context.Context, reason string) error          // stop delivering; copy to DEAD
-	Handle() ClaimHandle                                    // saved to run.json before the task host starts
-}
-
-// Queue is the broker seam.
-type Queue interface {
-	// Submit stores a job on SUBMIT. Re-submitting the same job_id inside the dedupe window is a no-op.
-	Submit(ctx context.Context, env *Envelope) (SubmitAck, error)
-	// NextSubmission is admission's side of SUBMIT: at most one raw job, waiting at most wait.
-	NextSubmission(ctx context.Context, wait time.Duration) (Submission, error)
-	// Enqueue puts an admitted job on work.<band>.<caller>.<service>.
-	Enqueue(ctx context.Context, env *Envelope, band string) error
-
-	// Pull fetches at most one job from the first consumer in order that has work. The scheduler computes the order
-	// (§14.4); the queue never decides priority. ErrNoWork when every consumer is empty.
-	Pull(ctx context.Context, order []ConsumerRef, wait time.Duration) (Delivery, error)
-	// Depth is the number of messages stored per work consumer, including ones held by a worker.
-	Depth(ctx context.Context) (map[ConsumerRef]int, error)
-	// Resume rebuilds a Delivery from the handle a previous controller saved, keeping the same claim (§9.4).
-	Resume(ctx context.Context, h ClaimHandle, env *Envelope) (Delivery, error)
-
-	// Publish writes an event for the caller. Final events are written before Ack.
-	Publish(ctx context.Context, ev *Event) error
-	// Events reads a job's events in order (the local API's view of the event stream).
-	Events(ctx context.Context, caller, jobID string) ([]Event, error)
-
-	// CreateState creates job_state create-only (idempotent submission, §16.4). ErrExists if present.
-	CreateState(ctx context.Context, s JobState) (uint64, error)
-	// State reads job_state; the revision is the fencing token.
-	State(ctx context.Context, jobID string) (JobState, uint64, error)
-	// CASState writes job_state only if its revision is still rev. ErrRevision otherwise.
-	CASState(ctx context.Context, s JobState, rev uint64) (uint64, error)
-
-	// SetControl and WatchControl carry cancel requests to whoever holds a job.
-	SetControl(ctx context.Context, jobID string, c Control) error
-	GetControl(ctx context.Context, jobID string) (Control, error)
-	WatchControl(ctx context.Context) (<-chan ControlChange, error)
-
-	// PutServer writes this server's capability record; Servers reads the fleet's.
-	PutServer(ctx context.Context, rec ServerRecord) error
-	Servers(ctx context.Context) ([]ServerRecord, error)
-
-	// Info describes the broker for health and status.
-	Info() BrokerInfo
-	Close() error
-}
-
-// BrokerInfo is what health reports about the broker.
-type BrokerInfo struct {
-	Kind      string `json:"kind"` // "nats" | "memory"
-	URL       string `json:"url,omitempty"`
-	Connected bool   `json:"connected"`
-	Version   string `json:"version,omitempty"`
+	Handle() ClaimHandle                                    // saved before the job starts
+	SetFence(rev uint64)                                    // record the fencing revision in the handle
 }

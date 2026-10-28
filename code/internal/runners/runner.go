@@ -24,6 +24,14 @@ type Runner interface {
 	Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (*Result, error)
 }
 
+// Reattacher is implemented by runners whose Run is idempotent per job id: after a restart, Run re-attaches to a
+// detached task host still working on the job, or collects the output it already finished. For such runners a
+// queued job held at restart runs again here under the same claim and attempt instead of going back to the queue
+// (pm/task_queue.mdx §9.4).
+type Reattacher interface {
+	Reattachable() bool
+}
+
 // Env is what the lifecycle hands a runner.
 type Env struct {
 	WorkDir string            // data/git_ignore/work/<job_id>/
@@ -50,7 +58,7 @@ type Result struct {
 // All returns the runners built into this binary, by name.
 func All() map[string]Runner {
 	m := map[string]Runner{}
-	for _, r := range []Runner{Compute{}, Render{}, FFmpeg{}} {
+	for _, r := range []Runner{Compute{}, Render{}, FFmpeg{}, OSSVideo{}, OSSUpscale{}} {
 		m[r.Name()] = r
 	}
 	return m

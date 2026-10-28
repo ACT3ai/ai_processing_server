@@ -1,16 +1,17 @@
 // Command ai_processing_server is the single binary that runs on every ACT3 processing and render-queue machine
 // (pm/ai_processing_server.mdx). Subcommands:
 //
-//	init [--write-new]   create data/git_ignore/this_server.yaml if missing (never overwrite); --write-new writes .new
+//	init [--write-new]   create data/git_ignore/this_server.yaml if missing (never overwrite); --write-new writes .new;
+//	                     then create the server identity key if missing and publish its public JWK Set
+//	keys [init|show]     the server identity key (pm/security.mdx §4): create once, or print its public half
 //	run                  start the server (local API, scheduler, runners) until SIGINT/SIGTERM
 //	detect               print detected hardware and the offers it would make
 //	validate             check this_server.yaml and data/ without starting
 //	status | jobs        ask the running server (thin clients of the local API)
 //	cancel <job_id> | drain | resume
-//	stop [--force]       stop the controller; running jobs keep going in their task hosts (pm/task_queue.mdx §9.5)
-//	runs                 list jobs running in task hosts on this machine
-//	broker install|config|status|uninstall   the nats-server service this controller uses (§8.2, §18)
-//	taskhost --run-dir   internal: the detached process that owns one running job (§9.3)
+//	stop [--force]       drain and stop the running server
+//	broker status        check this machine's nats-server: reachable, JetStream on, supported version
+//	broker config        write the nats-server config from this_server.yaml (outside the repo) and print its path
 //	version
 package main
 
@@ -21,12 +22,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -42,9 +45,7 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/queue"
 	"github.com/ACT3ai/ai_processing_server/internal/queue/natsq"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
-	"github.com/ACT3ai/ai_processing_server/internal/runs"
 	"github.com/ACT3ai/ai_processing_server/internal/scheduler"
-	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
 	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 	"gopkg.in/yaml.v3"
 )
@@ -68,7 +69,6 @@ type paths struct {
 	JSONOut  bool
 	Force    bool
 	WriteNew bool
-	RunDir   string // taskhost: the run directory of the job it owns
 }
 
 // elog records errors that should not happen (pm/errors.mdx) in error.err.
@@ -80,6 +80,16 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	// `taskhost --run <dir>` (hidden): one job's detached task host, started by a runner from a frozen snapshot
+	// (pm/task_queue.mdx §9.3). Dispatched before path resolution: it runs inside the snapshot, which is read-only
+	// and must not grow a data/git_ignore/, and it needs nothing but its run directory.
+	if cmd == "taskhost" {
+		os.Exit(taskhost.Main(args))
+	}
+	var sub []string // `broker status --json` and `broker --json status` both work
+	if cmd == "broker" && len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sub, args = args[:1], args[1:]
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	var p paths
 	fs.StringVar(&p.Root, "root", "", "repo root (default: the directory holding the binary)")
@@ -91,7 +101,6 @@ func main() {
 	fs.BoolVar(&p.JSONOut, "json", false, "print JSON (status, jobs, detect)")
 	fs.BoolVar(&p.Force, "force", false, "stop: kill now instead of draining")
 	fs.BoolVar(&p.WriteNew, "write-new", false, "init: write this_server.yaml.new for the owner to merge")
-	fs.StringVar(&p.RunDir, "run-dir", "", "taskhost: the job's run directory")
 	fs.Parse(args)
 	if err := p.resolve(); err != nil && cmd != "version" {
 		fail(err)
@@ -111,6 +120,8 @@ func main() {
 		fmt.Printf("ai_processing_server %s (git %s, built %s)\n", version, gitSHA, buildTime)
 	case "init":
 		err = cmdInit(p)
+	case "keys":
+		err = cmdKeys(p, fs.Args())
 	case "run":
 		err = cmdRun(p)
 	case "detect":
@@ -132,17 +143,10 @@ func main() {
 		err = cmdPost(p, "/v1/resume")
 	case "stop":
 		err = cmdStop(p)
-	case "runs":
-		err = cmdRuns(p)
 	case "broker":
-		err = cmdBroker(p, fs.Args())
-	case "taskhost":
-		if p.RunDir == "" {
-			fail(errors.New("usage: ai_processing_server taskhost --run-dir <dir> (started by the controller, not by hand)"))
-		}
-		code := taskhost.Run(p.RunDir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-		errlog.Close()
-		os.Exit(code)
+		err = cmdBroker(p, append(sub, fs.Args()...))
+	case "enable", "disable":
+		err = cmdEnable(p, append(sub, fs.Args()...), cmd == "enable")
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -156,8 +160,8 @@ func main() {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
-commands: init [--write-new] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
-          runs · broker install|config|status|uninstall · version
+commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
+          broker status|config · enable|disable <service-id|queue>... · version
 flags: --root --state-dir --config --log-dir --error-dir --listen --json
 `)
 }
@@ -302,12 +306,22 @@ func cmdInit(p paths) error {
 	for _, e := range res.Errors {
 		fmt.Println("  error:", e)
 	}
+	for _, n := range res.Next {
+		fmt.Println("  next:", n)
+	}
 	tokenFile := "~/.credentials/ai_processing_server_local.token"
 	if ts, err := config.Load(p.Config); err == nil {
 		tokenFile = ts.LocalAPI.TokenFile
 	}
 	if _, err := config.EnsureTokenFile(tokenFile); err != nil {
 		return fmt.Errorf("local API token: %w", err)
+	}
+	if ts, err := config.Load(p.Config); err == nil {
+		if err := setupKey(p, ts); err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("server identity key: skipped until this_server.yaml loads")
 	}
 	if res.Created {
 		fmt.Println("  check server.key, the services list and limits, then `just run`")
@@ -324,7 +338,17 @@ func cmdValidate(p paths) error {
 	if err != nil {
 		return err
 	}
+	k, err := loadServerKey(p, ts)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		fmt.Println("warning: no server identity key yet in", keyDir(p, ts)+": run `ai_processing_server keys init`")
+	case err != nil:
+		return fmt.Errorf("server identity key: %w", err)
+	}
 	fmt.Printf("OK: %s (%s), %d services listed\n", ts.Server.Key, ts.Server.DisplayName, len(ts.Services))
+	if k != nil {
+		fmt.Println("OK: server identity key", k.Fingerprint())
+	}
 	return nil
 }
 
@@ -342,7 +366,8 @@ func cmdDetect(p paths) error {
 		warns = append(warns, "using a generated config: "+err.Error())
 	}
 	eff, drift := hardware.Effective(facts, ts.Hardware)
-	offers := capability.ComputeOffers(capability.Input{Catalog: cat, Server: ts, Facts: eff, Runners: runners.Names()})
+	offers := capability.ComputeOffers(capability.Input{Catalog: cat, Server: ts, Facts: eff, Runners: runners.Names(),
+		NotInstalled: runners.InstallProblems()})
 	if p.JSONOut {
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"detected": facts, "effective": eff, "drift": drift, "offers": offers, "warnings": warns})
 	}
@@ -385,6 +410,19 @@ func cmdRun(p paths) error {
 	for _, w := range warns {
 		log.Warn(w)
 	}
+	// The identity key is loaded once here and held in memory only (security.mdx §4.4). Platform signing is not
+	// wired yet (phase 3), so a missing key only warns; an unsafe or unreadable one refuses to start.
+	idKey, err := loadServerKey(p, ts)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		log.Warn("no server identity key yet: run `ai_processing_server keys init` (pm/security.mdx §4)", "context", "security",
+			"dir", keyDir(p, ts))
+	case err != nil:
+		log.Error("refusing to start: server identity key", "context", "security", "error", err)
+		return fmt.Errorf("server identity key: %w", err)
+	default:
+		log.Info("server identity key loaded", "context", "security", "fingerprint", idKey.Fingerprint(), "kid", idKey.KID)
+	}
 	token, err := config.EnsureTokenFile(ts.LocalAPI.TokenFile)
 	if err != nil {
 		return fmt.Errorf("local API token: %w", err)
@@ -407,22 +445,16 @@ func cmdRun(p paths) error {
 		f := mon.Detected()
 		return loadConfig(p, &f)
 	}
-	// Freeze this binary as the code snapshot new jobs run from, before anything can rebuild it on disk (§9.2).
-	exe, err := os.Executable()
-	if err != nil {
-		return err
+	var openQueue func(context.Context) (queue.Queue, error)
+	if ts.Queue.Enabled { // queue settings take effect on restart, not on reload
+		qo := natsq.Options{URL: ts.Queue.BrokerURL, CredentialsFile: config.ExpandHome(ts.Queue.CredentialsFile),
+			Name: "ai_processing_server " + ts.Server.Key, AckWait: ts.Continuity.AckWait.Or(5 * time.Minute)}
+		openQueue = func(ctx context.Context) (queue.Queue, error) { return natsq.Open(ctx, qo) }
 	}
-	snap, err := snapshot.Ensure(filepath.Join(p.State, "snapshots"), exe, gitSHA, p.Data)
-	if err != nil {
-		return fmt.Errorf("code snapshot: %w", err)
-	}
-	thArgs := []string{"--root", p.Root, "--state-dir", p.State, "--log-dir", p.LogDir}
-	if p.ErrorDir != "" {
-		thArgs = append(thArgs, "--error-dir", p.ErrorDir)
-	}
+	// Task-host runners keep runs/ and snapshots/ in the state dir and snapshot code from the repo root.
+	runners.StateDir, runners.CodeRoot = p.State, p.Root
 	srv, err := scheduler.New(scheduler.Options{Server: ts, Catalog: cat, Monitor: mon, StateDir: p.State, Loader: loader,
-		OpenQueue: openQueue(log), Snapshot: snap, TaskHostArgs: thArgs, BrokerFix: "just broker-install (once), or just broker-status",
-		Version: version, GitSHA: gitSHA, Warnings: warns, Logger: log})
+		Version: version, GitSHA: gitSHA, Warnings: warns, Logger: log, OpenQueue: openQueue})
 	if err != nil {
 		return err
 	}
@@ -469,34 +501,17 @@ func cmdRun(p paths) error {
 			}
 			continue
 		case sig := <-stop:
-			// A code update restarts the controller only (§9.5): stop pulling, save every claim, close the broker
-			// connection without nacking, and leave every task host running for the next controller to re-adopt.
-			log.Info("stopping the controller; running jobs keep going in their task hosts", "signal", sig.String())
-			left := srv.Shutdown()
+			timeout := time.Duration(ts.Limits.DrainTimeoutS) * time.Second
+			log.Info("stopping: draining running jobs", "signal", sig.String(), "drain_timeout", timeout)
+			elog.Go("handling a second stop signal", func() { <-stop; log.Warn("second signal: stopping jobs now"); srv.Shutdown(0) })
+			srv.Shutdown(timeout)
 			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
 			elog.Ignore("shutting down the local API", httpSrv.Shutdown(sctx))
 			scancel()
 			cancel()
-			log.Info("ai_processing_server stopped", "jobs_left_running", left)
+			log.Info("ai_processing_server stopped")
 			return nil
 		}
-	}
-}
-
-// openQueue connects to this machine's nats-server with the streams and buckets of data/queue/streams.yaml.
-func openQueue(log *slog.Logger) scheduler.OpenQueue {
-	return func(ctx context.Context, ts *config.ThisServer, cat *config.Catalog) (queue.Queue, error) {
-		o := natsq.Options{URL: ts.Queue.BrokerURL, Name: "ai_processing_server " + ts.Server.Key, CredsFile: config.ExpandHome(ts.Queue.CredentialsFile),
-			AckWait: ts.Continuity.AckWait.Duration, MaxDeliver: cat.Queue.Streams.Consumers.MaxDeliver, Logger: log}
-		for _, st := range cat.Queue.Streams.Streams {
-			o.Streams = append(o.Streams, natsq.StreamDef{Name: st.Name, Subjects: st.Subjects, Retention: st.Retention, MaxAge: st.MaxAge, DuplicateWindow: st.DuplicateWindow})
-		}
-		for _, kv := range cat.Queue.Streams.KV {
-			o.KV = append(o.KV, natsq.KVDef{Bucket: kv.Bucket, TTL: kv.TTL, History: kv.History})
-		}
-		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		return natsq.Open(cctx, o)
 	}
 }
 
@@ -566,23 +581,70 @@ func cmdStatus(p paths) error {
 	if r, ok := info["state_reason"].(string); ok && r != "" {
 		reason = " (" + r + ")"
 	}
-	fmt.Printf("%v (%v): %v%s  version %v  up %vs  local API %s/\n", id["key"], id["display_name"], info["state"],
-		reason, info["version"], info["uptime_s"], c.base)
+	up, _ := info["uptime_s"].(float64)
+	fmt.Printf("%v (%v): %v%s  version %v (git %v)  up %s\n", id["key"], id["display_name"], info["state"],
+		reason, info["version"], info["git_sha"], time.Duration(up)*time.Second)
+	fmt.Printf("  local API   %s/\n", c.base)
+	fmt.Printf("  task queue  %s\n", queueLine(info["broker"]))
 	if w, ok := info["warnings"].([]any); ok {
 		for _, x := range w {
 			fmt.Println("  warning:", x)
 		}
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "SERVICE\tPARALLEL\tRUNNING\tWAITING\tREASON")
+
+	// Offered services first (what this machine will run), then the rest with the one reason each is not offered.
+	var ready, off []scheduler.ServiceView
 	for _, s := range svc.Services {
-		reason := s.Reason
-		if s.PausedBy != "" {
-			reason = "paused by " + s.PausedBy
+		if s.Parallel > 0 && s.PausedBy == "" {
+			ready = append(ready, s)
+		} else {
+			off = append(off, s)
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\n", s.Service, s.Parallel, s.Running, s.Waiting, reason)
 	}
-	return tw.Flush()
+	fmt.Println()
+	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "SERVICE\tPARALLEL\tRUNNING\tWAITING")
+	for _, s := range ready {
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\n", s.Service, s.Parallel, s.Running, s.Waiting)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if len(off) > 0 {
+		fmt.Printf("\nnot offered (%d):\n", len(off))
+		tw = tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+		for _, s := range off {
+			why := s.Reason
+			if s.PausedBy != "" {
+				why = "paused by " + s.PausedBy
+			}
+			fmt.Fprintf(tw, "  %s\t%s\n", s.Service, why)
+		}
+		return tw.Flush()
+	}
+	return nil
+}
+
+// queueLine is the one-line task queue state from GET /v1/server's broker block (pm/task_queue.mdx §8.2).
+func queueLine(v any) string {
+	b, _ := v.(map[string]any)
+	state, _ := b["state"].(string)
+	switch state {
+	case scheduler.BrokerDisabled, "":
+		return "off (queue.enabled is not true in this_server.yaml): direct jobs only. Turn on: ./ai_processing_server enable queue"
+	case scheduler.BrokerMissing:
+		return fmt.Sprintf("broker not reachable at %v: direct jobs only. Fix: just broker-install, then just run", b["url"])
+	case scheduler.BrokerConnecting:
+		return fmt.Sprintf("connecting to %v", b["url"])
+	}
+	if state == "ok" {
+		state = "connected"
+	}
+	line := fmt.Sprintf("%s: nats-server %v at %v", state, b["server_version"], b["url"])
+	if e, _ := b["error"].(string); e != "" {
+		line += " (" + e + ")"
+	}
+	return line
 }
 
 func cmdJobs(p paths, args []string) error {
@@ -599,26 +661,26 @@ func cmdJobs(p paths, args []string) error {
 	}
 	var out struct {
 		Jobs []struct {
-			ID       string  `json:"job_id"`
-			Service  string  `json:"service"`
+			ID       string  `json:"id"`
+			Type     string  `json:"type"`
 			State    string  `json:"state"`
-			Attempt  int     `json:"attempt"`
+			Stage    string  `json:"stage"`
 			Progress float64 `json:"progress"`
 			Note     string  `json:"note"`
-			Err      string  `json:"error_message"`
+			LastErr  string  `json:"last_err"`
 		} `json:"jobs"`
 	}
 	if err := c.do("GET", path, &out); err != nil {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "JOB\tSERVICE\tSTATE\tATTEMPT\tPROGRESS\tNOTE")
+	fmt.Fprintln(tw, "ID\tSERVICE\tSTATE\tSTAGE\tPROGRESS\tNOTE")
 	for _, j := range out.Jobs {
 		note := j.Note
-		if j.Err != "" {
-			note = j.Err
+		if j.LastErr != "" {
+			note = j.LastErr
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%.0f%%\t%s\n", j.ID, j.Service, j.State, j.Attempt, j.Progress*100, note)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%.0f%%\t%s\n", j.ID, j.Type, j.State, j.Stage, j.Progress*100, note)
 	}
 	return tw.Flush()
 }
@@ -657,115 +719,96 @@ func cmdStop(p paths) error {
 	if err := terminate(p, proc); err != nil {
 		return err
 	}
-	fmt.Printf("stopping controller pid %d; jobs running in task hosts keep going (`just runs` lists them)\n", pid)
+	fmt.Printf("stopping pid %d: draining running jobs (waits up to limits.drain_timeout_s; `just stop force` kills now)\n", pid)
 	start := time.Now()
 	for alive(proc) {
 		time.Sleep(250 * time.Millisecond)
-		if time.Since(start) > time.Minute {
-			return errors.New("controller did not stop within a minute; use `just stop force`")
+		if time.Since(start) > 15*time.Minute {
+			return errors.New("server did not stop within 15 minutes; use `just stop force`")
 		}
 	}
 	fmt.Printf("stopped after %s\n", time.Since(start).Round(100*time.Millisecond))
 	return nil
 }
 
-// cmdRuns lists the jobs running in task hosts on this machine, from their run directories (`just runs`).
-func cmdRuns(p paths) error {
-	root := filepath.Join(p.State, "runs")
-	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "JOB\tSERVICE\tATTEMPT\tCODE\tPID\tALIVE\tAGE\tLAST HEARTBEAT")
-	n := 0
-	for _, id := range runs.List(root) {
-		dir := filepath.Join(root, id)
-		var rec runs.Record
-		if runs.Exists(dir, runs.HandledFile) || runs.ReadJSON(dir, runs.RunFile, &rec) != nil {
-			continue
-		}
-		var hb runs.Heartbeat
-		last := "-"
-		if runs.ReadJSON(dir, runs.HeartbeatFile, &hb) == nil {
-			last = time.Since(hb.At).Round(time.Second).String() + " ago"
-		}
-		state := fmt.Sprint(runs.Alive(dir, &rec))
-		if runs.Exists(dir, runs.ExitFile) {
-			state = "finished (waiting for the controller)"
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\n", id, rec.Service, rec.Claim.Attempt, rec.Snapshot, rec.TaskHost.PID, state,
-			time.Since(rec.ClaimedAt).Round(time.Second), last)
-		n++
-	}
-	if n == 0 {
-		fmt.Println("no jobs running in task hosts")
-		return nil
-	}
-	return tw.Flush()
-}
-
-// cmdBroker manages this machine's nats-server service (`just broker-install`, `broker-config`, `broker-status`).
+// cmdBroker checks or configures this machine's nats-server (pm/task_queue.mdx §8.2, §18).
 func cmdBroker(p paths, args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: ai_processing_server broker install|config|status|uninstall")
-	}
-	ts, cat, _, err := loadConfig(p, nil)
+	ts, _, _, err := loadConfig(p, nil)
 	if err != nil {
 		return err
 	}
-	bp := brokerctl.DefaultPaths(ts)
-	logf := func(f string, a ...any) { fmt.Printf(f+"\n", a...) }
-	switch args[0] {
-	case "install":
-		if err := brokerctl.Install(context.Background(), ts, cat.Queue, bp, logf); err != nil {
-			return err
-		}
-		fmt.Printf("broker running as an OS service at %s (%s)\n", ts.Queue.BrokerURL, brokerctl.ServiceState())
-		return nil
+	pin, err := brokerctl.LoadPin(p.Data)
+	if err != nil {
+		return err
+	}
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
 	case "config":
-		changed, err := brokerctl.Reload(ts, cat.Queue, bp)
+		path, err := brokerctl.WriteConfig(ts, p.Data)
 		if err != nil {
 			return err
 		}
-		if changed {
-			fmt.Println("broker config regenerated and reloaded:", bp.Conf)
-		} else {
-			fmt.Println("broker config unchanged:", bp.Conf)
-		}
-		return nil
-	case "uninstall":
-		if err := brokerctl.Uninstall(bp); err != nil {
-			return err
-		}
-		fmt.Println("broker service removed; its stored jobs stay in", bp.Store)
+		fmt.Println(path)
 		return nil
 	case "status":
-		fmt.Println("service:", brokerctl.ServiceState())
-		fmt.Println("config: ", bp.Conf)
-		q, err := openQueue(slog.New(slog.NewTextHandler(io.Discard, nil)))(context.Background(), ts, cat)
-		if err != nil {
-			fmt.Println("broker: ", err)
-			return errors.New("broker_missing: run `just broker-install`")
+		if !ts.Queue.Enabled {
+			fmt.Println("queue.enabled is false in this_server.yaml: the server runs direct mode only")
 		}
-		defer q.Close()
-		info := q.Info()
-		v := info.Version
-		if !brokerctl.Supported(ts, cat.Queue, v) {
-			v += " (NOT in the supported range " + cat.Queue.Broker.Supported + ")"
-		}
-		fmt.Printf("broker:  %s nats-server %s, connected %v\n", info.URL, v, info.Connected)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if depth, err := q.Depth(ctx); err == nil {
-			total := 0
-			for _, n := range depth {
-				total += n
+		st, warns, err := brokerctl.Check(ctx, ts, pin)
+		if p.JSONOut {
+			b, _ := json.MarshalIndent(map[string]any{"status": st, "warnings": warns, "error": errString(err)}, "", "  ")
+			fmt.Println(string(b))
+		} else if err == nil {
+			fmt.Printf("broker ok: nats-server %s at %s, JetStream on\n", st.ServerVersion, st.URL)
+			for name, n := range st.Streams {
+				fmt.Printf("  stream %-7s %d messages\n", name, n)
 			}
-			fmt.Printf("work:    %d jobs stored in WORK across %d consumers\n", total, len(depth))
 		}
-		if srvs, err := q.Servers(ctx); err == nil {
-			for _, r := range srvs {
-				fmt.Printf("server:  %s %s code %s, %d services, seen %s ago\n", r.Key, r.State, r.CodeVersion, len(r.Services), time.Since(r.At).Round(time.Second))
-			}
+		for _, w := range warns {
+			fmt.Println("warning:", w)
+		}
+		if err != nil {
+			how := pin.Install[runtimeOS()]
+			return fmt.Errorf("broker_missing: %v\n  install once: %s\n  then: just broker-config && just broker-run", err, how)
 		}
 		return nil
 	}
-	return errors.New("usage: ai_processing_server broker install|config|status|uninstall")
+	return fmt.Errorf("usage: ai_processing_server broker status|config")
 }
+
+// cmdEnable turns services (or the queue) on or off in this_server.yaml at the owner's request, keeping comments
+// (config.SetEnabled). A running server reads the file at boot: restart it (`just stop && just run`) to apply.
+func cmdEnable(p paths, items []string, on bool) error {
+	if len(items) == 0 {
+		return errors.New("usage: ai_processing_server enable|disable <service-id|queue>...")
+	}
+	cat, err := config.LoadCatalog(p.Data)
+	if err != nil {
+		return err
+	}
+	did, err := config.SetEnabled(p.Config, cat, items, on)
+	for _, d := range did {
+		fmt.Println(d)
+	}
+	if err != nil {
+		return err
+	}
+	if c, cerr := newClient(p); cerr == nil && c.do("GET", "/v1/health", &map[string]any{}) == nil {
+		fmt.Println("the server is running on the old settings: restart it to apply (just stop && just run)")
+	}
+	return nil
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func runtimeOS() string { return runtime.GOOS }

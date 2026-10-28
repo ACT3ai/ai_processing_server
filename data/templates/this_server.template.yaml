@@ -11,6 +11,7 @@ server:
   profile: {{.ID.Profile}}            # generic | b5090 | bpc | bmt | bms | cloud
   family: {{.ID.Family}}              # bryan | office | cloud | runpod
   site: {{.ID.Site}}
+  servers_dir: "{{.ID.ServersDir}}"    # its directory under servers/ (public key published there); "" = not checked in
   bound_to:                           # a mismatch at boot means this file was copied from another machine
     hostname: "{{.ID.BoundTo.Hostname}}"
     machine_id: "{{.MachineID}}"
@@ -27,7 +28,7 @@ engines: {}
 services:
 {{.ServicesYAML}}
 
-platforms:                            # connections are not built yet (phase 3); kept for the shape
+platforms:                            # superseded by queue + callers below (task_queue.mdx §17.1); kept for the shape
   act3:
     enabled: false
     base_url: "https://api.act3ai.com"
@@ -58,29 +59,41 @@ local_api:
   token_file: "~/.credentials/ai_processing_server_local.token"
   allow_direct_jobs: true             # POST /v1/jobs without a platform (development, self tests, owner batches)
 
-# The task queue (pm/task_queue.mdx §17.1). The broker is a separate nats-server service on this machine:
-# `just broker-install` once, then `just broker-config` after editing this section.
+# The task queue: NATS JetStream in its own nats-server process on this machine (pm/task_queue.mdx §8.2, D-014).
+# Install the broker once with `just broker-install`, write its config with `just broker-config`, start it with
+# `just broker-run` (or as an OS service). Without a reachable broker the server still runs direct mode and
+# GET /v1/health reports broker: broker_missing with the fix.
 queue:
-  role: standalone                    # standalone today; worker | hub arrive in phase Q3
-  broker_url: "nats://127.0.0.1:4244" # this machine's own nats-server (4244, not 4222, which other apps use)
-  hub_url: ""                         # phase Q3: the cloud hub this machine's leaf node connects to
-  credentials_file: ""                # phase Q3: NATS .creds for this server
-  broker_version: ""                  # empty: the supported range in data/queue/broker.yaml
-  store_dir: "~/.act3_processing/nats/jetstream"   # outside the repo; the broker's own files
+  enabled: true
+  role: standalone                    # standalone | worker (hub is build phase Q3)
+  broker_url: "nats://127.0.0.1:4222"
+  hub_url: ""                         # worker only: the hub's leaf-node URL, used by broker-config
+  credentials_file: ""                # NATS .creds file; empty for a local standalone broker
+  broker_version: "2.15"              # supported nats-server line; any other line logs a warning
+  store_dir: "~/.act3_processing/nats/jetstream"
   store_max_gb: 20
 
-# Task continuity across code updates (§9): running jobs live in detached task hosts and survive restarts.
-continuity:
-  ack_wait: 5m                        # must exceed the slowest controller restart
-  heartbeat: 20s                      # how often a held job's claim is renewed
-  taskhost_claims: false              # self-claim mode (phase Q3)
-  keep_snapshots: 5                   # code snapshots kept besides those in use
+continuity:                           # pm/task_queue.mdx §9
+  ack_wait: 5m                        # a claim not extended this long is handed to another worker
+  heartbeat: 20s                      # how often a held job's claim is extended
 
-# Who may submit work here, and how the owner's own jobs rank (§14.5).
-callers:
+callers:                              # whose queued jobs this machine pulls (shares and accept/deny: phase Q2)
+  act3:
+    enabled: true
+  wtc:
+    enabled: true
   local:
     enabled: true
-    mode: first                       # first | share | idle_only
+    mode: {{.LocalMode}}                 # first | share | idle_only: how this machine ranks its owner's jobs (task_queue.mdx §14.5)
+
+models:                               # the owner's model fence (task_queue.mdx §11.2): deny wins; empty allow = every model
+  allow: []                           # e.g. ["wan2.2-*", "seedvr2*", "whisper-*"]
+  deny: []                            # vendor:* models are refused on every processing server regardless (D-021)
+
+# Server identity key (pm/security.mdx §4). The PRIVATE key never leaves this machine and is never committed.
+# key_dir "" = data/git_ignore/keys. Init points it at the credentials checkout's git-ignored keys/ when there is one.
+security:
+  key_dir: "{{.KeyDir}}"
 
 debug:
   keep_work_dirs: false

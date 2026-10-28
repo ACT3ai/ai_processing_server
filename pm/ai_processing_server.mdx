@@ -7,8 +7,7 @@ description: "CTO engineering spec for the Go single-binary processing server th
 
 # ai_processing_server: engineering specification
 
-**Owner:** CTO · **As of:** 2026-10-27 · **Status:** v0.1.0 built (phases 0–2 mostly done); task queue phase Q1 built on NATS JetStream
-([task_queue.mdx](./task_queue.mdx), D-Q1); see §24.2
+**Owner:** CTO · **As of:** 2026-10-27 · **Status:** v0.1.0 built (phases 0–2 mostly done; see §24.2)
 · **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
 · **Siblings:** `~/BGit/all/film/pm/subp/render_queue/RenderEngine.mdx` (the engine that decides which server gets a
 job) · `~/BGit/all/film/pm/subp/render_queue/bryan_servers.mdx` (the home fleet B5090, BPC, BMT, BMS and the admin
@@ -485,7 +484,9 @@ The hostname values above are placeholders until Bryan confirms the real names (
 | Machine id | `ioreg -rd1 -c IOPlatformExpertDevice` (IOPlatformUUID) | registry `MachineGuid` | `/etc/machine-id` |
 
 Every probe has a timeout (5 s for commands, 2 s for URLs), runs with an empty stdin, and never needs admin or root
-rights. A failing probe records `error` on that fact and the rest continue: a broken `nvidia-smi` must not stop a
+rights. The exception is slow probes such as macOS `system_profiler`, which get 30 s and one retry. On a loaded Mac
+Studio (load average 24), a 5 s timeout missed the GPU and turned off every GPU service for the whole session (fixed
+2026-10-27, `~/BGit/act3/ai_processing_server/code/internal/hardware/detect.go` — `runSlow`). A failing probe records `error` on that fact and the rest continue: a broken `nvidia-smi` must not stop a
 CPU-only service from running.
 
 ### 7.2 Engines catalog
@@ -693,12 +694,6 @@ What a platform sends in a lease response (JSON, schema `data/schemas/job_envelo
 
 ### 9.2 States on the server
 
-**Since task queue phase Q1 (2026-10-27):** the job record uses the task queue's states (task_queue.mdx §13.4,
-D-014): `SUBMITTED`, `QUEUED`, `CLAIMED`, `STAGING`, `RUNNING`, `UPLOADING`, then `SUCCEEDED`, `FAILED`, `CANCELLED`,
-`EXPIRED` or `REJECTED`. `LEASED` became `CLAIMED`; `REPORTING` and `DONE` became the final event and `SUCCEEDED`
-(the event is published before the broker message is acked). The table below keeps the platform-status mapping, which
-did not change.
-
 ```
 LEASED ──► STAGING ──► RUNNING ──► UPLOADING ──► REPORTING ──► DONE
    │          │           │            │              │
@@ -730,10 +725,6 @@ treated as one 32 GB card (bryan_servers.mdx §7.3.2).
 
 ### 9.4 Leases
 
-**Superseded by task_queue.mdx §14.4 and §16 (D-Q1):** a worker pulls one job per free slot from the broker, renews
-the claim with "in progress" every `continuity.heartbeat`, and fences its result with the `job_state` revision. The
-rules below are kept for history.
-
 * The server only leases what it can start soon: at most `free slots + 1` jobs per service waiting locally, so it never
   hoards work another server could start now.
 * It renews each lease every `renew_every_s` (default 20 s, lease length 60 s) with progress attached. A renewal
@@ -744,11 +735,6 @@ rules below are kept for history.
   double results are not.
 
 ### 9.5 The journal and crash recovery
-
-**Superseded by task_queue.mdx §9 (phase Q1):** a running job lives in a detached task host, so a controller restart
-or crash no longer fails it. The next controller re-adopts it from `runs/<job_id>/run.json`; only a task host that is
-gone (a reboot) makes the job go back on the queue as `infra`. The journal is now `state/jobs/<job_id>.json`. The
-rules below are kept for history.
 
 * Every state change writes `state/journal/<job_id>.json` (state, attempt, lease id, slot, started time, work dir)
   atomically before acting on it.
@@ -835,8 +821,8 @@ renders, and the reverse, without hard partitions that waste idle time.
 **Goal of this section:** the broker decision (open in CLAUDE.md), with a recommendation.
 
 **Superseded 2026-10-27:** the transport and queueing layer is now specified in [task_queue.mdx](./task_queue.mdx)
-(NATS JetStream run as its own `nats-server` service, with detached task hosts that survive code updates; decision
-D-Q1 there, **confirmed by Bryan on 2026-10-27**, which replaces D-001 below). This section is kept for history.
+(NATS JetStream run as its own `nats-server` service, with detached task hosts that survive code updates; decided
+decision D-Q1 there, which replaces D-001 below). This section is kept for history.
 
 ### 11.1 Options
 
@@ -939,6 +925,10 @@ shown as the reason in offers.
 | `GET /v1/jobs/{id}` | one job: envelope (inputs and params, URLs redacted), state history, slot, progress |
 | `GET /v1/jobs/{id}/log` | the per-job log (text, supports `?tail=200`) |
 | `POST /v1/jobs/{id}/cancel` | owner cancel; reported to the platform as cancelled by the machine owner |
+| `POST /v1/queue/jobs` | submit a task envelope (task_queue.mdx §13.2) to the queue as caller `local`; 202 with `{job_id, band, subject, sequence, duplicate}`; 503 `broker_missing` when the broker is down (v0.2.0) |
+| `GET /v1/queue/jobs/{id}` | the job's `job_state` (§13.4 states), its revision and every event, from the broker, whichever server ran it |
+| `POST /v1/queue/jobs/{id}/cancel` | set the job's cancel flag; the server holding it stops it, or it is cancelled when pulled |
+| `GET /v1/broker` | broker connection, stream sizes, waiting lanes, held claims, live servers (`GET /v1/health` carries a short `broker` object) |
 | `POST /v1/jobs` | **direct mode**: submit a job locally without a platform (development, `sys.self_test`, owner's own batch). Off unless `local_api.allow_direct_jobs: true` |
 | `POST /v1/drain` · `/v1/resume` | stop taking work / start again |
 | `POST /v1/reload` | reload `this_server.yaml` and `data/` (all or nothing) |
@@ -1309,26 +1299,41 @@ queue on the same day the lease endpoint starts serving it. No job type is serve
 
 | Id | Decision | Status |
 | --- | --- | --- |
-| D-001 | Transport: HTTPS lease API as the contract, Temporal adapter optional for migration, RabbitMQ not now (§11) | **proposed**, Bryan to confirm |
+| D-001 | Transport: HTTPS lease API as the contract, Temporal adapter optional for migration, RabbitMQ not now (§11) | **superseded** 2026-10-27 by D-014: NATS JetStream in its own `nats-server` process ([task_queue.mdx](./task_queue.mdx)) |
 | D-002 | `this_server.yaml` is written only by `init` when missing; machine-written state goes to `state/` | decided by the request |
-| D-003 | Owner allow-list is a hard fence; platforms set priority, weight, pause and drain only inside it (§10.1) | proposed |
-| D-004 | Effective hardware = min(detected, declared) (§7.4) | proposed |
-| D-005 | Pure Go build (`CGO_ENABLED=0`); GPU facts from vendor CLIs (§3.1) | proposed |
-| D-006 | Local API on `127.0.0.1:9440` with a bearer token (§13) | proposed |
-| D-007 | Priority scale shared with ACT3's `JobPriority` (§10.2) | proposed |
+| D-003 | Owner allow-list is a hard fence; platforms set priority, weight, pause and drain only inside it (§10.1) | decided 2026-10-27 (D-022) |
+| D-004 | Effective hardware = min(detected, declared) (§7.4) | decided 2026-10-27 (D-022) |
+| D-005 | Pure Go build (`CGO_ENABLED=0`); GPU facts from vendor CLIs (§3.1) | decided 2026-10-27 (D-022) |
+| D-006 | Local API on `127.0.0.1:9440` with a bearer token (§13) | decided 2026-10-27 (D-022) |
+| D-007 | Priority scale shared with ACT3's `JobPriority` (§10.2) | decided 2026-10-27 (D-022) |
 
-## 23. Open questions for Bryan
+## 23. Decisions on the open questions
 
-1. **Q1. Transport (D-001):** confirm HTTPS lease as the contract, or do you want RabbitMQ from the start?
-2. **Q2. Hostnames** of B5090, BPC, BMT and BMS for `known_servers.yaml`, so `init` names them without typing.
-3. **Q3. Default share** between ACT3 and WTC on the Bryan 4 (this spec proposes 70/30 on B5090 and BPC, 30/70 on BMS
-   where transcription fits best).
-4. **Q4. WTC's first services:** transcription, AI descriptions, OCR and transcodes are assumed from the Large File
-   Bridge work. Which come first, and does WTC already have a job table to lease from?
-5. **Q5. Quiet hours** at Bryan's office for the GPU machines (fan noise), or none?
-6. **Q6. Direct mode** (`POST /v1/jobs`) for your own batches (marketing videos, transcriptions) without going through
-   a platform: wanted on by default on the Bryan 4?
-7. **Q7. Customer work on BMS** (bryan_servers.mdx §18 Q1): still R&D and marketing only?
+**Answered 2026-10-27** by the CTO pass, at Bryan's request. Recorded as D-022 in pm/Decisions.yaml.
+
+1. **Q1. Transport:** NATS with JetStream as a separate `nats-server` process (D-014).
+2. **Q2. Hostnames:** the first `init` on each machine records its real hostname in `this_server.yaml`. The preset
+   line in `known_servers.yaml` is then corrected by pull request. Guessed hostnames do not block anything, because
+   `init` also matches on GPU hints and an unmatched machine gets `CHANGE_ME` and a clear message. Observed
+   2026-10-27: a machine named `Bryans-Mac-Pro-2024` ran `init` and got `CHANGE_ME`. If it is BMT, add that hostname
+   to BMT's preset.
+3. **Q3. Default shares (ACT3 / WTC):**
+   * 70/30 on B5090 and BPC.
+   * 30/70 on BMS, where transcription fits.
+   * 80/20 on the Nepal machines.
+
+   These are written as `callers.<id>.share` once shares are built (build phase Q2). Until then, strict band order
+   applies (D-015).
+4. **Q4. WTC's first services:** transcription first, transcode second, OCR and AI descriptions later. WTC submits
+   through NATS (`nats.go` is already in its backend). There is no job-table lease (D-001 is superseded).
+5. **Q5. Quiet hours: none.** The GPU boxes run around the clock. An owner who wants quiet uses `pause` or
+   `local_mode: first` on that machine.
+6. **Q6. Direct mode:** on by default on every machine, but bound to `127.0.0.1` with the bearer token (D-006). It is
+   the door for Bryan's own batches and internal software. Queued local jobs (`POST /v1/queue/jobs`, caller `local`)
+   are the preferred door because they survive restarts.
+7. **Q7. Customer work on BMS: yes.** Bryan named the Mac Studio as a render queue server for Wan 2.2 and the
+   upscaler (third dictation). Its `bms` profile keeps OpenClaw first: it declines GPU work while OpenClaw is busy,
+   and it reserves `memory_reserve_gb`.
 
 ## 24. Source code map and upgrade log
 
@@ -1348,25 +1353,20 @@ Loading and validating `this_server.yaml` and the `data/` catalogs is implemente
 Turning hardware and allowed services into offers is implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/capability/offers.go` — `ComputeOffers`
 
-Slots, and pulling work from the task queue only when a slot is free, are implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/scheduler/broker.go` — `Server.pull`, `Server.claim` (slots in `slots.go`, `SlotPool`)
+Slots, admission and the effective priority are implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.admit`, `Server.effPriority` (slots in `slots.go`, `SlotPool`)
 
-Submitting through the task queue (local API → SUBMIT) is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.Submit`
-
-Receiving work from ACT3 and WTC is task queue phase Q3 (hub and leaf nodes), not built yet; see task_queue.mdx §22.
+Leasing from ACT3 and WTC will be implemented in code (phase 3, not built yet):
+`~/BGit/act3/ai_processing_server/code/internal/broker/httplease/` — `Source`
 
 The local API is implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/api/api.go` — `NewRouter`
 
-One attempt of a job (stage inputs, run, fence, upload) runs in a detached task host, implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `Run`, `host.attempt`
+The job lifecycle (stage, run, upload, retry, cancel) is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/execute.go` — `Server.execute`, `Server.finishLocked`
 
-Retry, cancel, the final event and acking are implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/scheduler/supervise.go` — `Server.finalize`, `retryable`; cancel in `broker.go`, `Server.applyControl`
-
-Recovery after a controller restart (re-adopting running jobs) is implemented in code:
-`~/BGit/act3/ai_processing_server/code/internal/scheduler/supervise.go` — `Server.readopt`
+Crash recovery from the journal is implemented in code:
+`~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.recover`
 
 The black-box test suite (how it runs, what each suite proves) is documented in:
 `~/BGit/act3/ai_processing_server/tests/README.md`
@@ -1380,7 +1380,3 @@ The black-box test suite (how it runs, what each suite proves) is documented in:
   D-008). Runners built: `compute`, `render`, `ffmpeg`. The laptop's hand-written legacy `this_server.yaml` is left
   untouched; the server runs from a generated config and wrote `this_server.yaml.new` to merge.
 * 2026-10-27: security.mdx and apis.mdx written; §14.1 superseded (signed requests replace bearer tokens).
-* 2026-10-27: Bryan confirmed D-Q1. Task queue phase Q1 built (task_queue.mdx §25.2): jobs go through a separate
-  nats-server (SUBMIT → admission → WORK → pull when a slot is free) and run in detached task hosts from frozen code
-  snapshots, so a controller restart or a new build never stops a running job. The record now uses the task queue's
-  names and states (D-014); §9.2, §9.4 and §9.5 are marked superseded. Black-box suite: 86 tests.

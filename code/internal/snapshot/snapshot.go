@@ -1,40 +1,31 @@
-// Package snapshot makes the frozen, read-only copy of the code a job runs from (pm/task_queue.mdx §9.2), so a
-// `git pull` and `just build` during a 30-minute render can never change the code under it.
+// Package snapshot freezes the code a task runs: a read-only copy of the binary (the task host shim), the runner
+// scripts under code/scripts/ and the service catalogs, keyed by their content (pm/task_queue.mdx §9.2,
+// pm/task_authoring.mdx R1–R2). A task started from a snapshot never sees a later git pull: the pull changes the
+// working tree, the next job builds a new snapshot, and the running one keeps reading its own copy.
 //
-// Today every runner is compiled into the binary, so a snapshot is the binary itself plus the data/ catalogs a
-// runner reads. TypeScript bundles and Python runner trees will be added to the same directory when those runners
-// exist; the id already covers them because it hashes the binary that would launch them.
+// The key is a content hash, not the git commit, so a dirty working tree and a rebuilt binary are both caught and
+// two identical trees share one snapshot.
 package snapshot
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 )
 
-var elog = errlog.For("snapshot")
+// Dirs copied from the source root into every snapshot, at the same relative paths.
+var Dirs = []string{filepath.Join("code", "scripts"), filepath.Join("data", "services")}
 
-// Snapshot is one frozen copy.
-type Snapshot struct {
-	ID           string    `json:"id"` // <git_sha>-<first 8 hex of the binary's sha256>
-	GitSHA       string    `json:"git_sha"`
-	BinarySHA256 string    `json:"binary_sha256"`
-	CreatedAt    time.Time `json:"created_at"`
-	Dir          string    `json:"-"`
-	Binary       string    `json:"-"` // the task host shim to launch
-}
-
-// BinaryName is the executable's file name on this OS.
+// BinaryName is the binary's name inside a snapshot.
 func BinaryName() string {
 	if runtime.GOOS == "windows" {
 		return "ai_processing_server.exe"
@@ -42,131 +33,166 @@ func BinaryName() string {
 	return "ai_processing_server"
 }
 
-// Ensure returns the snapshot of the running binary, building it under root (data/git_ignore/snapshots) the first
-// time. Call it once at startup, before anything can rebuild the binary on disk: the copy is made from the file the
-// process was started from, and a later `just build` replaces that file.
-func Ensure(root, exe, gitSHA, dataDir string) (*Snapshot, error) {
-	sum, err := hashFile(exe)
+// Snapshot is one frozen copy.
+type Snapshot struct {
+	Key string // 12 hex characters of the content hash
+	Dir string // absolute path: <base>/<key>
+}
+
+// Binary is the task host shim inside the snapshot.
+func (s Snapshot) Binary() string { return filepath.Join(s.Dir, BinaryName()) }
+
+// Path returns rel (slash-separated, relative to the repo root) inside the snapshot.
+func (s Snapshot) Path(rel string) string { return filepath.Join(s.Dir, filepath.FromSlash(rel)) }
+
+var mu sync.Mutex
+
+// Ensure returns the snapshot of srcRoot (the repo checkout) and binary under base, building it on first use.
+// Building is atomic: a half-copied snapshot is never visible under its key.
+func Ensure(srcRoot, binary, base string) (Snapshot, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	files, err := list(srcRoot)
 	if err != nil {
-		return nil, fmt.Errorf("hash %s: %w", exe, err)
+		return Snapshot{}, err
 	}
-	if gitSHA == "" {
-		gitSHA = "unknown"
-	}
-	s := &Snapshot{ID: gitSHA + "-" + sum[:8], GitSHA: gitSHA, BinarySHA256: sum}
-	s.Dir = filepath.Join(root, s.ID)
-	s.Binary = filepath.Join(s.Dir, BinaryName())
-	if b, err := os.ReadFile(filepath.Join(s.Dir, "snapshot.json")); err == nil {
-		var have Snapshot
-		if json.Unmarshal(b, &have) == nil && have.BinarySHA256 == sum {
-			s.CreatedAt = have.CreatedAt
-			return s, nil
-		}
-	}
-	tmp, err := os.MkdirTemp(root, ".building-")
+	key, err := hashAll(binary, srcRoot, files)
 	if err != nil {
-		if err := os.MkdirAll(root, 0o700); err != nil {
-			return nil, err
+		return Snapshot{}, err
+	}
+	s := Snapshot{Key: key, Dir: filepath.Join(base, key)}
+	if _, err := os.Stat(filepath.Join(s.Dir, ".complete")); err == nil {
+		now := time.Now()
+		os.Chtimes(s.Dir, now, now) // last used, for Prune
+		return s, nil
+	}
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return Snapshot{}, err
+	}
+	tmp, err := os.MkdirTemp(base, ".building-")
+	if err != nil {
+		return Snapshot{}, err
+	}
+	defer os.RemoveAll(tmp)
+	if err := copyFile(binary, filepath.Join(tmp, BinaryName()), 0o500); err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot binary: %w", err)
+	}
+	for _, rel := range files {
+		if err := copyFile(filepath.Join(srcRoot, rel), filepath.Join(tmp, rel), 0o400); err != nil {
+			return Snapshot{}, fmt.Errorf("snapshot %s: %w", rel, err)
 		}
-		if tmp, err = os.MkdirTemp(root, ".building-"); err != nil {
-			return nil, err
-		}
 	}
-	defer func() { elog.Ignore("removing a half-built snapshot", os.RemoveAll(tmp)) }()
-	if err := copyFile(exe, filepath.Join(tmp, BinaryName()), 0o555); err != nil {
-		return nil, err
+	if err := os.WriteFile(filepath.Join(tmp, ".complete"), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o400); err != nil {
+		return Snapshot{}, err
 	}
-	// The binary has the same hash as the running process only if the file was not replaced while we copied it.
-	if got, err := hashFile(filepath.Join(tmp, BinaryName())); err != nil || got != sum {
-		return nil, fmt.Errorf("%s changed while it was being copied (a build running?); restart the server", exe)
-	}
-	for _, sub := range []string{"services", "queue"} {
-		if err := copyTree(filepath.Join(dataDir, sub), filepath.Join(tmp, "data", sub)); err != nil {
-			return nil, err
-		}
-	}
-	s.CreatedAt = time.Now().UTC()
-	b, _ := json.MarshalIndent(s, "", "  ")
-	if err := os.WriteFile(filepath.Join(tmp, "snapshot.json"), b, 0o444); err != nil {
-		return nil, err
-	}
-	if err := os.RemoveAll(s.Dir); err != nil { // a broken earlier attempt
-		return nil, err
-	}
+	os.RemoveAll(s.Dir) // an incomplete leftover from a crash
 	if err := os.Rename(tmp, s.Dir); err != nil {
-		return nil, err
+		return Snapshot{}, err
 	}
 	return s, nil
 }
 
-// GC removes snapshots that are not in use and not among the newest keep (§9.2).
-func GC(root string, keep int, inUse map[string]bool) (removed []string) {
-	entries, err := os.ReadDir(root)
+// Prune deletes snapshots beyond the newest keep, never one in inUse.
+func Prune(base string, keep int, inUse map[string]bool) (removed []string) {
+	mu.Lock()
+	defer mu.Unlock()
+	ents, err := os.ReadDir(base)
 	if err != nil {
 		return nil
 	}
 	type snap struct {
-		id string
-		at time.Time
+		name string
+		at   time.Time
 	}
 	var all []snap
-	for _, e := range entries {
+	for _, e := range ents {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		at := time.Time{}
-		if info, err := e.Info(); err == nil {
-			at = info.ModTime()
+		if fi, err := e.Info(); err == nil {
+			all = append(all, snap{e.Name(), fi.ModTime()})
 		}
-		all = append(all, snap{e.Name(), at})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].at.After(all[j].at) })
 	for i, s := range all {
-		if i < keep || inUse[s.id] {
+		if i < keep || inUse[s.name] {
 			continue
 		}
-		p := filepath.Join(root, s.id)
-		makeWritable(p)
-		if elog.Check("removing an old code snapshot", os.RemoveAll(p), "path", p) == nil {
-			removed = append(removed, s.id)
+		dir := filepath.Join(base, s.name)
+		makeWritable(dir)
+		if os.RemoveAll(dir) == nil {
+			removed = append(removed, s.name)
 		}
 	}
 	return removed
 }
 
-// makeWritable lets RemoveAll delete the read-only files of a snapshot (needed on Windows).
-func makeWritable(dir string) {
-	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
-		if err == nil {
-			os.Chmod(p, 0o700)
+// list returns the files under Dirs, relative to root, sorted.
+func list(root string) ([]string, error) {
+	var out []string
+	for _, d := range Dirs {
+		err := filepath.WalkDir(filepath.Join(root, d), func(p string, e fs.DirEntry, err error) error {
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			name := e.Name()
+			if e.IsDir() {
+				if name == "__pycache__" || name == "node_modules" || (strings.HasPrefix(name, ".") && p != filepath.Join(root, d)) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".pyc") || !e.Type().IsRegular() {
+				return nil
+			}
+			rel, _ := filepath.Rel(root, p)
+			out = append(out, rel)
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		return nil
-	})
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
-func hashFile(p string) (string, error) {
-	f, err := os.Open(p)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
+func hashAll(binary, root string, files []string) (string, error) {
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	add := func(name, path string) error {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		fmt.Fprintf(h, "%s\x00", filepath.ToSlash(name))
+		_, err = io.Copy(h, f)
+		return err
+	}
+	if err := add("<binary>", binary); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	for _, rel := range files {
+		if err := add(rel, filepath.Join(root, rel)); err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12], nil
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o700)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -180,15 +206,15 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	return os.Chmod(dst, mode)
 }
 
-func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
+func makeWritable(dir string) {
+	filepath.WalkDir(dir, func(p string, e fs.DirEntry, err error) error {
+		if err == nil {
+			if e.IsDir() {
+				os.Chmod(p, 0o700)
+			} else {
+				os.Chmod(p, 0o600)
+			}
 		}
-		rel, _ := filepath.Rel(src, p)
-		if d.IsDir() {
-			return os.MkdirAll(filepath.Join(dst, rel), 0o700)
-		}
-		return copyFile(p, filepath.Join(dst, rel), 0o444)
+		return nil
 	})
 }
