@@ -58,6 +58,29 @@ func TestRunsToTheEndAndReportsEvents(t *testing.T) {
 	}
 }
 
+// A runner that speaks ACT3_STAGE / ACT3_PROGRESS owns its progress: the weight-loading tqdm bars Wan prints after
+// "ACT3_STAGE loading" must not read as the job being 100% done.
+func TestOwnGrammarMutesThirdPartyBars(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.mp4")
+	script := `echo "ACT3_STAGE loading"; sleep 1.1; echo "Loading checkpoint shards: 100%|##########| 12/12"; sleep 1.1; ` +
+		`echo "ACT3_STAGE rendering"; echo "ACT3_PROGRESS 25.0"; printf video > "` + out + `"`
+	if err := Launch(selfHost(), dir, Task{JobID: "j1", Snapshot: "test", Argv: []string{"/bin/sh", "-c", script}, Output: out}); err != nil {
+		t.Fatal(err)
+	}
+	var got []float64
+	if _, err := Watch(context.Background(), dir, func(e Event) {
+		if e.Type == "progress" {
+			got = append(got, e.Progress)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != 0.25 {
+		t.Fatalf("progress events %v, want only [0.25]", got)
+	}
+}
+
 // The heart of continuity: the watcher (the controller) goes away mid-task, a new one attaches, and the task still
 // finishes once, without being started again.
 func TestSurvivesTheControllerGoingAway(t *testing.T) {

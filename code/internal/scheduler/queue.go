@@ -729,7 +729,19 @@ func (s *Server) QueueSubmit(ctx context.Context, env *queue.Envelope) (queue.Su
 	if env.JobID == "" {
 		env.JobID = newID()
 	}
-	return q.Submit(ctx, env)
+	ack, err := q.Submit(ctx, env)
+	if err != nil {
+		return ack, err
+	}
+	// Admission creates job_state, create-only (§16.4), so GET /v1/queue/jobs/{id} answers QUEUED from the moment the
+	// job is accepted. Without it a job waiting behind a busy slot reads as 404 and the caller takes it for lost
+	// (2026-10-28: the Wan engine gave up on three live tasks within 22 s and they rendered for nobody). An existing
+	// key (a claim that raced us, or a re-submit) wins: ErrFenced is the expected answer then.
+	st := queue.JobState{JobID: env.JobID, Caller: env.Caller, Service: env.Service, State: queue.StateQueued, Band: ack.Band}
+	if _, err := q.CASState(ctx, st, 0); err != nil && !errors.Is(err, queue.ErrFenced) {
+		s.log.Warn("queued job has no job_state yet; it reads as not found until a server claims it", "job_id", env.JobID, "error", err)
+	}
+	return ack, nil
 }
 
 // QueueJob is GET /v1/queue/jobs/{id}: the job's job_state and every event the caller has been sent.
