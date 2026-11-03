@@ -83,3 +83,16 @@ func TestLocalModeAndModels(t *testing.T) {
 		t.Error("empty allow list allows every non-vendor model")
 	}
 }
+
+// A dev machine (server.dev, Bryan's Mac Tower) only ever runs its owner's own jobs and never joins the fleet.
+func TestDevMachineRunsOnlyLocalJobs(t *testing.T) {
+	ts := &ThisServer{Server: Identity{Key: "BMT", Dev: true},
+		Callers: map[string]CallerSetting{"act3": {Enabled: true}, "wtc": {Enabled: true}, "local": {Enabled: true}}}
+	if got := ts.EnabledCallers(); len(got) != 1 || got[0] != "local" {
+		t.Fatalf("dev machine callers = %v, want [local]", got)
+	}
+	ts.Server.Dev = false
+	if got := ts.EnabledCallers(); len(got) != 3 {
+		t.Fatalf("render server callers = %v", got)
+	}
+}

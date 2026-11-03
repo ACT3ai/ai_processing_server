@@ -14,12 +14,12 @@
 
 - id: D-003
   title: "The owner's allow-list is a hard fence; platforms set priority, weight, pause and drain only inside it"
-  status: decided 2026-10-27 (D-022: every proposed decision confirmed)
+  status: "decided 2026-10-27 (D-022: every proposed decision confirmed)"
   date: 2026-10-27
 
 - id: D-004
   title: "Effective hardware = min(detected, declared)"
-  status: decided 2026-10-27 (D-022: every proposed decision confirmed)
+  status: "decided 2026-10-27 (D-022: every proposed decision confirmed)"
   date: 2026-10-27
 
 - id: D-005
@@ -30,12 +30,12 @@
 
 - id: D-006
   title: "Local API on 127.0.0.1:9440 with a bearer token"
-  status: decided 2026-10-27 (D-022: every proposed decision confirmed)
+  status: "decided 2026-10-27 (D-022: every proposed decision confirmed)"
   date: 2026-10-27
 
 - id: D-007
   title: "Priority scale shared with ACT3's JobPriority (0..300)"
-  status: decided 2026-10-27 (D-022: every proposed decision confirmed)
+  status: "decided 2026-10-27 (D-022: every proposed decision confirmed)"
   date: 2026-10-27
 
 - id: D-008
@@ -210,3 +210,93 @@
     pm/security.mdx §21 answered. Storage allow-list uses the live IPFS gateways (orbitor, filebase, pinata, ipfs-lens);
     ipfs.io and dweb.link are retired and refused.
   why: "Bryan asked for every open question to be decided (2026-10-27)."
+
+- id: D-024
+  title: "BMT (Bryan's Mac Tower, Mac Pro 2024, hostname Bryans-Mac-Pro-2024) is a dev machine, not a render server"
+  status: decided
+  date: 2026-10-28
+  decision: >
+    BMT is Bryan's development and debugging machine. Its known_servers.yaml preset has dev: true and profile generic
+    (the bmt profile is retired). On a dev machine init writes callers act3 and wtc off, the server pulls only local
+    jobs whatever the file says (ThisServer.EnabledCallers), queue.role worker fails validation, and
+    `service install` refuses. Debugging there uses `just run` / `just run-fg` as before. Supersedes the BMT parts of
+    D-021 (local mode "first" on BMT stays, for its own local jobs only).
+  why: "Bryan, 2026-10-28: the Mac Tower is a dev machine, not a render server; the earlier BMT preset implied it was."
+  code: >
+    code/internal/config/types.go (Identity.Dev, KnownServer.Dev, EnabledCallers); code/internal/config/load.go
+    (Validate); code/internal/config/init.go (Generate); data/templates/this_server.template.yaml;
+    data/servers/known_servers.yaml; code/cmd/ai_processing_server/main.go (cmdService).
+
+- id: D-025
+  title: "Resilience: checkpointed task-host steps (R8), segmented SeedVR2 upscale, orphan task-host sweep, snapshot pruning, OS services"
+  status: decided
+  date: 2026-10-28
+  decision: >
+    A task host may run a list of steps; each finished step is a checkpoint (checkpoint/<n>.done = output size). A
+    dead task host (reboot, crash) with checkpoints is relaunched in the same run directory on its own snapshot and
+    skips finished steps; without checkpoints it starts over as before. SeedVR2 upscales longer than 1.5 segments
+    (default 30 s of source, params.segment_seconds, 0 = off) run as cut / upscale per segment / join, with segment
+    length a whole number of SeedVR2 batches so the joins add no seam. Wan stays one step (one diffusion pass). The
+    sweep cancels a task host whose job this server no longer holds (only after the boot reclaim settled), removes
+    run directories nothing holds after 1 h (24 h with checkpoints, for a redelivery to resume), and prunes code
+    snapshots beyond the newest 3, never one a kept run directory names. `just install-service` installs nats-server
+    and the server as OS services (launchd agents, systemd user units, Task Scheduler) that restart on a crash and
+    start at boot/login.
+  why: "Bryan, 2026-10-28: the task layer must handle broker restarts, reboots, double delivery, short jobs and
+    frequent code updates with real resilience. A reboot used to restart a 30-minute upscale from zero, a direct job's
+    task host kept rendering after a restart with nobody collecting it (holding a GPU the slot pool thought free),
+    run directories and snapshots were never cleaned up, and nothing restarted the broker or server after a power cut."
+  code: >
+    code/internal/taskhost/taskhost.go (Task.Steps, Checkpoints, Relaunch); code/internal/runners/oss.go (resume);
+    code/internal/runners/oss_segments.go (segmentedSteps, planSegments); code/internal/runners/oss_upscale.go;
+    code/internal/scheduler/runs.go (sweepRuns); code/internal/service/service.go; justfile install-service.
+
+- id: D-026
+  title: "Hardening for broker outages, power cuts, duplicate delivery, git pulls and full disks: settlement outbox, durable control files, boot/pid liveness, death limit, output validation, consistent snapshots, detach on stop"
+  status: decided
+  date: 2026-10-28
+  decision: >
+    (1) Settlement outbox: when a queued job ends, its outcome (job_state, final event, ack/requeue/dead) is written to
+    the job's journal entry (jobs.Job.Settle) before any broker call, and retried until the broker took all of it; it
+    is resumed at boot, kept by the sweep, and a redelivery of a job that is in the outbox is settled from it instead
+    of running the job again. Each step is done once: a fenced job_state write that already holds our outcome counts as
+    written (lost reply), and the stored events are checked before a final event is published again, because EVENTS
+    dedupes message ids for 2 minutes only and a second "succeeded" would bill twice. The ack step gives up after 5
+    tries (job_state is final by then, so the redelivery is acked as a duplicate). (2) natsq: a failed Ack/Requeue/Dead
+    no longer marks the delivery settled, and acks are not buffered while disconnected. (3) The boot reclaim drops a
+    saved claim only on a definite answer; while the broker is unreachable the claim is kept (so the orphan sweep never
+    cancels its task host) and retried every 5 s. (4) A stop signal (just update / restart) lets go of queued jobs
+    running in detached task hosts at once, leaving them active with their claim in the journal for the next
+    controller (task_queue.mdx §9.5); before, the stop waited out drain_timeout_s and then failed the job as infra, so
+    it was requeued and re-rendered elsewhere while its task host kept rendering here. (5) Control files are written
+    through internal/fsx: unique temp + rename, and fsync of file and directory for the journal, task.json,
+    checkpoints, exit.json, deaths.json and snapshot manifests. (6) Task host liveness: heartbeat.json carries the
+    machine's boot id; a heartbeat from another boot, or whose pid no longer exists, is dead whatever its time says
+    (clock jumps after a power cut, pid reuse); a live process with a stalled heartbeat stays running until StaleHard
+    (10 min) so a second task host is never started beside it. (7) Checkpoints fsync the step output and record its
+    SHA-256, which the task host verifies before skipping a step. (8) A job whose task host died MaxDeaths (3) times on
+    this machine (each a reboot or crash, re-adopted under the same attempt) fails as infra instead of being started
+    forever; the count survives a fresh run directory. (9) A render is only done when ffprobe reads a video stream with
+    frames from its output, and, for a segmented upscale, about the source's frame count. (10) "No space left on
+    device" is infra (retried), not internal. (11) Snapshots: the copy is hashed again while it is copied and kept only
+    if it matches the key (a git pull mid-copy starts it over, never a mixed snapshot); files and directories are
+    fsynced; a .complete manifest of sizes is checked before reuse and a damaged snapshot is set aside and rebuilt;
+    Prune renames before deleting and removes hidden leftovers older than 1 h. (12) Disk: free space is measured on the
+    work dir's and the state dir's disks (runs, segments, snapshots), and every waiting job carries the reason it is
+    parked. (13) nats-server templates set jetstream sync_interval: always.
+  why: "Bryan, 2026-10-28: tasks run 30 s to 30+ min; git pulls land while they run; the broker may restart; machines
+    reboot or lose power; a job can be delivered twice; disks fill. An audit found a finished job's result lost and the
+    job re-run when the broker was down at the end, a failed Ack silently never retried, claims dropped at boot on a
+    broker blip (then their renders cancelled as orphans), a stop signal turning a running render into a requeue,
+    journal and checkpoint files that a power cut could leave empty, a dead task host taken for alive after a clock jump
+    (stuck forever), a stalled live one taken for dead (a second render on the same run dir), an unbounded relaunch
+    loop for a step that takes the machine down, unvalidated outputs, and snapshots that could mix two commits."
+  code: >
+    code/internal/scheduler/queue.go (settleLocked, runSettlement, settleOnce, handToSettlement, resumeSettlements,
+    reclaimAtBoot, reclaimOne); code/internal/scheduler/server.go (detachForRestart, leaveLocked, finishSettlements,
+    diskReasonLocked, parkLocked); code/internal/scheduler/execute.go (execute); code/internal/jobs/job.go (Settlement);
+    code/internal/jobs/journal.go (Save); code/internal/queue/natsq/natsq.go (delivery.send); code/internal/fsx/fsx.go;
+    code/internal/taskhost/taskhost.go (Alive, RecordDeath, writeCheckpoint, stepDone); code/internal/taskhost/boot_*.go
+    (BootID); code/internal/runners/oss.go (runDetached, validateVideo, failureKind); code/internal/runners/oss_segments.go
+    (segmentedSteps); code/internal/snapshot/snapshot.go (Ensure, verify, Prune); code/internal/hardware/monitor.go
+    (SampleLoad); data/queue/nats/standalone.conf.tmpl, worker.conf.tmpl.

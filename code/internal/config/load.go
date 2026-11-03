@@ -151,6 +151,9 @@ func Validate(ts *ThisServer, cat *Catalog) (errs []string, warns []string) {
 		errs = append(errs, "local_api.listen is required (default 127.0.0.1:9440)")
 	}
 	if q := ts.Queue; q.Enabled {
+		if ts.Server.Dev && q.Role == "worker" {
+			errs = append(errs, "queue.role worker on a dev machine (server.dev: true): a dev machine never joins the fleet; use standalone")
+		}
 		switch q.Role {
 		case "standalone", "worker":
 		case "hub":

@@ -1,7 +1,7 @@
 # Presets that let `init` name known machines without typing (pm/ai_processing_server.mdx §6.6).
 # Identity hints only: detection is truth for hardware. Hostnames marked "guess" are corrected by the first `init` on
 # the machine: it reports the real hostname, and that line is fixed here by pull request (§23 Q2, D-022).
-# local_mode = callers.local.mode init writes (task_queue.mdx §14.5, §24 Q3, D-021): first on the owner's workstations,
+# local_mode = callers.local.mode init writes (task_queue.mdx §14.5, §24 Q3, D-021): first on the owner's laptop and dev machine,
 # share on the GPU render boxes, idle_only on dedicated office and cloud machines.
 schema_version: 1
 servers:
@@ -28,13 +28,17 @@ servers:
     family: bryan
     site: bryan_office
     local_mode: share
+  # Bryan's Mac Tower (Mac Pro 2024) is his DEVELOPMENT machine, not a render server (Bryan, 2026-10-28). The server
+  # runs there only for debugging: dev: true makes init write act3/wtc off, and the server never pulls platform jobs,
+  # never joins the fleet as a worker and never installs itself as an OS service there.
   - key: BMT
-    display_name: "Bryan Mac Tower"
-    match: { hostname: ["Bryans-Mac-Pro-2024", "Bryans-Mac-Pro-2024.local", "Bryan-Mac-Tower"] }   # Mac Pro 2024 (M2 Ultra, 192 GB): detected 2026-10-27
-    profile: bmt
+    display_name: "Bryan Mac Tower (dev machine)"
+    match: { hostname: ["Bryans-Mac-Pro-2024", "Bryans-Mac-Pro-2024.local", "Bryan-Mac-Tower"] }   # detected 2026-10-27
+    profile: generic
     family: bryan
     site: bryan_office
     local_mode: first
+    dev: true
   - key: BMS
     display_name: "Bryan Mac Studio"
     servers_dir: Bryan_Mac_Studio

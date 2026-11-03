@@ -46,6 +46,10 @@ var (
 	errCancelled = errors.New("cancelled by the machine owner")
 	errTimeout   = errors.New("job exceeded its timeout")
 	errShutdown  = errors.New("server shutting down")
+	// errDetach ends a queued job's attempt in THIS controller only: its detached task host keeps rendering and the
+	// next controller re-adopts it from the journal (pm/task_queue.mdx §9.5). Never "cancel"/"timeout" (runners/oss.go
+	// stopsTheTask would stop the render).
+	errDetach = errors.New("controller stopping: the task host keeps rendering and the next controller re-adopts the job")
 )
 
 // elog records failures that should not happen (pm/errors.mdx): the journal, work dirs, panics, stuck shutdowns.
@@ -114,6 +118,16 @@ type Server struct {
 	qwake    chan struct{}
 	pub      chan pubReq
 	reclaim  []queue.ClaimHandle
+	// The settlement outbox (queue.go runSettlement, D-026): jobs whose outcome is in jobs.Job.Settle. settling holds
+	// the delivery to ack (heartbeated while it waits), settleRun marks a running settlement goroutine.
+	settling   map[string]queue.Delivery
+	settleRun  map[string]bool
+	swg        sync.WaitGroup
+	settleCtx  context.Context
+	stopSettle context.CancelFunc
+	// reclaimed: the boot reclaim has settled every claim from before the restart (or there is no queue), so a
+	// task host nothing holds is an orphan (runs.go).
+	reclaimed bool
 }
 
 type counters struct {
@@ -139,11 +153,13 @@ func New(o Options) (*Server, error) {
 		jobs: map[string]*jobs.Job{}, cancels: map[string]context.CancelCauseFunc{}, activeBy: map[string]int{},
 		pausedSvc: map[string]string{}, wake: make(chan struct{}, 1), log: o.Logger.With("ctx", "scheduler"),
 		bootAt: time.Now(), lastSave: map[string]time.Time{}, warnings: o.Warnings,
-		held: map[string]*heldJob{}, qwake: make(chan struct{}, 1), pub: make(chan pubReq, 1024), qState: BrokerDisabled,
+		held: map[string]*heldJob{}, settling: map[string]queue.Delivery{}, settleRun: map[string]bool{}, qwake: make(chan struct{}, 1), pub: make(chan pubReq, 1024), qState: BrokerDisabled,
 		stats: counters{map[string]int64{}, map[string]int64{}, map[string]int64{}, map[string]int64{}},
 	}
 	if o.OpenQueue != nil {
 		s.qState = BrokerConnecting // until queueMain's first attempt answers; never "disabled" while enabled
+	} else {
+		s.reclaimed = true
 	}
 	s.workDir = s.cfg.Paths.WorkDir
 	if s.workDir == "" {
@@ -163,6 +179,7 @@ func New(o Options) (*Server, error) {
 	}
 	s.journal = j
 	s.jobsCtx, s.stopJobs = context.WithCancelCause(context.Background())
+	s.settleCtx, s.stopSettle = context.WithCancel(context.Background())
 	s.recompute()
 	s.recover()
 	return s, nil
@@ -402,12 +419,16 @@ func (s *Server) admit() {
 		}
 		return cands[a].CreatedAt.Before(cands[b].CreatedAt)
 	})
-	diskLow := s.diskLowLocked()
+	if s.diskLowLocked() {
+		// Park, do not fail: a render started now would die mid-way when the disk fills. Every waiting job says why.
+		_, why := s.diskReasonLocked()
+		for _, j := range cands {
+			s.parkLocked(j, "waiting: "+why)
+		}
+		return
+	}
 	for _, j := range cands {
 		if s.active >= s.cfg.Limits.MaxParallelJobs {
-			return
-		}
-		if diskLow {
 			return
 		}
 		if _, p := s.pausedSvc[j.Type]; p {
@@ -431,8 +452,30 @@ func (s *Server) admit() {
 }
 
 func (s *Server) diskLowLocked() bool {
-	free := s.opt.Monitor.Load().DiskFreeGB
-	return free > 0 && free < s.cfg.Limits.DiskMinFreeGB
+	low, _ := s.diskReasonLocked()
+	return low
+}
+
+// diskReasonLocked: is free disk under limits.disk_min_free_gb on the work dir's or the state dir's disk (run
+// directories, segments and snapshots live in the state dir), and the sentence that says so.
+func (s *Server) diskReasonLocked() (bool, string) {
+	l := s.opt.Monitor.Load()
+	if l.DiskFreeGB <= 0 || l.DiskFreeGB >= s.cfg.Limits.DiskMinFreeGB {
+		return false, ""
+	}
+	return true, fmt.Sprintf("disk free %.1f GB at %s is under limits.disk_min_free_gb %.1f; no new job starts until space is freed",
+		l.DiskFreeGB, l.DiskPath, s.cfg.Limits.DiskMinFreeGB)
+}
+
+// parkLocked records why a waiting job is not starting, once per reason (journal and, for a queued job, a "note"
+// event the caller sees).
+func (s *Server) parkLocked(j *jobs.Job, why string) {
+	if j.Note == why {
+		return
+	}
+	j.Note = why
+	s.save(j, true)
+	s.eventLocked(j, "note", func(e *queue.Event) { e.Note = why })
 }
 
 func (s *Server) startLocked(j *jobs.Job, slot jobs.Slot) {
@@ -579,6 +622,8 @@ func (s *Server) RefreshHardware(ctx context.Context) {
 // Shutdown drains, waits up to timeout for running jobs, then stops the rest as `infra` "server shutting down".
 func (s *Server) Shutdown(timeout time.Duration) {
 	s.Drain()
+	defer s.finishSettlements(SettleGrace)
+	s.detachForRestart()
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
 	select {
@@ -596,12 +641,78 @@ func (s *Server) Shutdown(timeout time.Duration) {
 	}
 }
 
+// detachForRestart lets go, at once, of every queued job running in a detached task host (§9.5: the old controller
+// never signals its task hosts and never nacks their claims). Before, a stop waited out limits.drain_timeout_s and
+// then failed such a job as infra: it was requeued and run again elsewhere while its task host kept rendering here,
+// and the next controller's sweep cancelled that render as an orphan.
+func (s *Server) detachForRestart() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, j := range s.jobs {
+		if j.State != jobs.Active || j.Claim == nil || !s.reattachableLocked(j.Type) {
+			continue
+		}
+		if c := s.cancels[id]; c != nil {
+			c(errDetach)
+			s.log.Info("leaving a queued job to its task host for the next controller", "job_id", id, "service", j.Type)
+		}
+	}
+}
+
+func (s *Server) reattachableLocked(service string) bool {
+	def, ok := s.cat.Services[service]
+	if !ok {
+		return false
+	}
+	r, _ := s.runners[def.Runner].(runners.Reattacher)
+	return r != nil && r.Reattachable()
+}
+
+// leaveLocked ends this controller's hold on a detached job without finishing it: the slot is freed in memory, the
+// journal keeps the job active with its claim, and the next controller's boot reclaim re-adopts it (§9.4).
+func (s *Server) leaveLocked(j *jobs.Job) {
+	if j.Slot != nil {
+		s.pool.Release(j.Slot.ID)
+		j.Slot = nil
+	}
+	if j.State == jobs.Active {
+		s.activeBy[j.Type]--
+		s.active--
+	}
+	delete(s.cancels, j.ID)
+	j.Note = "left running in its task host for the next controller"
+	s.save(j, true)
+}
+
+// SettleGrace is how long Shutdown lets pending settlements reach the broker before it exits. Whatever is still
+// pending stays in the journal's outbox and the next process finishes it (queue.go resumeSettlements).
+var SettleGrace = 10 * time.Second
+
+func (s *Server) finishSettlements(grace time.Duration) {
+	done := make(chan struct{})
+	go func() { s.swg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return
+	case <-time.After(grace):
+	}
+	s.mu.Lock()
+	n := len(s.settleRun)
+	s.mu.Unlock()
+	s.log.Warn("stopping with queue settlements still pending; the next start finishes them from the journal", "pending", n)
+	s.stopSettle()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+}
+
 // sweep removes final jobs older than 24 hours, their results, old job logs, and orphan work dirs (spec §9.6).
 func (s *Server) sweep() {
 	s.mu.Lock()
 	cut := time.Now().Add(-24 * time.Hour)
 	for id, j := range s.jobs {
-		if j.State.Final() && j.FinishedAt != nil && j.FinishedAt.Before(cut) {
+		if j.State.Final() && j.FinishedAt != nil && j.FinishedAt.Before(cut) && j.Settle == nil {
 			delete(s.jobs, id)
 			elog.Ignore("deleting an old journal entry", s.journal.Delete(id), "job_id", id)
 			elog.Ignore("deleting old results", os.RemoveAll(filepath.Join(s.resultsDir, id)), "job_id", id)
@@ -616,6 +727,7 @@ func (s *Server) sweep() {
 	s.mu.Unlock()
 	removeOld(s.workDir, 48*time.Hour, live)
 	removeOld(s.jobLogDir, 7*24*time.Hour, nil)
+	s.sweepRuns()
 }
 
 func removeOld(dir string, age time.Duration, keep map[string]bool) {

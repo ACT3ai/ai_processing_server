@@ -198,6 +198,26 @@ type Job struct {
 	// Claim is set when the job came from the task queue: the broker claim this server holds, saved in the
 	// journal so a restarted process can settle it at once instead of waiting out the ack wait (task_queue.mdx §9.4).
 	Claim *queue.ClaimHandle `json:"claim,omitempty"`
+
+	// Settle is the queue outcome still to be reported (the settlement outbox, D-026): job_state, the final event,
+	// then ack / requeue / dead. It is written to the journal before any broker call and cleared only when the
+	// broker took all of it (or another worker fenced this one off), so a broker that is down when a 30-minute job
+	// finishes, or a crash right after it, never loses the result and never makes the job run again.
+	Settle *Settlement `json:"settle,omitempty"`
+}
+
+// Settlement is one pending queue outcome (scheduler/queue.go settleLocked, runSettlement).
+type Settlement struct {
+	Handle    queue.ClaimHandle `json:"handle"`    // ack subject and fencing revision of the claim being settled
+	State     queue.JobState    `json:"job_state"` // the final (or QUEUED) job_state to write at Handle.FenceRev
+	Event     queue.Event       `json:"event"`     // the final (or requeued) event for the caller
+	Action    string            `json:"action"`    // ack | requeue | dead:<reason>
+	DelayNS   int64             `json:"delay_ns,omitempty"`
+	Wrote     bool              `json:"wrote,omitempty"`     // job_state is written
+	Published bool              `json:"published,omitempty"` // the event is in the EVENTS stream
+	Tries     int               `json:"tries,omitempty"`
+	LastErr   string            `json:"last_err,omitempty"`
+	Since     time.Time         `json:"since"`
 }
 
 // Move records a state/stage change in the history.
@@ -222,6 +242,10 @@ func (j *Job) Clone() *Job {
 	if j.Claim != nil {
 		h := *j.Claim
 		c.Claim = &h
+	}
+	if j.Settle != nil {
+		st := *j.Settle
+		c.Settle = &st
 	}
 	return &c
 }

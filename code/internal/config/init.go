@@ -158,7 +158,7 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 			localMode = ks.LocalMode
 		}
 		id = Identity{Key: ks.Key, DisplayName: ks.DisplayName, Profile: ks.Profile, Family: ks.Family, Site: ks.Site,
-			ServersDir: ks.ServersDir}
+			ServersDir: ks.ServersDir, Dev: ks.Dev}
 		off = map[string]bool{}
 		for _, s := range ks.ServicesOff {
 			off[s] = true

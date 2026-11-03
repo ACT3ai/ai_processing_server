@@ -10,6 +10,8 @@ package snapshot
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -20,7 +22,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ACT3ai/ai_processing_server/internal/errlog"
+	"github.com/ACT3ai/ai_processing_server/internal/fsx"
 )
+
+var elog = errlog.For("snapshot")
 
 // Dirs copied from the source root into every snapshot, at the same relative paths.
 var Dirs = []string{filepath.Join("code", "scripts"), filepath.Join("data", "services")}
@@ -47,52 +54,167 @@ func (s Snapshot) Path(rel string) string { return filepath.Join(s.Dir, filepath
 
 var mu sync.Mutex
 
+// EnsureTries bounds how often Ensure starts over because the tree changed while it was being copied.
+var EnsureTries = 5
+
+// manifest is the .complete file: what the snapshot must hold. Ensure re-checks the sizes before reusing a snapshot,
+// so one whose data never reached the disk (a power cut right after it was built) is rebuilt, not run.
+type manifest struct {
+	Key   string           `json:"key"`
+	Files map[string]int64 `json:"files"` // relative path (slashes) → bytes; the binary is BinaryName()
+	At    time.Time        `json:"at"`
+}
+
 // Ensure returns the snapshot of srcRoot (the repo checkout) and binary under base, building it on first use.
-// Building is atomic: a half-copied snapshot is never visible under its key.
+//
+// Building is atomic and consistent: the files are copied into a hidden temp directory while they are hashed a
+// second time, and the copy is kept only if that second hash equals the first. A git pull that lands while the
+// snapshot is copied therefore never produces a snapshot that mixes old and new files (Ensure starts over instead).
+// Every file and directory is fsynced before the rename publishes the snapshot under its key.
 func Ensure(srcRoot, binary, base string) (Snapshot, error) {
 	mu.Lock()
 	defer mu.Unlock()
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return Snapshot{}, err
+	}
+	var lastErr error
+	for range max(EnsureTries, 1) {
+		s, err := ensureOnce(srcRoot, binary, base)
+		if err == nil {
+			return s, nil
+		}
+		lastErr = err
+		if !errors.Is(err, errTreeChanged) {
+			return Snapshot{}, err
+		}
+		time.Sleep(200 * time.Millisecond) // let the pull finish
+	}
+	return Snapshot{}, fmt.Errorf("the code tree kept changing while it was snapshotted (a git pull in progress?): %w", lastErr)
+}
+
+// beforeCopy is a test hook: it runs between hashing the tree and copying it (where a git pull can land).
+var beforeCopy func()
+
+var errTreeChanged = errors.New("the code tree changed while it was being snapshotted")
+
+func ensureOnce(srcRoot, binary, base string) (Snapshot, error) {
 	files, err := list(srcRoot)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	key, err := hashAll(binary, srcRoot, files)
 	if err != nil {
-		return Snapshot{}, err
+		return Snapshot{}, fmt.Errorf("%w: %v", errTreeChanged, err) // a file vanished between listing and hashing
 	}
 	s := Snapshot{Key: key, Dir: filepath.Join(base, key)}
-	if _, err := os.Stat(filepath.Join(s.Dir, ".complete")); err == nil {
+	switch err := verify(s); {
+	case err == nil:
 		now := time.Now()
-		os.Chtimes(s.Dir, now, now) // last used, for Prune
+		if cerr := os.Chtimes(s.Dir, now, now); cerr != nil { // last used, for Prune
+			return Snapshot{}, cerr
+		}
 		return s, nil
+	case !os.IsNotExist(err):
+		// Present but not whole (a crash mid-build, or data a power cut lost): set it aside for Prune, build again.
+		if rerr := os.Rename(s.Dir, filepath.Join(base, fmt.Sprintf(".broken-%s-%d", key, time.Now().UnixNano()))); rerr != nil {
+			return Snapshot{}, fmt.Errorf("snapshot %s is damaged (%v) and cannot be moved aside: %w", key, err, rerr)
+		}
 	}
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		return Snapshot{}, err
+	if beforeCopy != nil {
+		beforeCopy()
 	}
 	tmp, err := os.MkdirTemp(base, ".building-")
 	if err != nil {
 		return Snapshot{}, err
 	}
-	defer os.RemoveAll(tmp)
-	if err := copyFile(binary, filepath.Join(tmp, BinaryName()), 0o500); err != nil {
+	defer os.RemoveAll(tmp) // after a successful rename tmp no longer exists
+	m := manifest{Key: key, Files: map[string]int64{}, At: time.Now().UTC()}
+	h := sha256.New()
+	copyOne := func(name, src, dst string, mode os.FileMode) error {
+		fmt.Fprintf(h, "%s\x00", filepath.ToSlash(name))
+		n, err := copyFile(src, dst, mode, h)
+		if err != nil {
+			return err
+		}
+		rel := filepath.ToSlash(name)
+		if name == "<binary>" {
+			rel = BinaryName()
+		}
+		m.Files[rel] = n
+		return nil
+	}
+	if err := copyOne("<binary>", binary, filepath.Join(tmp, BinaryName()), 0o500); err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot binary: %w", err)
 	}
 	for _, rel := range files {
-		if err := copyFile(filepath.Join(srcRoot, rel), filepath.Join(tmp, rel), 0o400); err != nil {
+		if err := copyOne(rel, filepath.Join(srcRoot, rel), filepath.Join(tmp, rel), 0o400); err != nil {
+			if os.IsNotExist(err) {
+				return Snapshot{}, fmt.Errorf("%w: %s vanished", errTreeChanged, rel)
+			}
 			return Snapshot{}, fmt.Errorf("snapshot %s: %w", rel, err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(tmp, ".complete"), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o400); err != nil {
+	if got := hex.EncodeToString(h.Sum(nil))[:12]; got != key {
+		return Snapshot{}, fmt.Errorf("%w (hashed %s, copied %s)", errTreeChanged, key, got)
+	}
+	if err := syncTree(tmp); err != nil {
 		return Snapshot{}, err
 	}
-	os.RemoveAll(s.Dir) // an incomplete leftover from a crash
+	b, err := json.Marshal(m)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if err := fsx.WriteDurable(filepath.Join(tmp, ".complete"), b, 0o400); err != nil {
+		return Snapshot{}, err
+	}
 	if err := os.Rename(tmp, s.Dir); err != nil {
 		return Snapshot{}, err
 	}
-	return s, nil
+	return s, fsx.SyncDir(base)
 }
 
-// Prune deletes snapshots beyond the newest keep, never one in inUse.
+// verify: nil when the snapshot is complete and every file has its recorded size; os.ErrNotExist when there is no
+// snapshot under the key at all. A .complete from before manifests (a timestamp) is trusted as before.
+func verify(s Snapshot) error {
+	if _, err := os.Stat(s.Dir); err != nil {
+		return err
+	}
+	b, err := os.ReadFile(filepath.Join(s.Dir, ".complete"))
+	if err != nil {
+		return fmt.Errorf("no .complete: %v", err) // a leftover of an interrupted build (never os.ErrNotExist here)
+	}
+	var m manifest
+	if json.Unmarshal(b, &m) != nil || m.Files == nil {
+		return nil
+	}
+	for rel, n := range m.Files {
+		fi, err := os.Stat(filepath.Join(s.Dir, filepath.FromSlash(rel)))
+		if err != nil || fi.Size() != n {
+			return fmt.Errorf("%s: want %d bytes", rel, n)
+		}
+	}
+	return nil
+}
+
+// syncTree fsyncs every directory under dir (files were synced as they were copied).
+func syncTree(dir string) error {
+	return filepath.WalkDir(dir, func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if e.IsDir() {
+			return fsx.SyncDir(p)
+		}
+		return nil
+	})
+}
+
+// LeftoverAge: hidden .building-, .broken- and .deleting- directories older than this are removed by Prune.
+var LeftoverAge = time.Hour
+
+// Prune deletes snapshots beyond the newest keep, never one in inUse. A snapshot is first renamed to a hidden
+// .deleting- name, so a removal cut short (a crash, a file still open on Windows) never leaves a partial snapshot
+// under its key for Ensure to hand to a job. It also removes hidden leftovers of interrupted builds and deletes.
 func Prune(base string, keep int, inUse map[string]bool) (removed []string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -106,12 +228,22 @@ func Prune(base string, keep int, inUse map[string]bool) (removed []string) {
 	}
 	var all []snap
 	for _, e := range ents {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+		if !e.IsDir() {
 			continue
 		}
-		if fi, err := e.Info(); err == nil {
-			all = append(all, snap{e.Name(), fi.ModTime()})
+		fi, err := e.Info()
+		if err != nil {
+			continue
 		}
+		if strings.HasPrefix(e.Name(), ".") {
+			if time.Since(fi.ModTime()) > LeftoverAge {
+				dir := filepath.Join(base, e.Name())
+				makeWritable(dir)
+				elog.Ignore("removing a leftover snapshot directory", os.RemoveAll(dir), "dir", dir)
+			}
+			continue
+		}
+		all = append(all, snap{e.Name(), fi.ModTime()})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].at.After(all[j].at) })
 	for i, s := range all {
@@ -119,10 +251,14 @@ func Prune(base string, keep int, inUse map[string]bool) (removed []string) {
 			continue
 		}
 		dir := filepath.Join(base, s.name)
-		makeWritable(dir)
-		if os.RemoveAll(dir) == nil {
-			removed = append(removed, s.name)
+		gone := filepath.Join(base, fmt.Sprintf(".deleting-%s-%d", s.name, time.Now().UnixNano()))
+		if err := os.Rename(dir, gone); err != nil {
+			elog.Warn("moving an old snapshot aside to delete it", err, "snapshot", s.name)
+			continue
 		}
+		removed = append(removed, s.name)
+		makeWritable(gone)
+		elog.Ignore("deleting an old snapshot", os.RemoveAll(gone), "dir", gone) // a leftover is retried next Prune
 	}
 	return removed
 }
@@ -183,27 +319,31 @@ func hashAll(binary, root string, files []string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil))[:12], nil
 }
 
-func copyFile(src, dst string, mode os.FileMode) error {
+// copyFile copies src to dst (fsynced, then mode), feeding the bytes it copied into h. It returns the size.
+func copyFile(src, dst string, mode os.FileMode, h io.Writer) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
+		return 0, err
 	}
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer in.Close()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
+	n, err := io.Copy(io.MultiWriter(out, h), in)
+	if err == nil {
+		err = out.Sync()
 	}
-	if err := out.Close(); err != nil {
-		return err
+	if cerr := out.Close(); err == nil {
+		err = cerr
 	}
-	return os.Chmod(dst, mode)
+	if err != nil {
+		return 0, err
+	}
+	return n, os.Chmod(dst, mode)
 }
 
 func makeWritable(dir string) {

@@ -5,8 +5,11 @@ package taskhost
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -131,7 +134,7 @@ func TestTimeoutAndFailure(t *testing.T) {
 func TestDeadWhenHeartbeatStops(t *testing.T) {
 	dir := t.TempDir()
 	writeJSONAtomic(filepath.Join(dir, TaskFile), Task{JobID: "j"})
-	writeJSONAtomic(filepath.Join(dir, HeartbeatFile), Heartbeat{PID: 123, At: time.Now().Add(-time.Minute)})
+	writeJSONAtomic(filepath.Join(dir, HeartbeatFile), Heartbeat{PID: deadPID(t), At: time.Now().Add(-time.Minute)})
 	if s := Alive(dir); s != Dead {
 		t.Fatalf("got %s", s)
 	}
@@ -150,5 +153,173 @@ func TestParseProgress(t *testing.T) {
 	}
 	if _, ok := ParseProgress("loaded t2v in 40 s"); ok {
 		t.Error("plain line parsed as progress")
+	}
+}
+
+// R8: a task made of steps survives its task host dying (a reboot): Relaunch skips every step whose checkpoint still
+// matches its output, so only the step that was running runs again.
+func TestStepsResumeFromTheCheckpointAfterTheHostDies(t *testing.T) {
+	dir := t.TempDir()
+	runs := filepath.Join(dir, "runs.txt")
+	step := func(name, out, extra string) Step {
+		return Step{Name: name, Output: out, Argv: []string{"/bin/sh", "-c",
+			`echo ` + name + ` >> "` + runs + `"; ` + extra + `printf data-` + name + ` > "` + out + `"`}}
+	}
+	pidFile := filepath.Join(dir, "two.pid")
+	task := Task{JobID: "j2", Snapshot: "test", Output: filepath.Join(dir, "three"), Steps: []Step{
+		step("one", filepath.Join(dir, "one"), ""),
+		// The first run of step two parks itself so the test can cut the power; the rerun goes straight through.
+		step("two", filepath.Join(dir, "two"), `if [ ! -f "`+pidFile+`" ]; then echo $$ > "`+pidFile+`"; sleep 30; fi; `),
+		step("three", filepath.Join(dir, "three"), ""),
+	}}
+	if err := Launch(selfHost(), dir, task); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(pidFile); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("step two never started")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if done, total := Checkpoints(dir); done != 1 || total != 3 {
+		t.Fatalf("checkpoints before the power cut: %d of %d", done, total)
+	}
+	// The power goes: the task host and its render die without writing exit.json.
+	var hb Heartbeat
+	if err := readJSON(filepath.Join(dir, HeartbeatFile), &hb); err != nil || hb.PID == 0 {
+		t.Fatalf("heartbeat: %+v %v", hb, err)
+	}
+	b, _ := os.ReadFile(pidFile)
+	var child int
+	fmt.Sscan(string(b), &child)
+	syscall.Kill(-hb.PID, syscall.SIGKILL)
+	syscall.Kill(hb.PID, syscall.SIGKILL)
+	if child > 0 {
+		syscall.Kill(-child, syscall.SIGKILL)
+		syscall.Kill(child, syscall.SIGKILL)
+	}
+	for Alive(dir) != Dead {
+		if time.Now().After(deadline.Add(10 * time.Second)) {
+			t.Fatalf("the killed task host never read as dead: %s", Alive(dir))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := Relaunch(selfHost(), dir); err != nil {
+		t.Fatal(err)
+	}
+	x, err := Watch(context.Background(), dir, nil)
+	if err != nil || x.Code != 0 || x.OutputBytes == 0 {
+		t.Fatalf("after the relaunch: %+v %v", x, err)
+	}
+	got, _ := os.ReadFile(runs)
+	if string(got) != "one\ntwo\ntwo\nthree\n" {
+		t.Fatalf("step runs = %q, want one once, two twice (cut, then resumed), three once", got)
+	}
+	if done, total := Checkpoints(dir); done != 3 || total != 3 {
+		t.Fatalf("checkpoints at the end: %d of %d", done, total)
+	}
+}
+
+// A checkpoint whose output changed size (a partial file, a disk problem) does not count: the step runs again.
+func TestCheckpointNeedsTheSameOutput(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "a")
+	os.WriteFile(filepath.Join(dir, TaskFile), []byte(`{"run_version":1,"job_id":"j","output":"`+out+`","steps":[{"name":"a","argv":["true"],"output":"`+out+`"},{"name":"b","argv":["true"],"output":"`+out+`"}]}`), 0o600)
+	os.WriteFile(out, []byte("12345"), 0o600)
+	os.MkdirAll(filepath.Join(dir, CheckpointDir), 0o700)
+	writeJSONAtomic(checkpointPath(dir, 0), checkpoint{Bytes: 5})
+	if done, total := Checkpoints(dir); done != 1 || total != 2 {
+		t.Fatalf("%d of %d", done, total)
+	}
+	os.WriteFile(out, []byte("12"), 0o600)
+	if done, _ := Checkpoints(dir); done != 0 {
+		t.Fatalf("a changed output still counted as done (%d)", done)
+	}
+}
+
+// deadPID is the pid of a process that has exited and been reaped.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	c := exec.Command("true")
+	if err := c.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return c.Process.Pid
+}
+
+func writeHB(t *testing.T, dir string, hb Heartbeat) {
+	t.Helper()
+	writeJSONAtomic(filepath.Join(dir, TaskFile), Task{JobID: "j"})
+	if err := writeJSONAtomic(filepath.Join(dir, HeartbeatFile), hb); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// After a power cut the clock can come back behind (a heartbeat "from the future") and pids are reused. Liveness
+// goes by boot and pid first, so a dead host is never taken for a running one, and a live but stalled one is never
+// taken for dead (which started a second host on the same run directory).
+func TestAliveUsesBootAndPID(t *testing.T) {
+	me := os.Getpid()
+	dir := t.TempDir()
+	writeHB(t, dir, Heartbeat{PID: deadPID(t), StartedAt: time.Now(), At: time.Now().Add(time.Hour)})
+	if s := Alive(dir); s != Dead {
+		t.Fatalf("dead pid with a heartbeat from the future: %s, want dead", s)
+	}
+	if BootID() != "" {
+		writeHB(t, dir, Heartbeat{PID: me, Boot: "an-earlier-boot", StartedAt: time.Now(), At: time.Now()})
+		if s := Alive(dir); s != Dead {
+			t.Fatalf("pid reused after a reboot: %s, want dead", s)
+		}
+	}
+	writeHB(t, dir, Heartbeat{PID: me, Boot: BootID(), StartedAt: time.Now(), At: time.Now().Add(-time.Minute)})
+	if s := Alive(dir); s != Running {
+		t.Fatalf("live process with a stalled heartbeat: %s, want running", s)
+	}
+	writeHB(t, dir, Heartbeat{PID: me, Boot: BootID(), StartedAt: time.Now(), At: time.Now().Add(-StaleHard - time.Minute)})
+	if s := Alive(dir); s != Dead {
+		t.Fatalf("heartbeat stalled past StaleHard: %s, want dead", s)
+	}
+}
+
+// A checkpoint vouches for its output's bytes, not just its size: a same-size but different file (a torn write the
+// disk reported as complete) makes the task host run the step again.
+func TestCheckpointHashCatchesSameSizeCorruption(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "seg.mp4")
+	os.WriteFile(out, []byte("segment-data"), 0o600)
+	if err := writeCheckpoint(dir, 0, out); err != nil {
+		t.Fatal(err)
+	}
+	st := Step{Name: "a", Argv: []string{"true"}, Output: out}
+	if !stepDone(dir, 0, st, true) {
+		t.Fatal("an intact checkpoint was not accepted")
+	}
+	os.WriteFile(out, []byte("segment-DATA"), 0o600)
+	if stepDone(dir, 0, st, true) {
+		t.Fatal("a same-size corrupted output passed its checkpoint")
+	}
+}
+
+// One host's death seen twice counts once; a new host's death counts again; the record survives a fresh run dir.
+func TestRecordDeathCountsEachHostOnce(t *testing.T) {
+	dir := t.TempDir()
+	writeHB(t, dir, Heartbeat{PID: 11, StartedAt: time.Unix(100, 0)})
+	if n := RecordDeath(dir); n != 1 {
+		t.Fatalf("first death: %d", n)
+	}
+	if n := RecordDeath(dir); n != 1 {
+		t.Fatalf("the same death counted twice: %d", n)
+	}
+	writeHB(t, dir, Heartbeat{PID: 12, StartedAt: time.Unix(200, 0)})
+	if n := RecordDeath(dir); n != 2 {
+		t.Fatalf("second host's death: %d", n)
+	}
+	dir2 := t.TempDir()
+	if err := CarryDeaths(dir2, Deaths(dir)); err != nil || len(Deaths(dir2)) != 2 {
+		t.Fatalf("deaths not carried: %v %v", Deaths(dir2), err)
 	}
 }

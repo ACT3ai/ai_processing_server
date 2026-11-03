@@ -24,6 +24,16 @@ Coordination is **ours**. The transport is NATS JetStream in its own nats-server
 which job, priority, retries, how capabilities are matched) are our own logic, written in this repo
 and specified in `pm/`.
 
+## Which machines are render servers
+
+* **Render servers** (run this binary for platform work): B5090 (the 5090 PC), BPC, BMS (Mac Studio), and the
+  three Nepal machines NPL1–NPL3. Presets: `data/servers/known_servers.yaml`.
+* **BMT, Bryan's Mac Tower (Mac Pro 2024, hostname `Bryans-Mac-Pro-2024`), is NOT a render server.** It is Bryan's
+  dev machine, used only for software development and debugging. Never add it to the fleet, never install the OS
+  services there, and never tell Bryan it needs to become a server. Its preset has `dev: true` (D-024): it pulls
+  only local jobs, can't be a queue worker, and `service install` refuses. `just run` / `just run-fg` work there
+  for debugging.
+
 ## Language and build
 
 * **Go.** All code is Go, compiled to **one binary**.
@@ -80,6 +90,7 @@ code/
     ├── runners/      # One runner per job type (image, video, upscale, Blender, ...)
     ├── taskhost/     # Detached task host: a render outlives a controller restart
     ├── snapshot/     # Frozen, content-keyed copy of the task code a job runs
+    ├── service/      # nats-server + server as OS services (just install-service)
     ├── scripts/      # (code/scripts/) task code that gets snapshotted
     └── report/       # Progress, logs, and result reporting back to the platform
 ```
@@ -97,11 +108,18 @@ code/
 * Never compute or hard-code credit prices here; pricing lives in the ACT3 web app backend.
 * Work on the current branch. Do not create, switch, or push branches unless asked.
 
-## Current state (2026-10-27)
+## Current state (2026-10-28)
 
 v0.2.0: jobs arrive through NATS JetStream (POST /v1/queue/jobs, or NATS directly) or direct mode.
 Model runners oss_video (Wan 2.2) and oss_upscale (SeedVR2) run in detached task hosts from frozen
-snapshots (data/git_ignore/runs/, snapshots/), so a git pull and a restart never stop a render. Task
+snapshots (data/git_ignore/runs/, snapshots/), so a git pull and a restart never stop a render.
+Resilience (D-025):
+* Task hosts run checkpointed steps, so a reboot resumes a segmented SeedVR2 upscale instead of
+  restarting it.
+* The sweep cancels orphan task hosts and prunes old run directories and snapshots.
+* `just install-service` brings the broker and server back after a power cut.
+
+Gate tests G1–G7 pass with fake models (pm/task_authoring.mdx §8). Task
 scripts live in code/scripts/ (copies from ~/BGit/all; refresh with code/scripts/sync_from_all.sh).
 `just build` also installs nats-server; on the Mac Studio, `just render-setup` then `just render-test`. Builds use `GOWORK=off` because the
 parent `~/BGit/act3/go.work` would otherwise capture this module. See `pm/TO_DO.md` and

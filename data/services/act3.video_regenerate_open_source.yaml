@@ -1,0 +1,26 @@
+schema_version: 1
+id: act3.video_regenerate_open_source
+platform: act3
+title: "Open-source 2K / 4K regenerate of a draft take on our own GPU: NVIDIA Open-H3-Regenerate-2K (model open-h3-regenerate-2k)"
+# runner oss_regenerate: render_h3_regenerate.py from the job's frozen snapshot, in a detached task host, as two
+# checkpointed steps (refine, then finish), so a git pull, a controller restart or a reboot after the refine never
+# costs the refine again (code/internal/runners/oss_regenerate.go, pm/task_authoring.mdx R1-R12).
+# Model spec: ~/BGit/all/film/pm/subp/video_gen_ai/nvidia/h3_regenerate_2k/h3_regenerate_2k.mdx (§10.2 task design).
+# LICENSE: output is internal testing only until Legal clears the MiniMax H3 Community License (§12); the runner refuses
+# customer delivery (H3RegenerateLicenseCleared).
+runner: oss_regenerate
+# Off until the machine's owner turns it on in this_server.yaml; the weights (~/act3_render/open_h3_regenerate_2k/,
+# ~60-150 GB) are installed per machine and hardware detection cannot see them (pm/task_authoring.mdx §7.1 step 6).
+default_enabled: false
+requires:
+  engines: { ffmpeg: ">=6.0" }
+  gpu: required
+  compute: [cuda]          # no Metal / MLX port exists (§8)
+  min_vram_gb: 30          # an RTX 5090 reports ~31.8 GB; 32 GB is the smallest card shown refining (§7.4)
+# One task per GPU (§10.2); the job takes the whole 5090 and block-swaps the H3 base through system RAM (§7.3: 128 GB+).
+resources_per_job: { cpu_cores: 4, ram_gb: 96, vram_gb: 30 }
+max_parallel_default: 1
+# Estimates, not measured (§7.4/§7.5 still empty): ~3-5 min per 5 s 2K clip on a 5090, ~1 min model load, longer for
+# 15 s via ComfyUI and for the 4K ladder. Re-measure and tighten once §7.5 rows 1-8 are filled.
+timeouts: { stage_inputs: 20m, run: 120m, upload: 20m }
+retry: { max_attempts: 2, retry_on: [transient, infra] }

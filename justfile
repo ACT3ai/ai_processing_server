@@ -192,6 +192,20 @@ render-setup: build
     @echo
     just render-check
 
+# ---- start at boot (pm/task_authoring.mdx §8 G4: a real power cycle recovers unattended) ----
+
+# Install nats-server and the server as OS services (launchd / systemd user / Task Scheduler). Refused on a dev machine.
+install-service: _binary
+    ./{{bin}} service install
+
+# Remove both OS services (running renders keep going: task hosts are detached)
+uninstall-service: _binary
+    ./{{bin}} service uninstall
+
+# Are the OS services installed? `./ai_processing_server service print` shows the files without installing
+service-status: _binary
+    ./{{bin}} service status
+
 # Secret scan, Go unit tests (with vet), then the black-box test suite in tests/
 test: check-secrets test-go test-suite
 

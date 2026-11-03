@@ -1,7 +1,34 @@
 # ai_processing_server — TO DO
 
-**As of 2026-10-27, v0.2.0.** Phase 0 (scaffold) and most of phases 1–2 of the build plan
+**As of 2026-10-28, v0.2.0 + D-025/D-026 resilience (uncommitted).** Phase 0 (scaffold) and most of phases 1–2 of the build plan
 (`ai_processing_server.mdx` §21) are done.
+
+## Done 2026-10-28: hardening for broker outages, power cuts, duplicates, pulls and full disks (D-026)
+* [x] Settlement outbox: a queued job's outcome goes into its journal entry first and is retried until the broker takes
+  it; resumed at boot; a redelivery of a job in the outbox is settled from it, never run again; a final event is never
+  published twice (lost-reply checks). `scheduler/queue.go` settleLocked, runSettlement, settleOnce, handToSettlement.
+* [x] natsq: a failed Ack no longer marks the delivery done (retries were silent no-ops). `natsq.go` delivery.send.
+* [x] Boot reclaim keeps a claim until the broker answers for it (a blip used to drop it and the sweep then cancelled
+  its render). `scheduler/queue.go` reclaimAtBoot, reclaimOne.
+* [x] A stop signal (`just update`) leaves queued task-host jobs to the next controller at once instead of waiting out
+  the drain timeout and requeueing them while they kept rendering. `scheduler/server.go` detachForRestart, leaveLocked.
+* [x] Durable control files (journal, task.json, checkpoints, exit.json, snapshot manifests): `internal/fsx`.
+* [x] Task host liveness by boot id and pid (clock jumps, pid reuse), StaleHard for a stalled live host; checkpoints with
+  fsync + SHA-256; at most 3 task host deaths per job per machine. `taskhost.go` Alive, writeCheckpoint, RecordDeath.
+* [x] Output validated with ffprobe (frame count for segmented upscales); ENOSPC is infra. `runners/oss.go` validateVideo.
+* [x] Snapshots never mix two commits under a concurrent pull; fsynced; verified before reuse; safe Prune. `snapshot.go`.
+* [x] Disk low measured on the state dir too; waiting jobs say why they are parked. `scheduler/server.go` diskReasonLocked.
+* [x] nats-server templates: `jetstream { sync_interval: always }` (run `just broker-config` and restart the broker on
+  each machine to pick it up).
+* [ ] Still open from this audit (D-026 notes):
+  * Returning a job without running it (service not offered, model refused on a fleet worker) uses up one of its
+    attempts, so a model only one server allows can reach DEAD after enough refusals. Needs a "returns" count in
+    job_state that acceptDelivery subtracts.
+  * A hard nats-server kill loses the claim's delivery state (nats-server writes consumer state asynchronously): the
+    running job can be handed out again. Standalone: it comes back to the same server, which keeps running it. Fleet:
+    the hub cluster's replicas keep it; fencing guarantees one result either way. Verify on the hub before go-live.
+  * A direct-mode (not queued) task-host job is still failed at boot and its task host cancelled (D-025 rule).
+  * pm/Decisions.yaml does not parse as YAML (D-003 `status:` holds an unquoted colon); fix by quoting it.
 
 ## Done in v0.2.0 (2026-10-27): the task queue, NATS JetStream (D-014 to D-017)
 * `queue` seam, `queue/natsq` (client of a separate nats-server), `queue/queuetest` (in-memory queue + contract suite).
@@ -45,13 +72,13 @@
   direct mode keeps loopback inputs allowed (the test FakeStorage is on 127.0.0.1).
 * [x] Bryan: D-001 vs D-Q1. Decided 2026-10-27: NATS JetStream as a separate nats-server process (D-014); D-001 superseded.
 * [x] `queue/natsq`, the scheduler's queue link and `just broker-*` (v0.2.0, task_queue.mdx §22.1).
-* [ ] `nats-server` as an OS service (launchd, systemd, Windows service) in `just broker-install`; today `just broker-run`
-  starts it in the background.
+* [x] `nats-server` as an OS service: `just install-service` installs it beside the server (2026-10-28).
 * [ ] Restart-storm and code-change tests (task_queue.mdx §21.2) once task hosts and snapshots land.
 * [ ] Q2: admission (signatures, caller policy, categories, models), DRR over bands and caller shares, aging (D-015).
 * [x] All open questions in pm/ decided 2026-10-27 (D-020 to D-023).
 * [x] Caller band ceilings, vendor refusal, local modes in the pull order, owner model fence, NPL1–3 presets (D-021).
-* [ ] Run `init` on BMS, B5090 and NPL1–3; correct their hostnames in known_servers.yaml (and add `Bryans-Mac-Pro-2024` to BMT if that is BMT).
+* [ ] Run `init` on BMS, B5090 and NPL1–3; correct their hostnames in known_servers.yaml.
+* [x] BMT (`Bryans-Mac-Pro-2024`) is Bryan's dev machine, not a render server: preset `dev: true` (D-024, 2026-10-28).
 * [ ] FlashVSR (CUDA preview) and Real-ESRGAN (low VRAM) upscalers after SeedVR2 (D-020).
 * [ ] Caller shares and DRR (build phase Q2) using the decided shares (D-022 §23 Q3).
 * [ ] `data/services/act3.upscale_open_source.yaml` and its runner: the first ACT3 task type (task_authoring.mdx §4, §9).
@@ -62,4 +89,5 @@
 * [ ] JSON Schemas in `data/schemas/` for params (today each runner validates its params in Go).
 * [ ] `data/sites/sites.yaml` and the customer-data rule (§16.3).
 * [ ] GPU telemetry (nvidia-smi load, temperature) and the DEGRADED thermal guard (§12.4).
-* [ ] `just install-service` (launchd, Windows service, systemd).
+* [x] `just install-service` (launchd agents, systemd user units, Task Scheduler); refused on a dev machine (2026-10-28).
+* [ ] Run `just install-service` on BMS, B5090, BPC and NPL1–3, and turn on automatic login (macOS) or `loginctl enable-linger` (Linux), then do one real power cycle (G4 by hand).

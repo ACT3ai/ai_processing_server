@@ -577,7 +577,7 @@ The same binary runs in one of three roles, set in `this_server.yaml` `queue.rol
 | Role | Runs | Where |
 | --- | --- | --- |
 | `hub` | gateway, admission, promoter; a client of the hub `nats-server` (durable streams, KV buckets) that runs beside it as its own service; **no runners** | one small public cloud VM (2 vCPU, 4 GB RAM, 100 GB SSD is ample for phase 1) |
-| `worker` | local scheduler, slots, task hosts, re-adoption; a client of the machine's leaf `nats-server` (outbound to the hub) | every GPU/CPU machine: B5090, BPC, BMT, BMS, the laptop, Nepal, cloud GPU boxes |
+| `worker` | local scheduler, slots, task hosts, re-adoption; a client of the machine's leaf `nats-server` (outbound to the hub) | every GPU/CPU render machine: B5090, BPC, BMS, the laptop, Nepal, cloud GPU boxes (never BMT, the dev machine: D-024) |
 | `standalone` | hub and worker logic in one process, against one local `nats-server` with no outbound link | development; a lone machine on a LAN |
 
 A fourth mode, `--role taskhost`, is never set in config: the controller uses it to start a task host from a snapshot
@@ -744,6 +744,74 @@ callers never notice, and gateway callers retry the few seconds of HTTPS downtim
 * **Breaking changes to the run directory contract** (`run.json`, `events.jsonl`, `result.json`) must stay readable by
   the next controller version: the contract carries `run_version`, and a controller reads the current and previous
   versions.
+
+### 9.7 Hardening against outages, power cuts, duplicates and full disks (2026-10-28, D-026)
+
+**Goal of this section:** no job is lost, run twice, billed twice, stuck forever or shipped corrupt when the broker is
+down or restarts, the machine loses power, a pull lands mid-job, a job is delivered twice, or the disk fills.
+
+* **The outcome of a job is never lost.** When a queued job ends, its outcome (job_state, the final event, then ack,
+  requeue or dead) is written into the job's journal entry before any broker call, and retried until the broker took
+  it all, across restarts. A redelivery of a job whose outcome is still pending is settled from it, never run again.
+  * Writing, retrying and resuming the outbox is implemented in:
+    `~/BGit/act3/ai_processing_server/code/internal/scheduler/queue.go` — `Server.settleLocked`, `Server.runSettlement`,
+    `Server.resumeSettlements`, `Server.handToSettlement`
+* **Each step happens once, so the caller is billed once.** A fenced job_state write that already holds this outcome
+  counts as written (the reply was lost); before a final event is published again the stored events are checked,
+  because EVENTS dedupes message ids for 2 minutes only. The ack step gives up after 5 tries: job_state is final by
+  then, so the broker's redelivery is acked as a duplicate.
+  * When a settlement retries, it skips steps already done and checks EVENTS before publishing — implemented in:
+    `~/BGit/act3/ai_processing_server/code/internal/scheduler/queue.go` — `Server.settleOnce`
+* **A failed ack is really retried.** A failed Ack, Requeue or Dead leaves the delivery open, and nothing is sent while
+  the client is disconnected (a buffered ack is lost if the process stops).
+  * `~/BGit/act3/ai_processing_server/code/internal/queue/natsq/natsq.go` — `delivery.send`, `delivery.publishAck`
+* **Boot reclaim waits for the broker.** A claim saved before the restart is dropped only on a definite answer (gone,
+  taken over). While the broker is unreachable it stays in the reclaim list, which keeps its task host out of the
+  orphan sweep, and is retried every 5 s.
+  * `~/BGit/act3/ai_processing_server/code/internal/scheduler/queue.go` — `Server.reclaimAtBoot`, `Server.reclaimOne`
+* **A stop never turns a render into a requeue (§9.5 step 2).** On a stop signal the controller lets go, at once, of
+  every queued job running in a detached task host: the job stays active with its claim in the journal and the next
+  controller re-adopts it. Before, the stop waited out `limits.drain_timeout_s` and then failed the job as infra, so it
+  was requeued and rendered again elsewhere while its task host kept rendering here.
+  * `~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.detachForRestart`, `Server.leaveLocked`;
+    `code/internal/scheduler/execute.go` — `Server.execute`
+* **Control files survive a power cut.** The journal, task.json, checkpoints, exit.json, deaths.json and snapshot
+  manifests are written to a unique temp file, fsynced, renamed, and the directory fsynced. heartbeat.json is atomic only.
+  * `~/BGit/act3/ai_processing_server/code/internal/fsx/fsx.go` — `WriteDurable`, `WriteAtomic`
+* **Liveness by boot and pid, not only the clock.** heartbeat.json records the machine's boot id. A heartbeat from an
+  earlier boot, or whose pid no longer exists, is dead whatever its time says (a clock that jumped back after a power
+  cut used to keep a dead host "alive" forever; a reused pid looked like the host). A live process whose heartbeat
+  stalled stays running for up to 10 minutes (`StaleHard`), so a second task host is never started beside it.
+  * `~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `Alive`; boot id in
+    `code/internal/taskhost/boot_darwin.go`, `boot_linux.go`, `boot_windows.go` — `BootID`
+* **A step that keeps killing the machine is not restarted forever.** Each task host death is counted per job in the run
+  directory (and carried into a fresh one). At the third death on this machine the job fails as infra, and the queue's
+  retry policy moves it on.
+  * `~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `RecordDeath`, `CarryDeaths`;
+    `code/internal/runners/oss.go` — `runDetached`
+* **Checkpoints vouch for bytes.** A step's output is fsynced before its checkpoint, which records size and SHA-256;
+  the task host verifies the hash before it skips a step.
+  * `~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `writeCheckpoint`, `stepDone`
+* **Exit 0 is not enough.** A render is done only when ffprobe reads a video stream with frames from its output, and,
+  for a segmented upscale, about the source's frame count (a lost segment fails instead of shipping short). "No space
+  left on device" is infra (retried), not internal.
+  * `~/BGit/act3/ai_processing_server/code/internal/runners/oss.go` — `validateVideo`, `failureKind`
+* **Snapshots never mix two commits.** The tree is hashed, then copied while it is hashed again; the copy is kept only
+  if both hashes match, so a pull that lands mid-copy starts the snapshot over. Files and directories are fsynced, a
+  `.complete` manifest of sizes is checked before reuse (a damaged snapshot is set aside and rebuilt), and Prune renames
+  a snapshot before deleting it and removes hidden leftovers older than an hour.
+  * `~/BGit/act3/ai_processing_server/code/internal/snapshot/snapshot.go` — `Ensure`, `verify`, `Prune`
+* **A full disk parks work with a reason.** Free space is measured on the work dir's and the state dir's disks (run
+  directories, segments and snapshots live in the state dir). Below `limits.disk_min_free_gb` no job starts and no job
+  is pulled; every waiting job's note and `/v1/health` say why.
+  * `~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` — `Server.diskReasonLocked`, `Server.parkLocked`;
+    `code/internal/hardware/monitor.go` — `Monitor.SampleLoad`
+* **Broker writes are fsynced.** The nats-server templates set `jetstream { sync_interval: always }` (default: every
+  2 minutes). Run `just broker-config` and restart the broker on each machine to apply it.
+* **Known limits.** nats-server writes consumer (claim) state asynchronously: after a hard kill of the broker, a job
+  being rendered can be handed out again as a fresh delivery. On a standalone broker it comes back to the same server,
+  which keeps running it; in a fleet the hub cluster's replicas keep the claim; job_state fencing reports one result
+  either way. Returning a job without running it (a service not offered, a refused model) still uses one attempt.
 
 ## 10. Callers and how they submit
 
@@ -1171,7 +1239,7 @@ callers:
     yield_to_interactive: true
 ```
 
-* `first`: local jobs are pulled before any platform job, in every band. Right for the laptop and BMT.
+* `first`: local jobs are pulled before any platform job, in every band. Right for the laptop and for BMT, the dev machine (which runs only local jobs: D-024).
 * `share`: local is one more caller in the deficit round robin with its share. Right for B5090 when Bryan runs
   marketing batches but ACT3 customers must still be served.
 * `idle_only`: local jobs run only when no platform work is waiting. Right for a machine dedicated to customers.
@@ -1517,8 +1585,21 @@ The tests start a real `nats-server` binary as its own process, as production do
   once, on exactly one server), a killed worker's job finished by the other after the ack wait (attempt 2), a
   restarted worker returning its saved claim at once (inside a 60 s ack wait), and `broker_missing` followed by a
   late broker start (the server connects by itself; direct mode works throughout).
-* Not yet: the restart storm, code changes under a running task, self-claim and broker-restart cases (they need §9
-  task hosts), credentials and caller isolation (Q3), the leaf-link cut.
+* Not yet: self-claim mode, credentials and caller isolation (Q3), the leaf-link cut. (Restart storm, code changes,
+  broker restart, reboot, duplicate delivery and short jobs are the G1–G7 gate tests, task_authoring.mdx §8.)
+
+### 21.2c Hardening tests (2026-10-28, D-026)
+
+Go tests, fake models only:
+
+* `scheduler`: `TestSettlementSurvivesBrokerOutageAndRestart` (broker down when the job ends, process restarts, broker
+  redelivers: one `succeeded`, the job never runs again, the message is acked), `TestSettlementLostRepliesPublishOnce`
+  (lost replies on the job_state write and the event publish: one `succeeded`), `TestSettlementFencedOffIsDropped`,
+  `TestReclaimWaitsForTheBroker`, `TestStopLeavesATaskHostJobToTheNextController`, `TestLowDiskParksWorkWithAReason`.
+* `queue/natsq` (real nats-server): `TestAckRetriedAfterBrokerStall`, `TestSubmittedJobSurvivesAHardBrokerKill`.
+* `taskhost`: `TestAliveUsesBootAndPID`, `TestCheckpointHashCatchesSameSizeCorruption`, `TestRecordDeathCountsEachHostOnce`.
+* `runners`: `TestTaskHostThatKeepsDyingGivesUp`, `TestValidateVideo`, `TestDiskFullIsInfra`.
+* `snapshot`: `TestPullDuringCopyIsNeverMixed`, `TestDamagedSnapshotIsRebuilt`. `fsx`: `TestWriteAtomicNoTornFileAndNoTempLeft`.
 
 ### 21.3 Acceptance
 
@@ -1545,7 +1626,7 @@ The tests start a real `nats-server` binary as its own process, as production do
 | **Q2. Priority and policy** | bands, DRR, aging, callers, categories, models, admission | Q3, Q5, Q6 pass in standalone |
 | **Q3. Hub and workers** | hub role, leaf nodes, operator/accounts/users, signed envelopes, gateway | Q1, Q2 pass across a cloud hub and B5090 |
 | **Q4. ACT3 first type** | appsrv submits `act3.video_merge`; job rows updated from events | flash merges in production through the queue |
-| **Q5. WTC first types** | WTC submits transcription and transcode | WTC backlog drains on BMS and BMT with shares honored |
+| **Q5. WTC first types** | WTC submits transcription and transcode | WTC backlog drains on BMS with shares honored |
 | **Q6. Hardening** | three-node hub cluster (replicas 3), snapshots, alerts, credential rotation runbook | hub node loss causes no job loss |
 
 ### 22.1 Status as of 2026-10-27
@@ -1584,7 +1665,7 @@ To be copied into `pm/Decisions.yaml`.
    Until it exists, every machine runs **standalone** (its own `nats-server`, `queue.role: standalone`). ACT3 and the
    internal app submit to a machine's broker or local API directly.
 3. **Q3. Local priority defaults:**
-   * `first` on the laptop (BLAP) and BMT.
+   * `first` on the laptop (BLAP) and BMT (BMT is the dev machine and runs only local jobs: D-024).
    * `share` on B5090, BPC and BMS.
    * `idle_only` on the Nepal machines and cloud boxes.
 

@@ -10,7 +10,8 @@ import (
 type Load struct {
 	At         time.Time `json:"at"`
 	CPULoad1   float64   `json:"cpu_load_1m"`
-	DiskFreeGB float64   `json:"disk_free_gb"`
+	DiskFreeGB float64   `json:"disk_free_gb"`        // the lower of the work dir's and the state dir's disks
+	DiskPath   string    `json:"disk_path,omitempty"` // the directory DiskFreeGB was measured on
 }
 
 // Monitor holds the latest detection and telemetry for the running server.
@@ -19,6 +20,13 @@ type Monitor struct {
 	opts     Options
 	detected Facts
 	load     Load
+}
+
+// SetLoad replaces the telemetry sample (tests: a full disk without filling one).
+func (m *Monitor) SetLoad(l Load) {
+	m.mu.Lock()
+	m.load = l
+	m.mu.Unlock()
 }
 
 func NewMonitor(opts Options, initial Facts) *Monitor {
@@ -49,8 +57,13 @@ func (m *Monitor) Refresh(ctx context.Context) Facts {
 // SampleLoad takes one telemetry sample.
 func (m *Monitor) SampleLoad(ctx context.Context) {
 	l := Load{At: time.Now(), CPULoad1: readLoad(ctx)}
-	if d, err := diskUsage(m.opts.WorkDir); err == nil {
-		l.DiskFreeGB = d.FreeGB
+	for _, dir := range []string{m.opts.WorkDir, m.opts.StateDir} {
+		if dir == "" {
+			continue
+		}
+		if d, err := diskUsage(dir); err == nil && (l.DiskPath == "" || d.FreeGB < l.DiskFreeGB) {
+			l.DiskFreeGB, l.DiskPath = d.FreeGB, dir
+		}
 	}
 	m.mu.Lock()
 	m.load = l

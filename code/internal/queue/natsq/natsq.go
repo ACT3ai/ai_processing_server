@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/queue"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -27,6 +28,8 @@ const (
 	BucketControl = "job_control"
 	BucketServers = "servers"
 )
+
+var elog = errlog.For("natsq")
 
 // MinServerVersion is the oldest nats-server this adapter supports (work-queue streams, KV, NAK with delay).
 const MinServerVersion = "2.10.0"
@@ -248,7 +251,7 @@ func (q *Queue) toDelivery(msg jetstream.Msg) (queue.Delivery, error) {
 	var env queue.Envelope
 	if err := json.Unmarshal(msg.Data(), &env); err != nil {
 		// A message nobody can read must not loop forever: terminate it and say so.
-		_ = msg.Term()
+		elog.Check("terminating an unreadable work message", msg.Term(), "subject", msg.Subject())
 		return nil, fmt.Errorf("work message on %s is not a task envelope (terminated): %w", msg.Subject(), err)
 	}
 	attempt := 1
@@ -400,7 +403,9 @@ func (q *Queue) GetControl(ctx context.Context, jobID string) (queue.Control, er
 		return queue.Control{}, q.unavailable("reading job_control", err)
 	}
 	var c queue.Control
-	_ = json.Unmarshal(e.Value(), &c)
+	if err := json.Unmarshal(e.Value(), &c); err != nil {
+		return queue.Control{}, fmt.Errorf("job_control %s is not JSON: %w", jobID, err)
+	}
 	return c, nil
 }
 
@@ -568,20 +573,34 @@ func (d *delivery) Dead(ctx context.Context, reason string) error {
 	return d.send(ctx, []byte("+TERM "+reason), false, true)
 }
 
-// send publishes an ack body. final marks the delivery settled; confirm waits for the server's reply.
+// send publishes an ack body. final marks the delivery settled once the broker has it; confirm waits for the
+// server's reply. A send that failed (broker down, reconnecting) leaves the delivery open, so the caller's retry
+// really sends again (D-026: before, the first failed Ack marked it done and every retry was a silent no-op).
 func (d *delivery) send(ctx context.Context, body []byte, confirm, final bool) error {
 	d.mu.Lock()
-	if d.done {
-		d.mu.Unlock()
+	done, subj := d.done, d.h.AckSubject
+	d.mu.Unlock()
+	if done {
 		return nil
 	}
-	if final {
-		d.done = true
-	}
-	subj := d.h.AckSubject
-	d.mu.Unlock()
 	if subj == "" {
 		return errors.New("delivery has no ack subject")
+	}
+	if err := d.publishAck(ctx, subj, body, confirm); err != nil {
+		return err
+	}
+	if final {
+		d.mu.Lock()
+		d.done = true
+		d.mu.Unlock()
+	}
+	return nil
+}
+
+func (d *delivery) publishAck(ctx context.Context, subj string, body []byte, confirm bool) error {
+	if !d.q.nc.IsConnected() {
+		// A core publish while reconnecting only lands in the client's buffer, which is lost if this process stops.
+		return fmt.Errorf("%w: acknowledging job %s: not connected to nats-server", queue.ErrUnavailable, d.env.JobID)
 	}
 	if confirm {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -596,7 +615,10 @@ func (d *delivery) send(ctx context.Context, body []byte, confirm, final bool) e
 	}
 	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	return d.q.nc.FlushWithContext(fctx)
+	if err := d.q.nc.FlushWithContext(fctx); err != nil {
+		return d.q.unavailable("acknowledging job "+d.env.JobID, err)
+	}
+	return nil
 }
 
 // AckInfo is what an ack subject says about its message.

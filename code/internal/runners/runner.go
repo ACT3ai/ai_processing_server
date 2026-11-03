@@ -58,7 +58,7 @@ type Result struct {
 // All returns the runners built into this binary, by name.
 func All() map[string]Runner {
 	m := map[string]Runner{}
-	for _, r := range []Runner{Compute{}, Render{}, FFmpeg{}, OSSVideo{}, OSSUpscale{}} {
+	for _, r := range []Runner{Compute{}, Render{}, FFmpeg{}, OSSVideo{}, OSSUpscale{}, OSSRegenerate{}} {
 		m[r.Name()] = r
 	}
 	return m

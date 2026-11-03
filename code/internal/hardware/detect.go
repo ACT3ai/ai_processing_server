@@ -22,6 +22,9 @@ const (
 type Options struct {
 	// WorkDir is the disk whose free space matters most (paths.work_dir). Always probed.
 	WorkDir string
+	// StateDir is data/git_ignore: run directories (task host inputs, segments, outputs) and code snapshots live
+	// there, often on a different disk from WorkDir. Monitor samples both and reports the lower free space (D-026).
+	StateDir string
 	// EnginePaths overrides where to look for an engine (this_server.yaml `engines:`), name → path or URL.
 	EnginePaths map[string]string
 }

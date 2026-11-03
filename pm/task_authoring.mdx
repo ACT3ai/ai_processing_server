@@ -73,7 +73,8 @@ the params schema, and the caller code that submits it and reads its result.
 | `B5090` | Bryan's RTX 5090 PC (32 GB VRAM, CUDA) | `bryan_office` | Windows | video upscale, Wan video, image gen: the main GPU box |
 | `BMS` | Bryan's Mac Studio (Apple GPU, large unified memory) | `bryan_office` | macOS | Metal-capable work, transcription, CPU work; shared with OpenClaw (parent spec §15.3 `bms` profile) |
 | `NPL1`, `NPL2`, `NPL3` (decided, D-020) | the three Nepal machines | `nepal_office` | to be detected | GPU and CPU work; behind NAT, outbound connections only |
-| `BPC`, `BMT`, `BLAP` | Bryan's two-GPU PC, Mac Tower, laptop | `bryan_office` | Windows / macOS | also in the fleet per bryan_servers.mdx; not named in this dictation |
+| `BPC`, `BLAP` | Bryan's two-GPU PC, laptop | `bryan_office` | Windows / macOS | also in the fleet per bryan_servers.mdx; not named in this dictation |
+| ~~`BMT`~~ | Bryan's Mac Tower (Mac Pro 2024) | `bryan_office` | macOS | **not a render server**: Bryan's dev machine for development and debugging (D-024). Preset `dev: true`: only local jobs, never a worker, never an OS service |
 
 Every one of them:
 
@@ -166,6 +167,17 @@ the gate (§8); **should** rules are checked in review.
   video render in segments. After each chunk, write it to `runs/<job_id>/work/` and record it in a checkpoint line.
   A retry of the same job on the same machine (after a reboot) resumes from the last checkpoint instead of frame 0.
   Checkpoints are only an optimisation: the job must still be correct if it starts over.
+  * How a task gets checkpoints for free: hand the task host a list of **steps** instead of one argv. Each step
+    that exits 0 with its output written becomes `runs/<job_id>/checkpoint/<n>.done`. A dead task host is relaunched
+    in the same run directory on its own snapshot and skips every finished step. A step must write its output last,
+    whole, so its size is a fair checkpoint.
+  * SeedVR2 does this today. A source longer than 1.5 segments is cut, upscaled segment by segment, then joined.
+    A segment is `params.segment_seconds` (default 30 s; 0 turns it off) rounded to whole SeedVR2 batches, so the model
+    sees the same frame groups it would see uncut. Wan stays one step, because a diffusion pass cannot be split.
+  * When a task host dies, resume from its checkpoints on the same snapshot, else start over. Implemented in:
+    `~/BGit/act3/ai_processing_server/code/internal/runners/oss.go` — `resume`; `~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `Checkpoints`, `Relaunch`
+  * Cutting an upscale into checkpointed segments. Implemented in:
+    `~/BGit/act3/ai_processing_server/code/internal/runners/oss_segments.go` — `segmentedSteps`, `planSegments`
 * **R9. Honor cancel. (must)** Check for `runs/<job_id>/cancel` at every checkpoint and at least every 30 s; on cancel,
   stop, upload nothing, exit with the cancelled code. Child processes (ffmpeg, Python, ComfyUI client) must be in the
   task host's process group so they die with it.
@@ -268,8 +280,13 @@ binary, with `APS_FAKE_MODELS=on` so no weights are needed. The tests skip on a 
 * **G3, G4, G6, G7** (2026-10-27, `tests/broker/test_task_gates.py`, same setup):
   * G3: nats-server stopped and restarted mid-render. The render keeps going; `SUCCEEDED` once, attempt 1, no requeue.
   * G4: a simulated power cut (controller SIGKILL, task host and render killed, broker restarted, then broker and
-    server back in boot order). Redelivered, run again, `SUCCEEDED` on attempt 2 with exactly one `succeeded` event.
-    Wan and SeedVR2 have no checkpoint (R8), so they restart from the beginning.
+    server back in boot order). Run again, `SUCCEEDED` with exactly one `succeeded` event. Since D-026 the dead task
+    host is recognized at once by its pid and restarted here under the same claim (attempt 1, no requeue); before, this
+    fast simulated reboot read the fresh heartbeat as alive and the job went to attempt 2.
+    Wan has no checkpoint (R8), so it restarts from the beginning.
+  * G4 with a checkpoint (2026-10-28, `G4RebootResumesFromCheckpoint`): a segmented SeedVR2 upscale loses power
+    after its first segment. When the machine is back it resumes at the segment it was on, without redoing finished
+    steps. `SUCCEEDED` once, and the joined video has all 60 source frames.
   * G6: two servers on one broker. The worker holding the job is frozen with SIGSTOP past the ack wait, the other
     worker gets the job too, then the frozen one wakes and its render finishes. Exactly one `succeeded` event, from
     the claim holder, and still one after the fenced worker has had time to report.
@@ -277,8 +294,34 @@ binary, with `APS_FAKE_MODELS=on` so no weights are needed. The tests skip on a 
     `SUCCEEDED` once on attempt 1, with no requeue. Overhead is 0.2 s per job once controller downtime is taken out
     (limit 2 s).
   * Whole black-box suite: 99 of 99.
-* **Still to do:** real-weight runs on the Mac Studio (`just render-setup`, then `just render-test`; see §8.1) and
-  on B5090. A real power cycle stays a manual check.
+* **Hardening added 2026-10-28 (D-025):**
+  * Orphan task hosts: after a restart, the sweep cancels any task host whose job this server no longer holds. That
+    covers a direct-mode job failed at boot, and a claim another machine took over while this one was down. Before
+    this, such a host kept a GPU busy that the slot pool counted as free. The sweep waits until the boot reclaim
+    has settled the old claims.
+  * Disk: run directories nothing holds are removed after 1 h, or 24 h when they have checkpoints so a redelivery
+    can resume. Code snapshots beyond the newest 3 are pruned, never one a kept run directory names. Before this,
+    `Prune` was never called, so every `git pull` left another snapshot behind.
+  * Power cuts: `just install-service` installs nats-server and the server as OS services. They start at login
+    (macOS) or boot (Linux with linger) and restart on a crash. A clean `just stop` stays stopped. The command
+    refuses on a dev machine.
+  * Cleaning up orphan task hosts, old run directories and snapshots is implemented in:
+    `~/BGit/act3/ai_processing_server/code/internal/scheduler/runs.go` — `Server.sweepRuns`
+  * The OS services (launchd agents, systemd user units, Task Scheduler) are implemented in:
+    `~/BGit/act3/ai_processing_server/code/internal/service/service.go` — `Units`, `Install`
+* **Hardening added 2026-10-28 (D-026; full list with code in task_queue.mdx §9.7):**
+  * A job that ends while the broker is down keeps its outcome in the journal's settlement outbox until the broker
+    takes it; a redelivery is settled from it, not run again, and the caller gets one `succeeded`.
+  * `just update` mid-render leaves the job to its task host and the next controller at once (no drain wait, no
+    requeue, no second render).
+  * Task hosts: liveness by boot id and pid, fsynced checkpoints with SHA-256, at most 3 deaths per job per machine,
+    and the output is checked with ffprobe (all frames, for a segmented upscale) before the job counts as done.
+  * Snapshots are consistent under a concurrent `git pull`, fsynced, and checked before reuse.
+  * The settlement outbox is implemented in:
+    `~/BGit/act3/ai_processing_server/code/internal/scheduler/queue.go` — `Server.settleOnce`, `Server.runSettlement`
+* **Still to do:**
+  * Real-weight runs on the Mac Studio (`just render-setup`, then `just render-test`; see §8.1) and on B5090.
+  * `just install-service` on each render server, then one real power cycle by hand.
 
 ### 8.1 Real renders on the Mac Studio (problems 2026_oct_27)
 
@@ -368,13 +411,18 @@ implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/runners/oss_upscale.go` — `OSSUpscale.Check`, `OSSUpscale.Run`, `seedvr2Task`
 
 With `APS_FAKE_MODELS=on` both runners run `code/scripts/fake/fake_render.py` instead of a model (tests, machines
-without weights). Not built: re-adoption of a task host whose job came by direct mode (only queue claims are
-re-dispatched at boot), checkpoints (R8), the G1–G7 gate as integration tests.
+without weights). Not built: re-adoption of a task host whose job came by direct mode. Only queue claims are
+re-dispatched at boot; a direct job's task host is cancelled by the sweep instead of rendering unseen. Checkpoints
+(R8) and the G1–G7 gate tests are built (§5.2 R8, §8).
 
 The caller side for ACT3 render jobs (the internal web app on a render server) is
 `~/BGit/all/app/code/film/servers/src/processing/` (spec ~/BGit/all/film/pm/subp/backend/servers/servers.mdx §45).
 
 ## 12. Upgrade log
+
+* 2026-10-28: resilience pass (D-025). Checkpointed task-host steps, with resume after a reboot or crash. SeedVR2
+  upscales are cut into segments. The sweep cancels orphan task hosts and removes old run directories and snapshots.
+  `just install-service` added. BMT is now marked as Bryan's dev machine, not a render server (D-024).
 
 * 2026-10-27 (afternoon, problems 2026_oct_27): `just build` installs nats-server; `enable`/`disable` command;
   `just render-setup`, `render-check`, `render-test`; BMS `services_on`; a not-installed model offers 0 with the reason;

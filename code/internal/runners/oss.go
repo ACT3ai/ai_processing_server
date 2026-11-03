@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
 	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
@@ -26,10 +27,13 @@ import (
 //	no task.json            → snapshot, copy the inputs in, launch the task host
 //	task host alive         → re-attach (the controller restarted while it rendered)
 //	exit.json written       → collect what it produced while the controller was down
-//	task host gone          → start over (machine reboot); the run directory is replaced
+//	task host gone          → resume from its last checkpoint when it has one (R8, a segmented upscale) on the
+//	                          same snapshot; otherwise start over (machine reboot); the run directory is replaced
 //
 // When the job's context ends because the controller is stopping, Run returns WITHOUT touching the task host: the
 // next controller re-attaches. Only a cancel or a timeout writes the cancel file.
+
+var elog = errlog.For("runners")
 
 // StateDir is data/git_ignore (main sets it). Empty: derived from the job's work dir (<state>/work/<job_id>).
 var StateDir string
@@ -82,10 +86,12 @@ func safeID(id string) string {
 
 // detachedTask is what a runner wants run: built against the snapshot, with the run directory's own input copies.
 type detachedTask struct {
-	Argv   []string
-	Dir    string
-	Env    []string
-	Output string // inside the run directory
+	Argv         []string
+	Dir          string
+	Env          []string
+	Output       string          // inside the run directory
+	Steps        []taskhost.Step // instead of Argv: checkpointed steps, the last one writes Output (R8)
+	ExpectFrames int             // the output must have about this many frames (0: any number above zero)
 }
 
 // buildFunc builds the task. snap is the frozen code; inputs maps input name → its copy inside the run directory;
@@ -96,11 +102,40 @@ type buildFunc func(snap snapshot.Snapshot, inputs map[string]string, out string
 // it), anything else internal.
 var reOOM = regexp.MustCompile(`(?i)out of memory|OutOfMemory|Invalid buffer size|Killed: 9|larger than INT_MAX|without overflow`)
 
+// reDiskFull: the machine ran out of disk mid-render. Infra, so the job is retried, on another machine if this
+// one stays full (the scheduler stops taking work while the disk is low).
+var reDiskFull = regexp.MustCompile(`(?i)no space left on device|ENOSPC|disk (is )?full|not enough space on the disk|quota exceeded`)
+
 func failureKind(tail string) jobs.ErrorKind {
-	if reOOM.MatchString(tail) {
+	// A task script's own verdict wins over the regexes (render_h3_regenerate.py ends a failure with ONE line
+	// "ACT3_ERROR <kind>: <sentence>"): an echoed prompt that mentions "out of memory" never makes a bad job retried.
+	if k, ok := scriptErrorKind(tail); ok {
+		return k
+	}
+	if reOOM.MatchString(tail) || reDiskFull.MatchString(tail) {
 		return jobs.KindInfra
 	}
 	return jobs.KindInternal
+}
+
+var reScriptError = regexp.MustCompile(`(?m)^ACT3_ERROR ([a-z_]+):`)
+
+// scriptErrorKind maps the LAST "ACT3_ERROR <kind>:" line of a task's output to a job error kind. not_installed is
+// infra (another server may have the model); license_not_cleared is invalid_input (no retry can fix it).
+func scriptErrorKind(tail string) (jobs.ErrorKind, bool) {
+	m := reScriptError.FindAllStringSubmatch(tail, -1)
+	if len(m) == 0 {
+		return "", false
+	}
+	switch m[len(m)-1][1] {
+	case "invalid_input", "license_not_cleared":
+		return jobs.KindInvalidInput, true
+	case "infra", "not_installed":
+		return jobs.KindInfra, true
+	case "internal":
+		return jobs.KindInternal, true
+	}
+	return "", false
 }
 
 // runDetached is Run for every task-host runner. outName is the output's name ("video").
@@ -112,11 +147,28 @@ func runDetached(ctx context.Context, job *jobs.Job, env Env, rep Reporter, outN
 	case taskhost.Finished:
 		rep.Log("the task host finished this job while the controller was down; collecting it")
 	case taskhost.Dead, taskhost.Missing:
+		resumed := false
+		var deaths []string
 		if st == taskhost.Dead {
-			rep.Log("the previous task host for this job is gone (reboot or crash); starting it again")
+			// A task host that keeps dying (each time taking the machine down, so the job is re-adopted at boot under
+			// the same attempt) would otherwise be started here forever. After MaxDeaths it fails as infra: the
+			// queue's retry policy moves it on, to another machine or to DEAD.
+			if n := taskhost.RecordDeath(dir); n >= taskhost.MaxDeaths {
+				elog.Ignore("removing the run directory of a task host that keeps dying", os.RemoveAll(dir), "job_id", job.ID)
+				return nil, jobs.Errf(jobs.KindInfra, "the task host for this job died %d times on this machine without finishing "+
+					"(a reboot or crash each time); not starting it here again", n)
+			}
+			deaths = taskhost.Deaths(dir)
+			resumed = resume(env, rep, dir)
+			if !resumed {
+				rep.Log("the previous task host for this job is gone (reboot or crash); starting it again")
+			}
 		}
-		if err := launch(job, env, rep, dir, build); err != nil {
-			return nil, err
+		if !resumed {
+			if err := launch(job, env, rep, dir, build); err != nil {
+				return nil, err
+			}
+			elog.Check("carrying the task host death count into the new run directory", taskhost.CarryDeaths(dir, deaths), "job_id", job.ID)
 		}
 	}
 
@@ -131,7 +183,12 @@ func runDetached(ctx context.Context, job *jobs.Job, env Env, rep Reporter, outN
 		}
 	})
 	if errors.Is(err, taskhost.ErrDead) {
-		os.RemoveAll(dir)
+		// Keep the checkpoints: when the retry lands on this machine again it resumes (the run-dir sweep removes
+		// them once nothing here holds the job).
+		taskhost.RecordDeath(dir)
+		if done, _ := taskhost.Checkpoints(dir); done == 0 {
+			elog.Ignore("removing a dead task host's run directory", os.RemoveAll(dir), "job_id", job.ID)
+		}
 		return nil, jobs.Errf(jobs.KindInfra, "%v", err)
 	}
 	if err != nil { // ctx ended
@@ -140,17 +197,23 @@ func runDetached(ctx context.Context, job *jobs.Job, env Env, rep Reporter, outN
 			rep.Log("controller stopping: the task host keeps rendering and the next controller re-attaches")
 			return nil, cause
 		}
-		taskhost.Cancel(dir)
+		elog.Check("cancelling a task host", taskhost.Cancel(dir), "job_id", job.ID)
 		wctx, done := context.WithTimeout(context.Background(), 30*time.Second)
-		taskhost.Watch(wctx, dir, nil)
+		if _, werr := taskhost.Watch(wctx, dir, nil); werr != nil && !errors.Is(werr, taskhost.ErrDead) {
+			elog.Warn("waiting for a cancelled task host to stop", werr, "job_id", job.ID, "dir", dir)
+		}
 		done()
-		os.RemoveAll(dir) // R9: nothing is uploaded; R10: scratch removed
+		elog.Ignore("removing a cancelled run directory", os.RemoveAll(dir), "job_id", job.ID) // R9: nothing is uploaded; R10: scratch removed
 		return nil, cause
 	}
 
-	t, _ := taskhost.ReadTask(dir)
+	t, err := taskhost.ReadTask(dir)
+	if err != nil {
+		elog.Ignore("removing a run directory with an unreadable task.json", os.RemoveAll(dir), "job_id", job.ID)
+		return nil, jobs.Wrap(jobs.KindInfra, err, "read task.json of the finished task host")
+	}
 	if x.Code != 0 || x.OutputBytes == 0 {
-		os.RemoveAll(dir) // a retry starts clean
+		elog.Ignore("removing a failed run directory", os.RemoveAll(dir), "job_id", job.ID) // a retry starts clean
 		if x.Cancelled {
 			return nil, jobs.Errf(jobs.KindCancelled, "cancelled")
 		}
@@ -163,6 +226,13 @@ func runDetached(ctx context.Context, job *jobs.Job, env Env, rep Reporter, outN
 		}
 		return nil, jobs.Errf(failureKind(x.Tail), "render failed (%s): %s", why, lastLine(x.Tail))
 	}
+	// Never mark a render done on exit code alone: a truncated or empty-stream file would be uploaded and billed.
+	if err := validateVideo(enginePath(env, "ffprobe"), t.Output, t.ExpectFrames); err != nil {
+		elog.Ignore("removing a run directory whose output failed validation", os.RemoveAll(dir), "job_id", job.ID)
+		return nil, jobs.Errf(jobs.KindInternal, "the render finished but its output is not a valid video: %v", err)
+	} else if enginePath(env, "ffprobe") == "" {
+		rep.Log("ffprobe not detected: the output was not validated")
+	}
 	dst := filepath.Join(env.OutDir, outName+filepath.Ext(t.Output))
 	if err := os.MkdirAll(env.OutDir, 0o700); err != nil {
 		return nil, jobs.Wrap(jobs.KindInfra, err, "create out dir")
@@ -170,11 +240,41 @@ func runDetached(ctx context.Context, job *jobs.Job, env Env, rep Reporter, outN
 	if err := moveFile(t.Output, dst); err != nil {
 		return nil, jobs.Wrap(jobs.KindInfra, err, "collect the render")
 	}
-	os.RemoveAll(dir)
+	elog.Ignore("removing a collected run directory", os.RemoveAll(dir), "job_id", job.ID)
 	return &Result{
 		Outputs: []jobs.Output{{Name: outName, Path: dst, ContentType: "video/mp4"}},
 		Data:    map[string]any{"code_version": t.Snapshot, "bytes": x.OutputBytes},
 	}, nil
+}
+
+// resume relaunches a dead task host from its checkpoints (R8). It needs at least one finished step and the task's
+// own snapshot still on disk, so the resumed steps run exactly the code the finished ones ran. False: start over.
+func resume(env Env, rep Reporter, dir string) bool {
+	done, total := taskhost.Checkpoints(dir)
+	if done == 0 || done >= total {
+		return false
+	}
+	t, err := taskhost.ReadTask(dir)
+	if err != nil {
+		return false
+	}
+	snap := SnapshotFor(env, t.Snapshot)
+	if _, err := os.Stat(snap.Binary()); err != nil {
+		rep.Log("the task host died after " + fmt.Sprint(done) + " of " + fmt.Sprint(total) + " steps, but its snapshot " + t.Snapshot + " is gone; starting over")
+		return false
+	}
+	if err := taskhost.Relaunch(HostCommand(snap), dir); err != nil {
+		elog.Error("resuming a task host from its checkpoint", err, "job_id", t.JobID)
+		return false
+	}
+	rep.Log(fmt.Sprintf("the previous task host died (reboot or crash) after %d of %d steps; resuming at step %d from the checkpoint, snapshot %s",
+		done, total, done+1, t.Snapshot))
+	return true
+}
+
+// SnapshotFor is the snapshot a run directory's task.json names.
+func SnapshotFor(env Env, key string) snapshot.Snapshot {
+	return snapshot.Snapshot{Key: key, Dir: filepath.Join(stateDir(env), "snapshots", key)}
 }
 
 func launch(job *jobs.Job, env Env, rep Reporter, dir string, build buildFunc) error {
@@ -190,7 +290,9 @@ func launch(job *jobs.Job, env Env, rep Reporter, dir string, build buildFunc) e
 	if err != nil {
 		return jobs.Wrap(jobs.KindInfra, err, "build the code snapshot")
 	}
-	os.RemoveAll(dir)
+	if err := os.RemoveAll(dir); err != nil {
+		return jobs.Wrap(jobs.KindInfra, err, "clear the old run directory")
+	}
 	// Inputs are copied (hard-linked when possible) into the run directory: the work dir is deleted at every
 	// controller boot, and the task host may still be reading them then.
 	inputs := map[string]string{}
@@ -210,12 +312,18 @@ func launch(job *jobs.Job, env Env, rep Reporter, dir string, build buildFunc) e
 		timeout = MaxTaskSeconds
 	}
 	task := taskhost.Task{JobID: job.ID, Snapshot: snap.Key, Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output,
-		GPU: env.Slot.GPU, TimeoutSeconds: timeout}
-	os.MkdirAll(filepath.Dir(t.Output), 0o700)
+		GPU: env.Slot.GPU, TimeoutSeconds: timeout, Steps: t.Steps, ExpectFrames: t.ExpectFrames}
+	if err := os.MkdirAll(filepath.Dir(t.Output), 0o700); err != nil {
+		return jobs.Wrap(jobs.KindInfra, err, "create the output dir")
+	}
 	if err := taskhost.Launch(HostCommand(snap), dir, task); err != nil {
 		return jobs.Wrap(jobs.KindInfra, err, "start the task host")
 	}
-	rep.Log(fmt.Sprintf("task host started from snapshot %s: %s", snap.Key, strings.Join(t.Argv, " ")))
+	if len(t.Steps) > 0 {
+		rep.Log(fmt.Sprintf("task host started from snapshot %s: %d checkpointed steps", snap.Key, len(t.Steps)))
+	} else {
+		rep.Log(fmt.Sprintf("task host started from snapshot %s: %s", snap.Key, strings.Join(t.Argv, " ")))
+	}
 	return nil
 }
 
@@ -229,6 +337,24 @@ func stopsTheTask(cause error) bool {
 	}
 	s := strings.ToLower(cause.Error())
 	return strings.Contains(s, "cancel") || strings.Contains(s, "timeout") || strings.Contains(s, "exceeded")
+}
+
+// validateVideo checks a finished render with ffprobe: a readable video stream with frames, and about expect frames
+// when the task knows how many (a segmented upscale: every segment made it into the join). No ffprobe: not checked.
+func validateVideo(ffprobe, path string, expect int) error {
+	if ffprobe == "" {
+		return nil
+	}
+	vf, err := probeFrames(ffprobe, path)
+	if err != nil {
+		return err
+	}
+	if expect > 0 {
+		if tol := max(2, expect/100); vf.Frames < expect-tol || vf.Frames > expect+tol {
+			return fmt.Errorf("it has %d frames, expected %d", vf.Frames, expect)
+		}
+	}
+	return nil
 }
 
 func lastLine(tail string) string {

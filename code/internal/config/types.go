@@ -114,6 +114,9 @@ var DefaultCallers = []string{"act3", "wtc", "local"}
 
 // EnabledCallers returns the callers this machine pulls for, sorted.
 func (t *ThisServer) EnabledCallers() []string {
+	if t.Server.Dev {
+		return []string{"local"} // a dev machine only ever runs its owner's own jobs
+	}
 	if len(t.Callers) == 0 {
 		return append([]string(nil), DefaultCallers...)
 	}
@@ -128,13 +131,16 @@ func (t *ThisServer) EnabledCallers() []string {
 }
 
 type Identity struct {
-	Key         string  `yaml:"key" json:"key"`
-	DisplayName string  `yaml:"display_name" json:"display_name"`
-	Profile     string  `yaml:"profile" json:"profile"`
-	Family      string  `yaml:"family" json:"family"`
-	Site        string  `yaml:"site" json:"site"`
-	ServersDir  string  `yaml:"servers_dir" json:"servers_dir,omitempty"` // servers/{dir}/ in this repo; "" = not checked in
-	BoundTo     BoundTo `yaml:"bound_to" json:"bound_to"`
+	Key         string `yaml:"key" json:"key"`
+	DisplayName string `yaml:"display_name" json:"display_name"`
+	Profile     string `yaml:"profile" json:"profile"`
+	Family      string `yaml:"family" json:"family"`
+	Site        string `yaml:"site" json:"site"`
+	ServersDir  string `yaml:"servers_dir" json:"servers_dir,omitempty"` // servers/{dir}/ in this repo; "" = not checked in
+	// Dev marks a development machine (Bryan's Mac Tower): the server runs there only for debugging. It never pulls
+	// ACT3 or WTC jobs, never joins the fleet as a worker and never installs itself as an OS service.
+	Dev     bool    `yaml:"dev,omitempty" json:"dev,omitempty"`
+	BoundTo BoundTo `yaml:"bound_to" json:"bound_to"`
 }
 
 type BoundTo struct {
@@ -279,6 +285,7 @@ type KnownServer struct {
 	// model services on the box whose weights are installed: BMS Wan 2.2 + SeedVR2, problems 2026_oct_27 #2).
 	ServicesOn []string `yaml:"services_on"`
 	LocalMode  string   `yaml:"local_mode"` // callers.local.mode init writes; share when empty
+	Dev        bool     `yaml:"dev"`        // a development machine, not a render server (Identity.Dev)
 }
 
 type Match struct {

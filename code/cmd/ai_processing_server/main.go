@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -46,6 +47,7 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/queue/natsq"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
 	"github.com/ACT3ai/ai_processing_server/internal/scheduler"
+	"github.com/ACT3ai/ai_processing_server/internal/service"
 	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 	"gopkg.in/yaml.v3"
 )
@@ -147,6 +149,8 @@ func main() {
 		err = cmdBroker(p, append(sub, fs.Args()...))
 	case "enable", "disable":
 		err = cmdEnable(p, append(sub, fs.Args()...), cmd == "enable")
+	case "service":
+		err = cmdService(p, append(sub, fs.Args()...))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -161,7 +165,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
 commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · cancel <id> · drain · resume · stop [--force]
-          broker status|config · enable|disable <service-id|queue>... · version
+          broker status|config · enable|disable <service-id|queue>... · service install|uninstall|status|print · version
 flags: --root --state-dir --config --log-dir --error-dir --listen --json
 `)
 }
@@ -440,7 +444,7 @@ func cmdRun(p paths) error {
 	if ts.Paths.WorkDir != "" {
 		work = config.ExpandHome(ts.Paths.WorkDir)
 	}
-	mon := hardware.NewMonitor(hardware.Options{WorkDir: work, EnginePaths: ts.Engines}, facts)
+	mon := hardware.NewMonitor(hardware.Options{WorkDir: work, StateDir: p.State, EnginePaths: ts.Engines}, facts)
 	loader := func() (*config.ThisServer, *config.Catalog, []string, error) {
 		f := mon.Detected()
 		return loadConfig(p, &f)
@@ -802,6 +806,75 @@ func cmdEnable(p paths, items []string, on bool) error {
 		fmt.Println("the server is running on the old settings: restart it to apply (just stop && just run)")
 	}
 	return nil
+}
+
+// cmdService: service install|uninstall|status|print. The broker and the server as OS services, so a reboot or a
+// power cut brings this render server back by itself (internal/service).
+func cmdService(p paths, args []string) error {
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	ts, _, _, err := loadConfig(p, nil)
+	if err != nil {
+		return err
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	spec := service.Spec{Root: p.Root, Binary: filepath.Join(p.Root, filepath.Base(bin)), LogDir: filepath.Join(p.State, "logs")}
+	if ts.Queue.Enabled {
+		if nats, lerr := exec.LookPath("nats-server"); lerr == nil {
+			conf, cerr := brokerctl.WriteConfig(ts, p.Data)
+			if cerr != nil {
+				return cerr
+			}
+			spec.NATSServer, spec.BrokerConf = nats, conf
+		} else if sub == "install" {
+			fmt.Println("warning: nats-server is not on PATH (just broker-install): only the server is installed")
+		}
+	}
+	units, err := service.Units(runtime.GOOS, spec)
+	if err != nil {
+		return err
+	}
+	switch sub {
+	case "print":
+		for _, u := range units {
+			fmt.Printf("==== %s %s\n%s\n", u.Name, u.Path, u.Body)
+		}
+		return nil
+	case "install":
+		if ts.Server.Dev && !p.Force {
+			return fmt.Errorf("%s is a dev machine (server.dev: true), not a render server: it is not installed as a service. Use `just run` to debug here (--force overrides)", ts.Server.Key)
+		}
+		did, err := service.Install(units, spec.LogDir)
+		for _, d := range did {
+			fmt.Println(d)
+		}
+		if err == nil {
+			fmt.Println("both start at boot (login) and restart on a crash; `just stop` still stops the server until the next boot")
+			if runtime.GOOS == "darwin" {
+				fmt.Println("macOS: launchd agents start at login: turn on automatic login on a render box so a power cut recovers unattended")
+			}
+			if runtime.GOOS == "linux" {
+				fmt.Println("linux: run `loginctl enable-linger $USER` once so the user services start at boot without a login")
+			}
+		}
+		return err
+	case "uninstall":
+		for _, d := range service.Uninstall(units) {
+			fmt.Println(d)
+		}
+		return nil
+	case "status":
+		for name, ok := range service.Installed(units) {
+			fmt.Printf("%-24s %s\n", name, map[bool]string{true: "installed", false: "not installed (just install-service)"}[ok])
+		}
+		return nil
+	}
+	return errors.New("usage: ai_processing_server service install|uninstall|status|print [--force]")
 }
 
 func errString(err error) string {

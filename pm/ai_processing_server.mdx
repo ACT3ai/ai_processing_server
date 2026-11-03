@@ -10,7 +10,7 @@ description: "CTO engineering spec for the Go single-binary processing server th
 **Owner:** CTO · **As of:** 2026-10-27 · **Status:** v0.1.0 built (phases 0–2 mostly done; see §24.2)
 · **Repo:** https://github.com/ACT3ai/ai_processing_server.git (`~/BGit/act3/ai_processing_server/`)
 · **Siblings:** `~/BGit/all/film/pm/subp/render_queue/RenderEngine.mdx` (the engine that decides which server gets a
-job) · `~/BGit/all/film/pm/subp/render_queue/bryan_servers.mdx` (the home fleet B5090, BPC, BMT, BMS and the admin
+job) · `~/BGit/all/film/pm/subp/render_queue/bryan_servers.mdx` (the home fleet B5090, BPC, BMS and the admin
 Server page) · `~/BGit/all/film/pm/subp/render_queue/render_queue.mdx` (the Render Queue page)
 
 Every section that holds facts that can go stale carries an **As of** line. When work in a section lands, change its
@@ -51,7 +51,7 @@ Requirements derived from it (each answered later and tested in §20):
 
 Vocabulary used throughout:
 
-* **Server:** one machine running this binary. Its **key** is short and upper case (`B5090`, `BPC`, `BMT`, `BMS`,
+* **Server:** one machine running this binary. Its **key** is short and upper case (`B5090`, `BPC`, `BMS`,
   `NPL1`, `AWS3`).
 * **Platform:** a product that sends work. Two today: **ACT3** (the AI filmmaking web app, appsrv) and **WTC** (We The
   Citizens, the Go backend in `~/BGit/act3/AI_Coding/` and `~/BGit/act3/we_citizens/`).
@@ -149,7 +149,7 @@ Target picture:
   `github.com/ACT3ai/ai_processing_server`.
 * One binary, `ai_processing_server` (`ai_processing_server.exe` on Windows), built into the repo root, ignored by
   `.gitignore` (already in place: `/ai_processing_server`, `/ai_processing_server.exe`).
-* Targets: `darwin/arm64` (BMT, BMS), `windows/amd64` (B5090, BPC), `linux/amd64` and `linux/arm64` (cloud). Each
+* Targets: `darwin/arm64` (BMS; BMT for development only), `windows/amd64` (B5090, BPC), `linux/amd64` and `linux/arm64` (cloud). Each
   machine builds its own binary; cross-compiling is allowed for CI but never committed.
 * `CGO_ENABLED=0` by default so the build needs no C toolchain. GPU facts come from vendor command-line tools
   (`nvidia-smi`, `system_profiler`), not from linking NVML. If NVML through cgo is ever needed for precision, it goes
@@ -290,7 +290,7 @@ created_by: "ai_processing_server init 0.1.0 (git 5f1ead1)"
 server:
   key: B5090                    # upper case, A-Z 0-9, at most 12 characters, unique across the fleet
   display_name: "Bryan 5090"
-  profile: b5090                # which Go profile to load: generic | b5090 | bpc | bmt | bms | cloud (§15.3)
+  profile: b5090                # which Go profile to load: generic | b5090 | bpc | bms | cloud (§15.3)
   family: bryan                 # bryan | office | cloud | runpod (bryan_servers.mdx §6.1)
   site: bryan_office            # key in data/sites/sites.yaml
   bound_to:                     # detected at creation; a mismatch at boot means the file was copied (§6.5)
@@ -436,11 +436,12 @@ servers:
     profile: bpc
     family: bryan
     site: bryan_office
-  - key: BMT
-    display_name: "Bryan Mac Tower"
-    profile: bmt
+  - key: BMT                     # NOT a render server: Bryan's dev machine (D-024)
+    display_name: "Bryan Mac Tower (dev machine)"
+    profile: generic
     family: bryan
     site: bryan_office
+    dev: true                    # init writes act3/wtc off; never a worker; `service install` refuses
   - key: BMS
     display_name: "Bryan Mac Studio"
     profile: bms
@@ -1024,7 +1025,7 @@ code/
     ├── config/       # load + validate this_server.yaml and data/ catalogs; template fill for init; never writes outside init
     ├── hardware/     # probes per OS (hardware_darwin.go, hardware_windows.go, hardware_linux.go), engines, telemetry loop
     ├── capability/   # hardware × services × limits → offers with reasons (§7.3)
-    ├── profiles/     # per-machine behavior: generic, b5090, bpc, bmt, bms, cloud (§15.3)
+    ├── profiles/     # per-machine behavior: generic, b5090, bpc, bms, cloud (§15.3)
     ├── jobs/         # Job, envelope parsing, state machine, ErrorKind, journal
     ├── scheduler/    # slots, admission, local ordering (§10.3), platform sharing (§10.5), leasing loop
     ├── broker/       # Source interface; httplease/ (phase 1); temporal/ (optional)
@@ -1114,7 +1115,7 @@ type Base struct{}
 | `b5090` | `cuda` | one heavy model resident at a time; switch-cost in offers; VRAM by process in `Special` |
 | `bpc` | `cuda` | one slot per GPU with `CUDA_VISIBLE_DEVICES`; never sums VRAM across cards |
 | `mac` | `Base` | unified-memory fit, Metal/MLX capability, `powermetrics`-free telemetry |
-| `bmt` | `mac` | CPU and ffmpeg services only; declines new work while non-server CPU use is over 70% |
+| ~~`bmt`~~ | | retired 2026-10-28: BMT (Bryan's Mac Tower) is his dev machine, not a render server (D-024); its preset uses `generic` with `dev: true` |
 | `bms` | `mac` | OpenClaw is the tenant: declines GPU/ML work while OpenClaw containers are busy; `memory_reserve_gb` default 128 |
 | `cloud` | `Base` | no reserves, no quiet hours, drain on SIGTERM within the platform's grace period |
 
@@ -1285,9 +1286,9 @@ platform's grace period), then cancel remaining jobs as `infra` "server shutting
 | **0. Specs and scaffold** | this spec; `pm/Goal.md`, `pm/TO_DO.md`, `pm/Decisions.yaml`; `.gitignore` line for `/data/git_ignore/`; `code/go.mod`, `main.go` with `version`; justfile `build`/`run` | `just build` and `just run` work on a clean checkout |
 | **1. Identity and hardware** | `config`, `hardware`, `capability`, `init`, `detect`, local API read routes, logging | A1, A2 on all four machines |
 | **2. Jobs locally** | `jobs`, `scheduler`, `procs`, `storage`, runners `selftest` and `ffmpeg`, direct mode | merges run locally through `POST /v1/jobs` |
-| **3. ACT3 connected** | `broker/httplease`; appsrv adds §14 endpoints over the `job` table; heartbeat feeds the Server page | ACT3 flash merges run on BMT through the platform; A3 to A7 |
+| **3. ACT3 connected** | `broker/httplease`; appsrv adds §14 endpoints over the `job` table; heartbeat feeds the Server page | ACT3 flash merges run on BMS through the platform; A3 to A7 |
 | **4. GPU services** | runners `comfy`, `python` (upscale, video gen), model cache, profiles `b5090`, `bpc`, `bms` | `comfy_generation_on_prem` moved from job_runner to this server on B5090 |
-| **5. WTC connected** | WTC backend implements §14; `wtc.transcription`, `wtc.transcode`, `wtc.ocr` | WTC backlog processed on BMS/BMT with shares honored |
+| **5. WTC connected** | WTC backend implements §14; `wtc.transcription`, `wtc.transcode`, `wtc.ocr` | WTC backlog processed on BMS with shares honored |
 | **6. Fleet** | `install-service`, metrics, automated update, Nepal and cloud machines | a fifth machine joins with no code change |
 
 Strangler rule for ACT3: one job type at a time moves from job_runner to this server; job_runner stops polling that
@@ -1314,9 +1315,9 @@ queue on the same day the lease endpoint starts serving it. No job type is serve
 1. **Q1. Transport:** NATS with JetStream as a separate `nats-server` process (D-014).
 2. **Q2. Hostnames:** the first `init` on each machine records its real hostname in `this_server.yaml`. The preset
    line in `known_servers.yaml` is then corrected by pull request. Guessed hostnames do not block anything, because
-   `init` also matches on GPU hints and an unmatched machine gets `CHANGE_ME` and a clear message. Observed
-   2026-10-27: a machine named `Bryans-Mac-Pro-2024` ran `init` and got `CHANGE_ME`. If it is BMT, add that hostname
-   to BMT's preset.
+   `init` also matches on GPU hints and an unmatched machine gets `CHANGE_ME` and a clear message. `Bryans-Mac-Pro-2024`
+   is BMT, Bryan's Mac Tower: his development machine, not a render server (D-024, 2026-10-28). Its preset has
+   `dev: true`.
 3. **Q3. Default shares (ACT3 / WTC):**
    * 70/30 on B5090 and BPC.
    * 30/70 on BMS, where transcription fits.

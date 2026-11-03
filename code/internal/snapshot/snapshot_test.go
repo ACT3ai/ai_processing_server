@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func write(t *testing.T, p, s string) {
@@ -56,5 +57,77 @@ func TestPullDoesNotChangeARunningSnapshot(t *testing.T) {
 	}
 	if got := Prune(base, 1, map[string]bool{s1.Key: true}); len(got) != 1 || got[0] != s2.Key {
 		t.Fatalf("prune removed %v", got)
+	}
+}
+
+// A git pull that lands between hashing and copying never yields a snapshot that mixes old and new files: Ensure
+// sees the copy no longer matches the hash and starts over, so the snapshot's content is exactly its key's.
+func TestPullDuringCopyIsNeverMixed(t *testing.T) {
+	root, base := t.TempDir(), t.TempDir()
+	bin := filepath.Join(root, "ai_processing_server")
+	a := filepath.Join(root, "code", "scripts", "a.py")
+	b := filepath.Join(root, "code", "scripts", "b.py")
+	write(t, bin, "binary")
+	write(t, a, "a v1")
+	write(t, b, "b v1")
+	pulled := false
+	beforeCopy = func() {
+		if !pulled {
+			pulled = true
+			write(t, a, "a v2") // the pull lands mid-snapshot
+			write(t, b, "b v2")
+		}
+	}
+	defer func() { beforeCopy = nil }()
+	s, err := Ensure(root, bin, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ga, _ := os.ReadFile(s.Path("code/scripts/a.py"))
+	gb, _ := os.ReadFile(s.Path("code/scripts/b.py"))
+	if string(ga) != "a v2" || string(gb) != "b v2" {
+		t.Fatalf("snapshot holds a=%q b=%q", ga, gb)
+	}
+	again, _ := Ensure(root, bin, base)
+	if again.Key != s.Key {
+		t.Fatalf("the snapshot's key does not match its content: %s vs %s", s.Key, again.Key)
+	}
+}
+
+// A snapshot whose files lost their data (a power cut right after it was built) is set aside and rebuilt, never
+// handed to a job; Prune later removes the damaged copy and other hidden leftovers.
+func TestDamagedSnapshotIsRebuilt(t *testing.T) {
+	root, base := t.TempDir(), t.TempDir()
+	bin := filepath.Join(root, "ai_processing_server")
+	script := filepath.Join(root, "code", "scripts", "run.py")
+	write(t, bin, "binary")
+	write(t, script, "print('render')")
+	s, err := Ensure(root, bin, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := s.Path("code/scripts/run.py")
+	os.Chmod(p, 0o600)
+	os.Truncate(p, 0)
+	s2, err := Ensure(root, bin, base)
+	if err != nil || s2.Key != s.Key {
+		t.Fatalf("rebuild: %v %s", err, s2.Key)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "print('render')" {
+		t.Fatalf("damaged snapshot reused: %q", b)
+	}
+	old := LeftoverAge
+	LeftoverAge = 0
+	defer func() { LeftoverAge = old }()
+	os.MkdirAll(filepath.Join(base, ".building-123"), 0o700)
+	time.Sleep(10 * time.Millisecond)
+	Prune(base, 5, nil)
+	ents, _ := os.ReadDir(base)
+	if len(ents) != 1 || ents[0].Name() != s.Key {
+		var names []string
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("after Prune: %v", names)
 	}
 }

@@ -125,12 +125,23 @@ func (s *Server) queueMain(ctx context.Context) {
 	if want != "" && !strings.HasPrefix(strings.TrimPrefix(st.ServerVersion, "v"), want) {
 		s.log.Warn("nats-server version is not the supported line", "server_version", st.ServerVersion, "supported", want+".x")
 	}
-	s.reclaimAtBoot(ctx, q)
-
+	// The publisher and the heartbeats start first: the outbox and the boot reclaim publish through the one
+	// in-order publisher, and a re-adopted claim must be extended while the rest of the reclaim runs.
 	done := make(chan struct{})
 	go func() { defer elog.Recover("publishing queue events"); s.publishLoop(ctx, q); close(done) }()
 	go func() { defer elog.Recover("watching job_control"); s.controlLoop(ctx, q) }()
 	go func() { defer elog.Recover("extending queue claims"); s.heartbeatLoop(ctx, q) }()
+	s.resumeSettlements()
+	s.reclaimAtBoot(ctx, q)
+	s.mu.Lock()
+	first := !s.reclaimed && ctx.Err() == nil
+	if ctx.Err() == nil {
+		s.reclaimed = true
+	}
+	s.mu.Unlock()
+	if first {
+		s.safely("sweeping run directories after the boot reclaim", s.sweepRuns)
+	}
 	s.pullLoop(ctx, q)
 	<-done
 }
@@ -244,6 +255,9 @@ func pullOrder(callers, svcs []string, localMode string) []queue.ConsumerRef {
 // acceptDelivery claims a pulled job (fencing token), or settles it at once when it must not run.
 func (s *Server) acceptDelivery(ctx context.Context, q queue.Queue, d queue.Delivery) {
 	env := d.Envelope()
+	if s.handToSettlement(env.JobID, d) {
+		return // finished here already; its outcome is in the outbox
+	}
 	attempt := d.Attempt()
 	s.mu.Lock()
 	def, known := s.cat.Services[env.Service]
@@ -273,7 +287,8 @@ func (s *Server) acceptDelivery(ctx context.Context, q queue.Queue, d queue.Deli
 		return
 	}
 	h.rev = rev
-	ctl, _ := q.GetControl(ctx, env.JobID)
+	ctl, err := q.GetControl(ctx, env.JobID)
+	elog.Ignore("reading job_control for a pulled job", err, "job_id", env.JobID) // no flags is the safe default
 	now := time.Now().UTC()
 	switch {
 	case ctl.Cancel:
@@ -346,61 +361,161 @@ func (s *Server) acceptDelivery(ctx context.Context, q queue.Queue, d queue.Deli
 	s.eventLocked(j, "claimed", func(e *queue.Event) { e.State = queue.StateClaimed })
 }
 
-// settleDirect finishes a job that never reached a slot: write job_state, publish the final event, then act.
+// settleDirect finishes a job that never reached a slot: write job_state, publish the final event, then act. The job
+// never ran, so its settlement is retried in memory for a few minutes only; if the broker stays down the message is
+// redelivered after the ack wait and decided again.
 func (s *Server) settleDirect(ctx context.Context, q queue.Queue, h *heldJob, st queue.JobState, state string, ev *queue.Event, action string) {
 	st.State = state
 	ev.JobID, ev.Caller, ev.State, ev.Attempt, ev.Server, ev.Band = st.JobID, st.Caller, state, st.Attempt, st.Server, st.Band
 	h.seq++
 	ev.Seq = h.seq
-	s.finishQueued(ctx, q, h, st, ev, action, 0)
+	set := newSettlement(h, st, ev, action, 0)
+	s.swg.Add(1)
+	go func() {
+		defer s.swg.Done()
+		defer elog.Recover("settling a queued job that never ran", "job_id", st.JobID)
+		for try := 1; ; try++ {
+			err := s.settleOnce(context.WithoutCancel(ctx), q, set, h.d)
+			if err == nil || errors.Is(err, errFencedOff) || try >= 8 {
+				s.logSettled(set, err)
+				return
+			}
+			select {
+			case <-s.settleCtx.Done():
+				return
+			case <-time.After(backoff(try)):
+			}
+		}
+	}()
 }
 
-// finishQueued is the one place a claim ends: fence check (CAS on job_state), event, then ack, requeue or dead.
-// A stale fencing token means another worker holds the job now: this result is dropped and the claim left alone.
-func (s *Server) finishQueued(ctx context.Context, q queue.Queue, h *heldJob, st queue.JobState, ev *queue.Event, action string, delay time.Duration) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
+func newSettlement(h *heldJob, st queue.JobState, ev *queue.Event, action string, delay time.Duration) *jobs.Settlement {
+	handle := h.d.Handle()
+	handle.FenceRev = h.rev
 	st.Kind, st.Message = ev.Kind, ev.Message
-	if _, err := q.CASState(ctx, st, h.rev); err != nil {
-		if errors.Is(err, queue.ErrFenced) {
-			s.log.Warn("result fenced off: another worker holds this job now", "job_id", st.JobID, "state", st.State)
-			elog.Warn("settling a queued job", err, "job_id", st.JobID, "outcome", st.State)
-			return
+	return &jobs.Settlement{Handle: handle, State: st, Event: *ev, Action: action, DelayNS: int64(delay), Since: time.Now().UTC()}
+}
+
+// errFencedOff: another worker wrote job_state after this one's claim; this outcome is dropped, the claim left alone.
+var errFencedOff = errors.New("result fenced off: another worker holds this job now")
+
+// settleActionTries bounds the last step (ack, requeue, dead). Once job_state and the event are written, a missing
+// ack is harmless: the broker redelivers after the ack wait and acceptDelivery acks the duplicate of a final job.
+const settleActionTries = 5
+
+// settleOnce moves a settlement forward as far as the broker lets it, in order: job_state at the fencing revision,
+// the event, then the broker action. It records progress in set (Wrote, Published), so each step happens once even
+// across retries and restarts. nil: done. errFencedOff: dropped for good. Anything else: try again later.
+func (s *Server) settleOnce(ctx context.Context, q queue.Queue, set *jobs.Settlement, d queue.Delivery) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	set.Tries++
+	id := set.State.JobID
+	fresh := false // job_state was written by this very try, so no earlier try can have published the event
+	if !set.Wrote {
+		_, err := q.CASState(ctx, set.State, set.Handle.FenceRev)
+		switch {
+		case err == nil:
+			set.Wrote, fresh = true, true
+		case errors.Is(err, queue.ErrFenced):
+			// Either another worker took the job, or an earlier try's write landed and only its reply was lost.
+			cur, _, rerr := q.State(ctx, id)
+			if rerr != nil {
+				return rerr
+			}
+			if cur.State != set.State.State || cur.Server != set.State.Server || cur.Attempt != set.State.Attempt {
+				return errFencedOff
+			}
+			set.Wrote = true
+		default:
+			return err
 		}
-		s.log.Error("cannot write job_state; the broker will redeliver the job after the ack wait", "job_id", st.JobID, "error", err)
-		elog.Error("settling a queued job", err, "job_id", st.JobID, "outcome", st.State)
-		return
 	}
-	if err := s.publishSync(ctx, ev); err != nil {
-		s.log.Error("cannot publish the final event", "job_id", st.JobID, "error", err)
-		elog.Error("publishing a final queue event", err, "job_id", st.JobID, "type", ev.Type)
+	if !set.Published {
+		if !fresh {
+			// The event may already be stored by an earlier try (its reply lost, or the process died before it
+			// recorded Published). EVENTS dedupes a message id for 2 minutes only, and a second "succeeded" would
+			// bill the customer twice, so look before publishing again.
+			evs, err := q.Events(ctx, set.Event.Caller, id)
+			if err != nil {
+				return err
+			}
+			for _, e := range evs {
+				if e.Seq == set.Event.Seq && e.Type == set.Event.Type {
+					set.Published = true
+				}
+			}
+		}
+		if !set.Published {
+			ev := set.Event
+			if err := s.publishSync(ctx, &ev); err != nil {
+				return err
+			}
+			set.Published = true
+		}
+	}
+	if d == nil {
+		var err error
+		if d, err = q.Resume(ctx, set.Handle); err != nil {
+			if errors.Is(err, queue.ErrNotFound) {
+				return nil // the message is gone: acked by an earlier try, or by the worker that ran it next
+			}
+			return s.actionErr(set, err)
+		}
 	}
 	var err error
 	switch {
-	case action == "ack":
-		err = h.d.Ack(ctx)
-	case action == "requeue":
-		err = h.d.Requeue(ctx, delay)
-	case strings.HasPrefix(action, "dead:"):
-		err = h.d.Dead(ctx, strings.TrimPrefix(action, "dead:"))
+	case set.Action == "ack":
+		err = d.Ack(ctx)
+	case set.Action == "requeue":
+		err = d.Requeue(ctx, time.Duration(set.DelayNS))
+	case strings.HasPrefix(set.Action, "dead:"):
+		err = d.Dead(ctx, strings.TrimPrefix(set.Action, "dead:"))
 	}
-	elog.Check("settling a queued job with the broker ("+action+")", err, "job_id", st.JobID)
-	s.log.Info("queued job settled", "job_id", st.JobID, "caller", st.Caller, "state", st.State, "attempt", st.Attempt, "action", action)
+	return s.actionErr(set, err)
 }
 
-// settleLocked is called by finishLocked when a queued job reaches a final local state. It hands the broker work
-// to a goroutine the drain waits for, so a job's claim is always settled before the process exits.
+func (s *Server) actionErr(set *jobs.Settlement, err error) error {
+	if err == nil {
+		return nil
+	}
+	set.LastErr = err.Error()
+	if set.Tries >= settleActionTries {
+		elog.Warn("settling a queued job with the broker ("+set.Action+"); job_state and the event are written, "+
+			"so the broker's redelivery will be acked as a duplicate", err, "job_id", set.State.JobID)
+		return nil
+	}
+	return err
+}
+
+func (s *Server) logSettled(set *jobs.Settlement, err error) {
+	switch {
+	case err == nil:
+		s.log.Info("queued job settled", "job_id", set.State.JobID, "caller", set.State.Caller, "state", set.State.State,
+			"attempt", set.State.Attempt, "action", set.Action, "tries", set.Tries)
+	case errors.Is(err, errFencedOff):
+		s.log.Warn("result fenced off: another worker holds this job now", "job_id", set.State.JobID, "state", set.State.State)
+		elog.Warn("settling a queued job", err, "job_id", set.State.JobID, "outcome", set.State.State)
+	default:
+		s.log.Error("could not settle a queued job; the broker will redeliver it after the ack wait", "job_id", set.State.JobID, "error", err)
+		elog.Error("settling a queued job", err, "job_id", set.State.JobID, "outcome", set.State.State, "tries", set.Tries)
+	}
+}
+
+// settleLocked is called by finishLocked when a queued job reaches a final local state. The outcome goes into the
+// job's settlement outbox in the journal first (jobs.Job.Settle), then a goroutine hands it to the broker, retrying
+// until the broker takes it. A broker that is down when a 30-minute render finishes therefore never loses the
+// result, and the redelivery that follows never runs the job a second time (handToSettlement).
 func (s *Server) settleLocked(j *jobs.Job, retryable bool) {
 	h := s.held[j.ID]
-	if h == nil || s.q == nil {
+	if h == nil {
 		return
 	}
 	delete(s.held, j.ID)
-	q := s.q
 	st := queue.JobState{JobID: j.ID, Caller: h.caller, Service: j.Type, Band: h.band, Attempt: h.attempt, Server: s.cfg.Server.Key}
 	h.seq++
 	ev := &queue.Event{JobID: j.ID, Caller: h.caller, Seq: h.seq, Attempt: h.attempt, Server: st.Server, Band: h.band,
-		Stage: string(j.ErrorStage), Kind: string(j.ErrorKind), Message: j.LastErr}
+		Stage: string(j.ErrorStage), Kind: string(j.ErrorKind), Message: j.LastErr, At: time.Now().UTC()}
 	action, delay := "ack", time.Duration(0)
 	switch j.State {
 	case jobs.Completed:
@@ -424,13 +539,106 @@ func (s *Server) settleLocked(j *jobs.Job, retryable bool) {
 	}
 	ev.State = st.State
 	j.Claim = nil
+	j.Settle = newSettlement(h, st, ev, action, delay)
 	s.save(j, true)
-	s.wg.Add(1)
+	s.settling[j.ID] = h.d
+	s.startSettlementLocked(j.ID)
+}
+
+// startSettlementLocked runs the job's outbox in a goroutine unless one is already running.
+func (s *Server) startSettlementLocked(id string) {
+	if s.settleRun[id] {
+		return
+	}
+	s.settleRun[id] = true
+	s.swg.Add(1)
 	go func() {
-		defer s.wg.Done()
-		defer elog.Recover("settling a queued job", "job_id", st.JobID)
-		s.finishQueued(context.Background(), q, h, st, ev, action, delay)
+		defer s.swg.Done()
+		defer elog.Recover("settling a queued job", "job_id", id)
+		s.runSettlement(id)
 	}()
+}
+
+// runSettlement retries the job's outbox until the broker took all of it. It stops early only at shutdown; the
+// outbox stays in the journal and the next process resumes it (resumeSettlements).
+func (s *Server) runSettlement(id string) {
+	defer func() {
+		s.mu.Lock()
+		delete(s.settleRun, id)
+		s.mu.Unlock()
+	}()
+	for try := 1; ; try++ {
+		s.mu.Lock()
+		j := s.jobs[id]
+		if j == nil || j.Settle == nil {
+			delete(s.settling, id)
+			s.mu.Unlock()
+			return
+		}
+		set := *j.Settle
+		d, q := s.settling[id], s.q
+		s.mu.Unlock()
+
+		err := errors.New("the broker is not connected yet")
+		if q != nil {
+			err = s.settleOnce(s.settleCtx, q, &set, d)
+		}
+		s.mu.Lock()
+		if j := s.jobs[id]; j != nil && j.Settle != nil {
+			if err == nil || errors.Is(err, errFencedOff) {
+				j.Settle = nil
+				delete(s.settling, id)
+			} else {
+				// Keep the handle: a redelivery may have replaced it while this try ran (handToSettlement).
+				j.Settle.Wrote, j.Settle.Published, j.Settle.Tries = set.Wrote, set.Published, set.Tries
+				j.Settle.LastErr = err.Error()
+			}
+			s.save(j, true)
+		}
+		s.mu.Unlock()
+		if err == nil || errors.Is(err, errFencedOff) {
+			s.logSettled(&set, err)
+			return
+		}
+		if try == 1 || try%20 == 0 {
+			s.log.Warn("queued job outcome not settled yet; retrying (kept in the journal)", "job_id", id, "tries", set.Tries, "error", err)
+		}
+		select {
+		case <-s.settleCtx.Done():
+			return
+		case <-time.After(backoff(try)):
+		}
+	}
+}
+
+// resumeSettlements restarts the outbox of every job a previous process finished but could not settle.
+func (s *Server) resumeSettlements() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, j := range s.jobs {
+		if j.Settle != nil {
+			s.log.Info("resuming the settlement of a job finished before the restart", "job_id", id, "state", j.Settle.State.State)
+			s.startSettlementLocked(id)
+		}
+	}
+}
+
+// handToSettlement: a job this server already finished came back (its claim lapsed while the outcome waited for
+// the broker). The new delivery is handed to the outbox, which settles it; the job never runs a second time.
+func (s *Server) handToSettlement(id string, d queue.Delivery) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j := s.jobs[id]
+	if j == nil || j.Settle == nil {
+		return false
+	}
+	j.Settle.Handle.AckSubject = d.Handle().AckSubject
+	s.settling[id] = d
+	s.save(j, true)
+	s.log.Info("redelivered job already finished here; settling it instead of running it again", "job_id", id,
+		"state", j.Settle.State.State, "delivery", d.Attempt())
+	s.startSettlementLocked(id)
+	return true
 }
 
 // publicOutputs is what a caller learns about outputs: names, sizes, hashes and where they went (no local paths).
@@ -535,6 +743,11 @@ func (s *Server) heartbeatLoop(ctx context.Context, q queue.Queue) {
 		for _, h := range s.held {
 			ds = append(ds, h.d)
 		}
+		for _, d := range s.settling {
+			if d != nil {
+				ds = append(ds, d) // keep the claim while its outcome waits for the broker
+			}
+		}
 		s.mu.Unlock()
 		for _, d := range ds {
 			if err := d.InProgress(ctx); err != nil && ctx.Err() == nil {
@@ -586,7 +799,9 @@ func (s *Server) controlLoop(ctx context.Context, q queue.Queue) {
 				if by == "" {
 					by = "caller"
 				}
-				_, _ = s.Cancel(c.JobID, by)
+				if _, err := s.Cancel(c.JobID, by); err != nil && !errors.Is(err, ErrFinal) {
+					elog.Warn("applying a cancel from job_control", err, "job_id", c.JobID)
+				}
 			}
 		}
 	}
@@ -595,35 +810,73 @@ func (s *Server) controlLoop(ctx context.Context, q queue.Queue) {
 // reclaimAtBoot settles the claims a previous process held when it stopped (the journal saved their handles).
 // A job whose runner can re-attach (runners.Reattacher: a detached task host, §9) runs again here under the same
 // claim and attempt; any other job goes straight back to the queue instead of waiting out the ack wait.
+//
+// A claim is dropped only on a definite answer from the broker. While the broker is unreachable (it may be
+// restarting with this machine after a power cut) the claims stay in s.reclaim, which keeps their task hosts out of
+// the orphan sweep, and the reclaim tries again every ReclaimRetry (D-026).
 func (s *Server) reclaimAtBoot(ctx context.Context, q queue.Queue) {
-	s.mu.Lock()
-	claims := s.reclaim
-	s.reclaim = nil
-	key := s.cfg.Server.Key
-	s.mu.Unlock()
-	for _, c := range claims {
-		d, err := q.Resume(ctx, c)
-		if err != nil {
-			s.log.Info("claim from before the restart is gone (settled or redelivered)", "job_id", c.JobID, "error", err)
-			continue
+	for ctx.Err() == nil {
+		s.mu.Lock()
+		claims := append([]queue.ClaimHandle(nil), s.reclaim...)
+		s.mu.Unlock()
+		var keep []queue.ClaimHandle
+		for _, c := range claims {
+			if err := s.reclaimOne(ctx, q, c); err != nil {
+				keep = append(keep, c)
+				s.log.Warn("cannot settle a claim from before the restart yet; will retry", "job_id", c.JobID, "error", err)
+			}
 		}
-		cur, rev, err := q.State(ctx, c.JobID)
-		if err != nil || rev != c.FenceRev || cur.Server != key {
-			s.log.Info("claim from before the restart was taken over; leaving it", "job_id", c.JobID)
-			continue
+		s.mu.Lock()
+		s.reclaim = keep
+		s.mu.Unlock()
+		if len(keep) == 0 {
+			return
 		}
-		h := &heldJob{d: d, caller: c.Caller, band: cur.Band, attempt: c.Attempt, rev: rev, seq: int64(c.Attempt)*eventSeqBase + eventSeqBase/2}
-		if s.readopt(ctx, h, c) {
-			continue
+		select {
+		case <-ctx.Done():
+		case <-time.After(ReclaimRetry):
 		}
-		st := cur
-		st.State = queue.StateQueued
-		next := time.Now().UTC()
-		ev := &queue.Event{JobID: c.JobID, Caller: c.Caller, Seq: h.seq, Type: "requeued", State: queue.StateQueued,
-			Attempt: c.Attempt, Server: key, Band: cur.Band, Kind: string(jobs.KindInfra),
-			Message: "server restarted during the job", NextAttemptAfter: &next}
-		s.finishQueuedNow(ctx, q, h, st, ev)
 	}
+}
+
+// ReclaimRetry is how often the boot reclaim retries claims the broker could not answer for.
+var ReclaimRetry = 5 * time.Second
+
+// retryLater: the broker did not answer (as opposed to answering "gone" or "taken over").
+func retryLater(err error) bool {
+	return errors.Is(err, queue.ErrUnavailable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+// reclaimOne settles one saved claim. A non-nil error means "ask again later".
+func (s *Server) reclaimOne(ctx context.Context, q queue.Queue, c queue.ClaimHandle) error {
+	key := s.cfg.Server.Key
+	d, err := q.Resume(ctx, c)
+	if err != nil {
+		if retryLater(err) {
+			return err
+		}
+		s.log.Info("claim from before the restart is gone (settled or redelivered)", "job_id", c.JobID, "error", err)
+		return nil
+	}
+	cur, rev, err := q.State(ctx, c.JobID)
+	if err != nil && retryLater(err) {
+		return err
+	}
+	if err != nil || rev != c.FenceRev || cur.Server != key {
+		s.log.Info("claim from before the restart was taken over; leaving it", "job_id", c.JobID)
+		return nil
+	}
+	h := &heldJob{d: d, caller: c.Caller, band: cur.Band, attempt: c.Attempt, rev: rev, seq: int64(c.Attempt)*eventSeqBase + eventSeqBase/2}
+	if s.readopt(ctx, h, c) {
+		return nil
+	}
+	st := cur
+	st.State = queue.StateQueued
+	next := time.Now().UTC()
+	ev := &queue.Event{JobID: c.JobID, Caller: c.Caller, Seq: h.seq, Type: "requeued", State: queue.StateQueued,
+		Attempt: c.Attempt, Server: key, Band: cur.Band, Kind: string(jobs.KindInfra),
+		Message: "server restarted during the job", NextAttemptAfter: &next}
+	return s.finishQueuedNow(ctx, q, h, st, ev)
 }
 
 // readopt runs a reclaimed job again on this machine when its runner re-attaches; false means "requeue it".
@@ -659,17 +912,19 @@ func (s *Server) readopt(ctx context.Context, h *heldJob, c queue.ClaimHandle) b
 	return true
 }
 
-func (s *Server) finishQueuedNow(ctx context.Context, q queue.Queue, h *heldJob, st queue.JobState, ev *queue.Event) {
-	// Events cannot go through publishLoop yet (it starts after reclaim); publish directly, in order.
-	pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if _, err := q.CASState(pctx, st, h.rev); err != nil {
-		s.log.Info("could not return a reclaimed job", "job_id", st.JobID, "error", err)
-		return
+// finishQueuedNow returns a reclaimed claim to the queue at once. A broker error is returned so the boot reclaim
+// asks again; a fenced write means the job is someone else's now.
+func (s *Server) finishQueuedNow(ctx context.Context, q queue.Queue, h *heldJob, st queue.JobState, ev *queue.Event) error {
+	set := newSettlement(h, st, ev, "requeue", 0)
+	err := s.settleOnce(ctx, q, set, h.d)
+	switch {
+	case err == nil:
+		s.log.Info("claim from before the restart returned to the queue", "job_id", st.JobID, "attempt", st.Attempt)
+	case errors.Is(err, errFencedOff):
+		s.log.Info("could not return a reclaimed job: another worker holds it now", "job_id", st.JobID)
+		return nil
 	}
-	elog.Check("publishing a requeued event at boot", q.Publish(pctx, ev), "job_id", st.JobID)
-	elog.Check("returning a reclaimed job to the queue", h.d.Requeue(pctx, 0), "job_id", st.JobID)
-	s.log.Info("claim from before the restart returned to the queue", "job_id", st.JobID, "attempt", st.Attempt)
+	return err
 }
 
 // maxAttempts is the envelope's max_attempts, else the service's retry.max_attempts, at least 1.
@@ -774,7 +1029,9 @@ func (s *Server) QueueCancel(ctx context.Context, id, by string) error {
 	_, mine := s.held[id]
 	s.mu.Unlock()
 	if mine {
-		_, _ = s.Cancel(id, by)
+		if _, err := s.Cancel(id, by); err != nil && !errors.Is(err, ErrFinal) {
+			return err
+		}
 	}
 	return nil
 }
@@ -801,7 +1058,10 @@ func (s *Server) Broker(ctx context.Context) BrokerView {
 	if q != nil {
 		st := q.Status(ctx)
 		v.Status = &st
-		v.Servers, _ = q.Servers(ctx)
+		var err error
+		if v.Servers, err = q.Servers(ctx); err != nil {
+			v.Error = err.Error()
+		}
 	}
 	if v.Servers == nil {
 		v.Servers = []queue.ServerRecord{}

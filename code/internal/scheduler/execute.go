@@ -124,6 +124,11 @@ func (s *Server) execute(ctx context.Context, cancel context.CancelCauseFunc, jo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j := s.jobs[job.ID]
+	if err != nil && errors.Is(context.Cause(ctx), errDetach) {
+		s.leaveLocked(j) // the controller is stopping; the task host is not (Shutdown → detachForRestart)
+		rep.Log("controller stopping: left to the task host; the next controller re-adopts the job")
+		return
+	}
 	if err == nil {
 		j.Outputs = result.Outputs
 		if result.Data != nil {

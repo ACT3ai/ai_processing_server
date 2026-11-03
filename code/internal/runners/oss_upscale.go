@@ -33,6 +33,8 @@ type upscaleParams struct {
 	Width           int     `json:"width"`
 	Height          int     `json:"height"`
 	DurationSeconds float64 `json:"duration_seconds"`
+	// SegmentSeconds: source seconds per checkpointed segment (R8); 0 = never segment; absent = the default.
+	SegmentSeconds *float64 `json:"segment_seconds"`
 
 	DurationSecondsAlt float64 `json:"durationSeconds"` // the internal web app's camelCase
 }
@@ -110,13 +112,32 @@ func (OSSUpscale) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter)
 		return nil, err
 	}
 	p.defaults()
+	accel := accelerator()
 	return runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
 		src := inputs["source_video"]
+		one := func(in, o string) detachedTask { return seedvr2Task(p, in, o, accel) }
 		if FakeModels() {
-			return fakeTask(snap, out, src, "", p.Width, p.Height)
+			one = func(in, o string) detachedTask { t, _ := fakeTask(snap, o, in, "", p.Width, p.Height); return t }
 		}
-		return seedvr2Task(p, src, out, accelerator()), nil
+		ff, fp := enginePath(env, "ffmpeg"), enginePath(env, "ffprobe")
+		steps, frames, err := segmentedSteps(ff, fp, src, out, segmentSeconds(p.SegmentSeconds), seedvr2Batch(p, accel), one)
+		if err != nil {
+			rep.Log("not segmenting this upscale (" + err.Error() + "); it runs as one step")
+		}
+		if len(steps) > 0 {
+			rep.Log(fmt.Sprintf("upscale cut into %d checkpointed segments", (len(steps)-1)/2))
+			// The join must hold every source frame: a lost segment fails validation instead of shipping short.
+			return detachedTask{Steps: steps, Output: out, ExpectFrames: frames}, nil
+		}
+		return one(src, out), nil
 	})
+}
+
+func enginePath(env Env, name string) string {
+	if e := env.Engines[name]; e != nil {
+		return e.Path
+	}
+	return ""
 }
 
 // seedvr2Task builds the inference_cli.py command (seedvr2-cli.ts seedvr2Argv).
@@ -125,17 +146,13 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 	repo := filepath.Join(home, "repo")
 	q := seedvr2Qualities[p.Quality]
 	short, long := min(p.Width, p.Height), max(p.Width, p.Height)
-	batch, swap := 21, 0
+	batch, swap := seedvr2Batch(p, accel), 0
 	if accel == "cuda" {
-		batch, swap = nvidiaBatch(q.size, short), nvidiaSwap(q.size, short)
-	}
-	if v, err := strconv.Atoi(os.Getenv("SEEDVR2_BATCH_SIZE")); err == nil && v > 0 {
-		batch = v
+		swap = nvidiaSwap(q.size, short)
 	}
 	if v, err := strconv.Atoi(os.Getenv("SEEDVR2_BLOCKS_TO_SWAP")); err == nil && v >= 0 && accel == "cuda" {
 		swap = v
 	}
-	batch = 4*max(0, (max(1, batch)-1+2)/4) + 1 // nearest 4n+1
 	argv := []string{
 		venvPython(repo), filepath.Join(repo, "inference_cli.py"), src,
 		"--output", out, "--output_format", "mp4", "--video_backend", "ffmpeg",
@@ -161,6 +178,18 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 		env = append(env, "PYTORCH_ENABLE_MPS_FALLBACK=1")
 	}
 	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out}
+}
+
+// seedvr2Batch is the --batch_size (frames per temporal batch, 4n+1) for this job on this accelerator.
+func seedvr2Batch(p upscaleParams, accel string) int {
+	batch := 21
+	if accel == "cuda" {
+		batch = nvidiaBatch(seedvr2Qualities[p.Quality].size, min(p.Width, p.Height))
+	}
+	if v, err := strconv.Atoi(os.Getenv("SEEDVR2_BATCH_SIZE")); err == nil && v > 0 {
+		batch = v
+	}
+	return 4*max(0, (max(1, batch)-1+2)/4) + 1 // nearest 4n+1
 }
 
 // The RTX 5090 profile (seed_vr2_nvidia/nvidia.ts): 7B needs BlockSwap and small batches from 1440p up.

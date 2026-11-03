@@ -89,7 +89,7 @@ Without a broker the server still runs direct mode (`POST /v1/jobs`), and `GET /
 
 `data/git_ignore/this_server.yaml` is the per-machine file. It holds:
 
-* **Identity:** the server key (`B5090`, `BPC`, `BMT`, `BMS`, …), display name, profile, site, and the hostname and
+* **Identity:** the server key (`B5090`, `BPC`, `BMS`, …), display name, profile, site, and the hostname and
   machine id it was created on.
 * **Hardware snapshot:** cores, RAM, disks, GPUs, engines. The owner can lower numbers to offer less. Detection still
   decides what exists, so the effective value is `min(detected, declared)`.
@@ -173,7 +173,7 @@ Still planned under `data/`: `models/`, `sites/sites.yaml` and `schemas/`.
 | Bryan's Mac Studio ("CLAW") | [servers/Bryan_Mac_Studio/server.yaml](servers/Bryan_Mac_Studio/server.yaml) | guessed | Always on. Shares the machine with OpenClaw agents and voice-memo transcription. |
 
 Values marked `guess` must be replaced by running hardware detection on each machine. The spec also names `BPC`
-(two-GPU PC) and `BMT` (Mac Tower), which have no `servers/` file yet. Two points still need to line up with the spec:
+(two-GPU PC), which has no `servers/` file yet. `BMT` (Mac Tower) is Bryan's dev machine, not a render server (D-024). Two points still need to line up with the spec:
 
 * **Server keys:** the `servers/` folders use names like `Bryan_5090`, while the spec uses short keys like `B5090`.
 * **The 5090's OS:** the spec assumes Windows, while `servers/Bryan_5090` guesses Linux.

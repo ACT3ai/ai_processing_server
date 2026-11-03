@@ -18,6 +18,7 @@ Needs a machine whose GPU the server detects (both services require one); skippe
 """
 
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -138,8 +139,68 @@ class G4Reboot(ModelGateCase):
         self.server.start()
         self.wait_broker(self.server, "ok", timeout=30)
         done = self.api.queue_wait(job, timeout=120)
-        self.assert_once(done, attempt=2)                    # redelivered and run again, one result
-        self.assertIn("requeued", self.types(done))
+        # D-026: the task host's pid is gone, so the boot reclaim sees it dead at once and starts the render again
+        # here under the same claim (attempt 1, no requeue), as a real reboot longer than the 30 s heartbeat
+        # staleness always did. Before, this fast simulated reboot read the fresh heartbeat as alive, waited for it
+        # to go stale, and requeued to attempt 2. Either way: one result. A host that keeps dying stops after
+        # taskhost.MaxDeaths (runners TestTaskHostThatKeepsDyingGivesUp).
+        self.assert_once(done, attempt=1)
+        self.assertNotIn("requeued", self.types(done))
+        log = self.api.log(job)
+        self.assertIn("starting it again", log if isinstance(log, str) else str(log))
+        self.assertFalse(self.render_procs(job))
+
+
+class G4RebootResumesFromCheckpoint(ModelGateCase):
+    """G4 with a checkpoint (R8): a segmented SeedVR2 upscale loses power after its first segment. When the machine
+    is back, the job resumes at the segment it was on (the finished steps are skipped) and the joined video has every
+    source frame."""
+    ACK_WAIT = "5s"
+    FAKE_SECONDS = "2"
+
+    def test_g4_segmented_upscale_resumes(self):
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            self.skipTest("ffmpeg / ffprobe not on PATH")
+        os.environ["SEEDVR2_BATCH_SIZE"] = "5"   # read by the restarted server below: 20-frame segments
+        self.addCleanup(os.environ.pop, "SEEDVR2_BATCH_SIZE", None)
+        src = self.server.tmp / "source.mp4"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=6",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
+        # The server started before SEEDVR2_BATCH_SIZE was set: restart it so the plan is 3 segments of 20 frames.
+        self.server.stop()
+        self.server.start()
+        self.wait_broker(self.server, "ok", timeout=30)
+        job = self.api.queue_submit("act3.upscale_open_source", {
+            "model": "seedvr2-standard", "width": 128, "height": 128, "durationSeconds": 6, "segment_seconds": 2},
+            inputs=[{"name": "source_video", "path": str(src)}], max_attempts=2)["job_id"]
+        marker = self.server.state_dir / "runs" / job / "checkpoint" / "1.done"   # step 2 = the first segment's upscale
+        deadline = time.time() + 60
+        while not marker.exists():
+            self.assertLess(time.time(), deadline, "the first segment never finished")
+            time.sleep(0.05)
+        # The power goes: every process on the machine dies at the same moment.
+        self.server.kill()
+        for pid in self.render_procs(job):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+        self.broker.stop()
+        time.sleep(1)
+        self.assertFalse(self.render_procs(job), "a render outlived the power cut")
+        self.broker.start()
+        self.server.start()
+        self.wait_broker(self.server, "ok", timeout=30)
+        done = self.api.queue_wait(job, timeout=120)
+        self.assert_once(done)
+        log = self.api.log(job)
+        self.assertIn("resuming at step", log if isinstance(log, str) else str(log))
+        out = self.server.tmp / "upscaled.mp4"
+        out.write_bytes(self.api.output(job, "video")[0])
+        frames = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries",
+                                 "stream=nb_read_frames", "-of", "csv=p=0", str(out)],
+                                capture_output=True, text=True).stdout.strip()
+        self.assertEqual(frames, "60", "the resumed, joined upscale lost or doubled frames")
         self.assertFalse(self.render_procs(job))
 
 

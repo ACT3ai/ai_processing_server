@@ -40,7 +40,8 @@ func (s *Server) stateLocked() (string, string) {
 	case s.paused:
 		return StatePaused, "paused"
 	case s.diskLowLocked():
-		return StateDegraded, fmt.Sprintf("disk free %.1f GB is under limits.disk_min_free_gb %.1f", s.opt.Monitor.Load().DiskFreeGB, s.cfg.Limits.DiskMinFreeGB)
+		_, why := s.diskReasonLocked()
+		return StateDegraded, why
 	case s.active >= s.cfg.Limits.MaxParallelJobs:
 		return StateBusy, "all slots busy"
 	}

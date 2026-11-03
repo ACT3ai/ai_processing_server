@@ -11,9 +11,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
 	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
@@ -22,6 +24,7 @@ import (
 // The test binary doubles as the task host (HostCommand points at it with APS_RUNNERS_TASKHOST=1).
 func TestMain(m *testing.M) {
 	if os.Getenv("APS_RUNNERS_TASKHOST") == "1" {
+		taskhost.HeartbeatEvery, taskhost.CancelPoll = 200*time.Millisecond, 100*time.Millisecond
 		os.Exit(taskhost.Main(os.Args[1:]))
 	}
 	os.Exit(m.Run())
@@ -235,5 +238,181 @@ func TestUpscaleChecks(t *testing.T) {
 		if err := (OSSUpscale{}).Check(context.Background(), bad, env); err == nil {
 			t.Errorf("accepted %s", bad.Payload.Params)
 		}
+	}
+}
+
+func TestPlanSegments(t *testing.T) {
+	for _, c := range []struct {
+		frames, seg, batch int
+		want               [][2]int
+	}{
+		{100, 80, 1, [][2]int{{0, 100}}},                   // under 1.5 segments: one piece
+		{60, 20, 5, [][2]int{{0, 20}, {20, 40}, {40, 60}}}, // whole batches
+		{65, 20, 5, [][2]int{{0, 20}, {20, 40}, {40, 65}}}, // a 5-frame tail joins the last segment
+		{70, 18, 5, [][2]int{{0, 20}, {20, 40}, {40, 60}, {60, 70}}},
+	} {
+		if got := planSegments(c.frames, c.seg, c.batch); !slices.Equal(flat(got), flat(c.want)) {
+			t.Errorf("planSegments(%d, %d, %d) = %v, want %v", c.frames, c.seg, c.batch, got, c.want)
+		}
+	}
+}
+
+func flat(r [][2]int) []int {
+	var out []int
+	for _, x := range r {
+		out = append(out, x[0], x[1])
+	}
+	return out
+}
+
+// G4 with a checkpoint (R8): a segmented upscale loses its task host to a power cut after the first segment; the
+// next Run resumes at the second segment on the same snapshot, and the joined result has every source frame.
+func TestSegmentedUpscaleResumesAfterAPowerCut(t *testing.T) {
+	ff, err1 := exec.LookPath("ffmpeg")
+	fp, err2 := exec.LookPath("ffprobe")
+	if err1 != nil || err2 != nil {
+		t.Skip("ffmpeg / ffprobe not on PATH")
+	}
+	env, job := setupFake(t)
+	t.Setenv("APS_FAKE_SECONDS", "1")
+	t.Setenv("SEEDVR2_BATCH_SIZE", "5")
+	oldStale := taskhost.StaleAfter
+	taskhost.StaleAfter = 2 * time.Second
+	t.Cleanup(func() { taskhost.StaleAfter = oldStale })
+	src := filepath.Join(t.TempDir(), "src.mp4")
+	if out, err := exec.Command(ff, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=6",
+		"-c:v", "libx264", "-pix_fmt", "yuv420p", src).CombinedOutput(); err != nil {
+		t.Fatalf("make source: %v %s", err, out)
+	}
+	env.Engines = map[string]*hardware.Engine{"ffmpeg": {Path: ff}, "ffprobe": {Path: fp}}
+	env.Inputs = map[string]string{"source_video": src}
+	job.Type = "act3.upscale_open_source"
+	job.Payload.Params, _ = json.Marshal(map[string]any{"width": 128, "height": 128, "segment_seconds": 2})
+
+	// First controller: it stops as soon as the first segment is upscaled (step 2 of 7 checkpointed).
+	dir := runDirFor(env, job.ID)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	go func() {
+		for i := 0; i < 600; i++ {
+			if _, err := os.Stat(filepath.Join(dir, taskhost.CheckpointDir, "1.done")); err == nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		cancel(errors.New("server shutting down"))
+	}()
+	if _, err := (OSSUpscale{}).Run(ctx, job, env, &recRep{}); err == nil {
+		t.Fatal("the first run should have stopped with the controller")
+	}
+	if done, total := taskhost.Checkpoints(dir); done < 2 || total != 7 {
+		t.Fatalf("checkpoints at the power cut: %d of %d", done, total)
+	}
+	// The power goes: the task host and its render die.
+	b, err := os.ReadFile(filepath.Join(dir, taskhost.HeartbeatFile))
+	var hb taskhost.Heartbeat
+	if err != nil || json.Unmarshal(b, &hb) != nil || hb.PID == 0 {
+		t.Fatalf("heartbeat: %s %v", b, err)
+	}
+	syscall.Kill(-hb.PID, syscall.SIGKILL)
+	exec.Command("pkill", "-9", "-f", dir).Run() // the fake render's python, in its own process group
+	for i := 0; taskhost.Alive(dir) != taskhost.Dead; i++ {
+		if i > 200 {
+			t.Fatalf("the killed task host never read as dead: %s", taskhost.Alive(dir))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	done, _ := taskhost.Checkpoints(dir)
+
+	// The machine is back: the next controller resumes from the checkpoint instead of starting over.
+	rep := &recRep{}
+	res, err := (OSSUpscale{}).Run(context.Background(), job, env, rep)
+	if err != nil {
+		t.Fatal(err, rep.logs)
+	}
+	logs := strings.Join(rep.logs, "\n")
+	if !strings.Contains(logs, "resuming at step") {
+		t.Fatalf("did not resume from the checkpoint (%d steps done): %s", done, logs)
+	}
+	vf, err := probeFrames(fp, res.Outputs[0].Path)
+	if err != nil || vf.Frames != 60 {
+		t.Fatalf("joined result has %d frames (want all 60): %v", vf.Frames, err)
+	}
+}
+
+// A task host that dies again and again (each time taking the machine down, so the job is re-adopted at boot under
+// the same attempt) is not started forever: after MaxDeaths it fails as infra and the queue's retry policy decides.
+func TestTaskHostThatKeepsDyingGivesUp(t *testing.T) {
+	env, job := setupFake(t)
+	dir := runDirFor(env, job.ID)
+	os.MkdirAll(dir, 0o700)
+	dead := exec.Command("true")
+	dead.Run()
+	b, _ := json.Marshal(taskhost.Task{RunVersion: 1, JobID: job.ID, Snapshot: "s", Argv: []string{"true"}, Output: filepath.Join(dir, "out", "output.mp4")})
+	os.WriteFile(filepath.Join(dir, taskhost.TaskFile), b, 0o600)
+	b, _ = json.Marshal(taskhost.Heartbeat{PID: dead.Process.Pid, StartedAt: time.Now().Add(-time.Hour), At: time.Now().Add(-time.Hour)})
+	os.WriteFile(filepath.Join(dir, taskhost.HeartbeatFile), b, 0o600)
+	if err := taskhost.CarryDeaths(dir, []string{"earlier-1", "earlier-2"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := OSSVideo{}.Run(context.Background(), job, env, &recRep{})
+	var je *jobs.Error
+	if !errors.As(err, &je) || je.Kind != jobs.KindInfra || !strings.Contains(je.Message, "died 3 times") {
+		t.Fatalf("third death: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("the run directory of a task host that keeps dying was kept")
+	}
+	// One death only: it starts again, and the count goes with the new run directory.
+	os.MkdirAll(dir, 0o700)
+	os.WriteFile(filepath.Join(dir, taskhost.TaskFile), []byte(`{"run_version":1,"job_id":"job-1","argv":["true"],"output":"x"}`), 0o600)
+	b, _ = json.Marshal(taskhost.Heartbeat{PID: dead.Process.Pid, StartedAt: time.Now().Add(-time.Hour), At: time.Now().Add(-time.Hour)})
+	os.WriteFile(filepath.Join(dir, taskhost.HeartbeatFile), b, 0o600)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	go func() { time.Sleep(300 * time.Millisecond); cancel(errors.New("server shutting down")) }()
+	OSSVideo{}.Run(ctx, job, env, &recRep{})
+	if n := len(taskhost.Deaths(dir)); n != 1 {
+		t.Fatalf("death count in the new run directory: %d, want 1", n)
+	}
+	taskhost.Cancel(dir)
+}
+
+// A render that exits 0 is only done when its output is a real video, with every frame when the count is known.
+func TestValidateVideo(t *testing.T) {
+	ff, err1 := exec.LookPath("ffmpeg")
+	fp, err2 := exec.LookPath("ffprobe")
+	if err1 != nil || err2 != nil {
+		t.Skip("ffmpeg / ffprobe not on PATH")
+	}
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.mp4")
+	if out, err := exec.Command(ff, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=3",
+		"-c:v", "libx264", "-pix_fmt", "yuv420p", good).CombinedOutput(); err != nil {
+		t.Fatalf("make video: %v %s", err, out)
+	}
+	bad := filepath.Join(dir, "bad.mp4")
+	os.WriteFile(bad, []byte("not a video at all"), 0o600)
+	if err := validateVideo(fp, good, 30); err != nil {
+		t.Fatalf("a good 30-frame video failed: %v", err)
+	}
+	if err := validateVideo(fp, good, 60); err == nil {
+		t.Fatal("a video missing half its frames passed")
+	}
+	if err := validateVideo(fp, bad, 0); err == nil {
+		t.Fatal("a file that is not a video passed")
+	}
+	if err := validateVideo("", bad, 0); err != nil {
+		t.Fatal("no ffprobe must mean not checked")
+	}
+}
+
+// Running out of disk mid-render is the machine's fault (infra, retried), not the job's.
+func TestDiskFullIsInfra(t *testing.T) {
+	for _, tail := range []string{"OSError: [Errno 28] No space left on device", "av_interleaved_write_frame(): No space left on device"} {
+		if k := failureKind(tail); k != jobs.KindInfra {
+			t.Errorf("%q: %s, want infra", tail, k)
+		}
+	}
+	if k := failureKind("ValueError: bad prompt"); k != jobs.KindInternal {
+		t.Errorf("plain failure: %s", k)
 	}
 }

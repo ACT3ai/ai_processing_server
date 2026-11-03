@@ -8,10 +8,13 @@ created_by: "{{.CreatedBy}}"
 server:
   key: {{.ID.Key}}                    # upper case, A-Z 0-9, at most 12 characters, unique across the fleet
   display_name: "{{.ID.DisplayName}}"
-  profile: {{.ID.Profile}}            # generic | b5090 | bpc | bmt | bms | cloud
+  profile: {{.ID.Profile}}            # generic | b5090 | bpc | bms | cloud
   family: {{.ID.Family}}              # bryan | office | cloud | runpod
   site: {{.ID.Site}}
   servers_dir: "{{.ID.ServersDir}}"    # its directory under servers/ (public key published there); "" = not checked in
+{{- if .ID.Dev}}
+  dev: true                           # development machine, NOT a render server: runs only its owner's local jobs
+{{- end}}
   bound_to:                           # a mismatch at boot means this file was copied from another machine
     hostname: "{{.ID.BoundTo.Hostname}}"
     machine_id: "{{.MachineID}}"
@@ -79,9 +82,9 @@ continuity:                           # pm/task_queue.mdx §9
 
 callers:                              # whose queued jobs this machine pulls (shares and accept/deny: phase Q2)
   act3:
-    enabled: true
+    enabled: {{not .ID.Dev}}
   wtc:
-    enabled: true
+    enabled: {{not .ID.Dev}}
   local:
     enabled: true
     mode: {{.LocalMode}}                 # first | share | idle_only: how this machine ranks its owner's jobs (task_queue.mdx §14.5)

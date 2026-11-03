@@ -20,6 +20,9 @@ func InstallProblems() map[string]string {
 	if p := seedvr2InstallProblem(seedvr2Qualities["standard"].dit); p != "" {
 		m[OSSUpscale{}.Name()] = p
 	}
+	if p := regenInstallProblem(Env{}); p != "" {
+		m[OSSRegenerate{}.Name()] = p
+	}
 	return m
 }
 

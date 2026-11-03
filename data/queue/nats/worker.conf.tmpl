@@ -12,6 +12,9 @@ jetstream {
   max_file_store: {{.MaxFileStore}}
   max_memory_store: 268435456
   domain: "{{.Domain}}"
+  # fsync every write (D-026). The default (every 2 minutes) can lose acknowledged submissions, events and job_state
+  # writes on a power cut; our volume is a few writes a second, so the cost is nothing.
+  sync_interval: always
 }
 
 leafnodes {
