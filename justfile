@@ -8,6 +8,8 @@ bin := if os_family() == "windows" { "ai_processing_server.exe" } else { "ai_pro
 git_sha := if os_family() == "windows" { `$s = git rev-parse --short HEAD 2>$null; if ($s) { $s } else { 'unknown' }` } else { `git rev-parse --short HEAD 2>/dev/null || echo unknown` }
 ldflags := "-s -w -X main.version=" + version + " -X main.gitSHA=" + git_sha + " -X main.buildTime=" + datetime_utc("%Y-%m-%dT%H:%M:%SZ")
 
+nats_image := "nats:2.15-alpine"
+
 export GOWORK := "off"        # a parent go.work (e.g. ~/BGit/act3/go.work) must not capture this module
 export CGO_ENABLED := "0"     # pure Go: no C toolchain needed (spec §3.1, D-005)
 
@@ -19,6 +21,7 @@ default:
 # Compile, install nats-server if missing, create this_server.yaml if missing, write the broker config
 [unix]
 build:
+    @just _warn-tools
     @echo "building {{bin}} {{version}} (git {{git_sha}}) with `go version | cut -d' ' -f3`"
     @cd code && go build -trimpath -ldflags "{{ldflags}}" -o ../{{bin}} ./cmd/ai_processing_server
     @echo "built ./{{bin}}"
@@ -31,6 +34,7 @@ build:
 # Compile, install nats-server if missing, create this_server.yaml if missing, write the broker config
 [windows]
 build:
+    @just _warn-tools
     @Write-Output "building {{bin}} {{version}} (git {{git_sha}}) with $((go version).Split(' ')[2])"
     @go build -C code -trimpath -ldflags "{{ldflags}}" -o ../{{bin}} ./cmd/ai_processing_server
     @Write-Output "built ./{{bin}}"
@@ -46,9 +50,10 @@ run: _binary
     #!/usr/bin/env bash
     set -euo pipefail
     if ./{{bin}} status >/dev/null 2>&1; then echo "already running:"; ./{{bin}} status; exit 0; fi
-    # The queue needs this machine's nats-server: start it first when it is not answering (problems 2026_oct_27 #1).
-    if command -v nats-server >/dev/null && ! ./{{bin}} broker status >/dev/null 2>&1; then
-      just broker-run || echo "warning: the broker did not start; the server runs direct mode only (just broker-status)"
+    # The queue needs this machine's broker: start it first when it is not answering (problems 2026_oct_27 #1).
+    if ! ./{{bin}} broker status >/dev/null 2>&1; then
+      if docker inspect act3-nats >/dev/null 2>&1; then just broker-docker || echo "warning: the broker did not start; the server runs direct mode only (just broker-status)"
+      elif command -v nats-server >/dev/null; then just broker-run || echo "warning: the broker did not start; the server runs direct mode only (just broker-status)"; fi
     fi
     mkdir -p data/git_ignore/logs
     # Installed as a LaunchAgent (just install-service): launchd starts it, so it is the only copy and restarts on a crash.
@@ -78,7 +83,7 @@ run: _binary
 [windows]
 run: _binary
     if (./{{bin}} status 2>$null) { ./{{bin}} status; exit 0 }
-    if (Get-Command nats-server -ErrorAction SilentlyContinue) { ./{{bin}} broker status *> $null; if ($LASTEXITCODE -ne 0) { just broker-run; if ($LASTEXITCODE -ne 0) { Write-Output "warning: the broker did not start; the server runs direct mode only (just broker-status)" } } }
+    ./{{bin}} broker status *> $null; if ($LASTEXITCODE -ne 0) { docker inspect act3-nats *> $null; if ($LASTEXITCODE -eq 0) { just broker-docker } elseif (Get-Command nats-server -ErrorAction SilentlyContinue) { just broker-run }; if ($LASTEXITCODE -ne 0) { Write-Output "warning: the broker did not start; the server runs direct mode only (just broker-status)" } }
     New-Item -ItemType Directory -Force data/git_ignore/logs | Out-Null
     Start-Process -FilePath ./{{bin}} -ArgumentList run -WindowStyle Hidden -RedirectStandardOutput data/git_ignore/logs/server.stdout.log -RedirectStandardError data/git_ignore/logs/server.stderr.log
     Start-Sleep -Seconds 3
@@ -141,6 +146,33 @@ validate: _binary
 
 # ---- task queue broker: NATS JetStream in its own nats-server process (pm/task_queue.mdx §8.2, §18, D-014) ----
 
+# Warn for each tool the build or the model runners need that is missing (never stops the build)
+[unix]
+_warn-tools:
+    @for t in go git ffmpeg ffprobe; do command -v "$t" >/dev/null || echo "WARNING: $t is not installed"; done
+
+[windows]
+_warn-tools:
+    @foreach ($t in 'go', 'git', 'ffmpeg', 'ffprobe') { if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { Write-Output "WARNING: $t is not installed" } }
+
+# Run the broker as the act3-nats Docker container (NATS 2.15, data/queue/nats/docker.conf), restarting with Docker
+[unix]
+broker-docker:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then echo "nats: Docker is not installed or not running"; exit 1; fi
+    if docker inspect act3-nats >/dev/null 2>&1; then docker start act3-nats >/dev/null && echo "nats: act3-nats is running"; exit; fi
+    if (exec 3<>/dev/tcp/127.0.0.1/4222) 2>/dev/null; then echo "nats: port 4222 already answers (another nats-server, native or in a container): keeping it"; exit 0; fi
+    docker create --name act3-nats --restart unless-stopped -p 127.0.0.1:4222:4222 -p 127.0.0.1:8222:8222 \
+      -v act3-nats-data:/data {{nats_image}} -c /etc/nats/act3.conf >/dev/null || exit 1
+    docker cp data/queue/nats/docker.conf act3-nats:/etc/nats/act3.conf && docker start act3-nats >/dev/null || exit 1
+    echo "nats: started act3-nats ({{nats_image}}, 127.0.0.1:4222; JetStream data in the act3-nats-data volume)"
+
+[windows]
+broker-docker:
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Write-Output "nats: Docker is not installed"; exit 1 }; docker info *> $null; if ($LASTEXITCODE -ne 0) { Write-Output "nats: Docker is not running"; exit 1 }
+    docker inspect act3-nats *> $null; if ($LASTEXITCODE -eq 0) { docker start act3-nats > $null; if ($LASTEXITCODE -ne 0) { exit 1 }; Write-Output "nats: act3-nats is running" } elseif ($(try { $c = New-Object Net.Sockets.TcpClient; $c.Connect('127.0.0.1', 4222); $c.Close(); $true } catch { $false })) { Write-Output "nats: port 4222 already answers (another nats-server, native or in a container): keeping it" } else { docker create --name act3-nats --restart unless-stopped -p 127.0.0.1:4222:4222 -p 127.0.0.1:8222:8222 -v act3-nats-data:/data {{nats_image}} -c /etc/nats/act3.conf > $null; if ($LASTEXITCODE -ne 0) { exit 1 }; docker cp data/queue/nats/docker.conf act3-nats:/etc/nats/act3.conf; if ($LASTEXITCODE -ne 0) { exit 1 }; docker start act3-nats > $null; if ($LASTEXITCODE -ne 0) { exit 1 }; Write-Output "nats: started act3-nats ({{nats_image}}, 127.0.0.1:4222; JetStream data in the act3-nats-data volume)" }
+
 # Once per machine: install nats-server (data/queue/broker.yaml lists the command per OS), then check its version
 [unix]
 broker-install:
@@ -155,17 +187,22 @@ broker-install:
 broker-install:
     if (Get-Command nats-server -ErrorAction SilentlyContinue) { nats-server --version } else { winget install NATS.Server }
 
-# `just build` calls this: install nats-server when missing; never fails the build (without a broker the server
-# still runs direct mode and GET /v1/health says broker_missing with the fix)
+# `just build` calls this: a broker for the queue, never failing the build (without one the server still runs direct
+# mode and GET /v1/health says broker_missing with the fix). The act3-nats container, else a native nats-server or any
+# broker already on 4222, else a new act3-nats container when Docker runs, else the native install
 [unix]
 _broker-ensure:
     #!/usr/bin/env bash
+    if docker inspect act3-nats >/dev/null 2>&1; then just broker-docker; exit 0; fi
+    if command -v nats-server >/dev/null; then echo "nats-server present: $(nats-server --version)"; exit 0; fi
+    if (exec 3<>/dev/tcp/127.0.0.1/4222) 2>/dev/null; then echo "nats: port 4222 already answers: keeping it"; exit 0; fi
+    if command -v docker >/dev/null && docker info >/dev/null 2>&1 && just broker-docker; then exit 0; fi
     if just broker-install; then exit 0; fi
-    echo "WARNING: nats-server is not installed, so the task queue cannot start on this machine (see above)."
+    echo "WARNING: no broker: nats-server is not installed and Docker is not running, so the task queue cannot start (see above)."
 
 [windows]
 _broker-ensure:
-    just broker-install; if ($LASTEXITCODE -ne 0) { Write-Output "WARNING: nats-server is not installed; the task queue cannot start on this machine." }
+    docker inspect act3-nats *> $null; if ($LASTEXITCODE -eq 0) { just broker-docker; exit 0 }; if (Get-Command nats-server -ErrorAction SilentlyContinue) { nats-server --version; exit 0 }; if ($(try { $c = New-Object Net.Sockets.TcpClient; $c.Connect('127.0.0.1', 4222); $c.Close(); $true } catch { $false })) { Write-Output "nats: port 4222 already answers: keeping it"; exit 0 }; if (Get-Command docker -ErrorAction SilentlyContinue) { docker info *> $null; if ($LASTEXITCODE -eq 0) { just broker-docker; if ($LASTEXITCODE -eq 0) { exit 0 } } }; just broker-install; if ($LASTEXITCODE -ne 0) { Write-Output "WARNING: no broker: nats-server is not installed and Docker is not running, so the task queue cannot start." }
 
 # Write this machine's nats-server config from this_server.yaml (to ~/.act3_processing/nats/, never hand edited)
 broker-config: _binary

@@ -185,6 +185,7 @@ turns services off, with reasons. It never breaks the build.
 
 | Command | Does |
 | --- | --- |
+| `just broker-docker` | run the broker as the `act3-nats` Docker container (NATS 2.15); `just build` does it by itself when Docker runs and no native nats-server or other broker is there |
 | `just build` | compile `code/` into `./ai_processing_server` (git-ignored), then `init` |
 | `just run` / `just run-fg` | start in the background / foreground; prints `Local API: http://127.0.0.1:9440/` |
 | `just stop` | drain (wait up to 10 min for running jobs), then stop |
