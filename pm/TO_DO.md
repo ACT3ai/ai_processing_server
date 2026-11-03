@@ -90,4 +90,6 @@
 * [ ] `data/sites/sites.yaml` and the customer-data rule (§16.3).
 * [ ] GPU telemetry (nvidia-smi load, temperature) and the DEGRADED thermal guard (§12.4).
 * [x] `just install-service` (launchd agents, systemd user units, Task Scheduler); refused on a dev machine (2026-10-28).
+* [x] macOS LaunchAgents are `ai.act3.processing_server` + `ai.act3.nats-server` (AbandonProcessGroup on the server); every `just build` installs them (`_service-ensure`, skipped with APS_NO_SERVICE=1 and refused on a dev machine); `just run` / `just stop` / `just broker-run` / `just broker-stop` load and unload them (2026-11-02 merge: one Go implementation, origin's labels).
 * [ ] Run `just install-service` on BMS, B5090, BPC and NPL1–3, and turn on automatic login (macOS) or `loginctl enable-linger` (Linux), then do one real power cycle (G4 by hand).
+* [ ] Systemd user unit and Windows Task Scheduler paths are written but not yet tried on a real Linux / Windows render box; `just build` only auto-installs on macOS.

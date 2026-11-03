@@ -25,6 +25,7 @@ build:
     @just _broker-ensure
     @./{{bin}} init
     @./{{bin}} broker config >/dev/null 2>&1 && echo "broker config: `./{{bin}} broker config`" || echo "broker config: skipped until this_server.yaml loads"
+    @just _service-ensure
 
 # Start the server in the background and print where its API and logs are
 [unix]
@@ -37,17 +38,24 @@ run: _binary
       just broker-run || echo "warning: the broker did not start; the server runs direct mode only (just broker-status)"
     fi
     mkdir -p data/git_ignore/logs
-    nohup ./{{bin}} run > data/git_ignore/logs/server.stdout.log 2>&1 &
-    pid=$!
+    # Installed as a LaunchAgent (just install-service): launchd starts it, so it is the only copy and restarts on a crash.
+    plist="$HOME/Library/LaunchAgents/ai.act3.processing_server.plist"
+    if [ "$(uname)" = "Darwin" ] && [ -f "$plist" ]; then
+      launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl kickstart "gui/$(id -u)/ai.act3.processing_server"
+      pid=launchd
+    else
+      nohup ./{{bin}} run > data/git_ignore/logs/server.stdout.log 2>&1 &
+      pid=$!
+    fi
     for _ in $(seq 1 80); do
       if ./{{bin}} status >/dev/null 2>&1; then
         ./{{bin}} status
         echo
-        echo "started pid $pid · stop: just stop · status: just status"
+        echo "started ($pid) · stop: just stop · status: just status"
         echo "logs: just logs (~/_act3_logs/processing_server.info, .err) · stdout: data/git_ignore/logs/server.stdout.log"
         exit 0
       fi
-      if ! kill -0 "$pid" 2>/dev/null; then
+      if [ "$pid" != launchd ] && ! kill -0 "$pid" 2>/dev/null; then
         echo "server exited during start:"; tail -n 30 data/git_ignore/logs/server.stdout.log; exit 1
       fi
       sleep 0.25
@@ -67,6 +75,13 @@ run-fg: _binary
     ./{{bin}} run
 
 # Drain running jobs, then stop. `just stop force` kills now.
+[unix]
+stop mode="": _binary
+    @./{{bin}} stop {{ if mode == "force" { "--force" } else { "" } }}
+    @# unload the LaunchAgent so launchd does not restart it (a killed server is not a clean exit); `just run` reloads it
+    -@[ "`uname`" = Darwin ] && launchctl bootout "gui/`id -u`/ai.act3.processing_server" 2>/dev/null || true
+
+[windows]
 stop mode="": _binary
     @./{{bin}} stop {{ if mode == "force" { "--force" } else { "" } }}
 
@@ -75,6 +90,14 @@ status: _binary
     @./{{bin}} status
     @echo
     @./{{bin}} jobs
+
+# The task queue: `just queue` lists what waits or runs; `just queue show <id>` is one job's states, events and log
+queue *args: _binary
+    @./{{bin}} queue {{args}}
+
+# Cancel jobs on whichever route holds them and wait until they stop: `just cancel <id>...`, `just cancel --prefix act3_<hex>_`
+cancel *args: _binary
+    @./{{bin}} cancel {{args}}
 
 # Tail the server logs in ~/_act3_logs
 [unix]
@@ -142,20 +165,43 @@ broker-run: _binary
     if ./{{bin}} broker status >/dev/null 2>&1; then ./{{bin}} broker status; exit 0; fi
     conf=$(./{{bin}} broker config)
     dir=$(dirname "$conf")
-    nohup nats-server -c "$conf" > "$dir/nats-server.log" 2>&1 &
-    echo $! > "$dir/nats-server.pid"
+    plist="$HOME/Library/LaunchAgents/ai.act3.nats-server.plist"
+    if [ "$(uname)" = "Darwin" ] && [ -f "$plist" ]; then
+      launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl kickstart "gui/$(id -u)/ai.act3.nats-server"
+      started="launchd ai.act3.nats-server"
+    else
+      nohup nats-server -c "$conf" > "$dir/nats-server.log" 2>&1 &
+      echo $! > "$dir/nats-server.pid"
+      started="pid $!"
+    fi
     for _ in $(seq 1 40); do
-      if ./{{bin}} broker status >/dev/null 2>&1; then ./{{bin}} broker status; echo "pid $(cat "$dir/nats-server.pid") · log $dir/nats-server.log · stop: just broker-stop"; exit 0; fi
+      if ./{{bin}} broker status >/dev/null 2>&1; then ./{{bin}} broker status; echo "$started · log $dir/nats-server.log · stop: just broker-stop"; exit 0; fi
       sleep 0.25
     done
     echo "nats-server did not answer; see $dir/nats-server.log"; tail -n 20 "$dir/nats-server.log"; exit 1
 
-# Stop the nats-server started by broker-run (queued jobs and claims stay in its store)
+# Stop the nats-server (LaunchAgent or broker-run's); queued jobs and claims stay in its store
 [unix]
 broker-stop:
     #!/usr/bin/env bash
+    if [ "$(uname)" = "Darwin" ] && launchctl bootout "gui/$(id -u)/ai.act3.nats-server" 2>/dev/null; then echo "stopped (LaunchAgent unloaded; just broker-run reloads it)"; exit 0; fi
     f="${APS_BROKER_DIR:-$HOME/.act3_processing/nats}/nats-server.pid"
     if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then kill "$(cat "$f")" && rm -f "$f" && echo stopped; else echo "no broker started by broker-run"; fi
+
+# ---- start at login/boot (pm/ai_processing_server.mdx §19.2). install-service / uninstall-service / service-status
+# are below, next to render-setup: one Go implementation (code/internal/service), LaunchAgents ai.act3.* on macOS ----
+
+# `just build` calls this so a machine never misses it. APS_NO_SERVICE=1 skips it (dev laptops, CI).
+[unix]
+_service-ensure:
+    #!/usr/bin/env bash
+    if [ -n "${APS_NO_SERVICE:-}" ]; then echo "service: skipped (APS_NO_SERVICE set)"; exit 0; fi
+    if [ "$(uname)" != "Darwin" ]; then echo "service: not automated on $(uname) yet (systemd unit: pm/TO_DO.md)"; exit 0; fi
+    ./{{bin}} service install || echo "service: not installed (see above; a dev machine refuses by design, D-024); the server still runs with just run"
+
+[windows]
+_service-ensure:
+    Write-Output "service: not automated on Windows yet (pm/TO_DO.md)"
 
 # Is this machine's broker up, which version, how many jobs are stored
 broker-status: _binary

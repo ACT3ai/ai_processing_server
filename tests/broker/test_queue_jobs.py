@@ -70,9 +70,11 @@ class QueueJobs(BrokerTestCase):
             high = self.api.queue_submit("sys.compute", {"op": "sleep", "ms": 50}, priority=200)
             self.assertEqual((low["band"], high["band"]), ("p4", "p0"))
             time.sleep(1.0)
-            with self.assertRaises(APIError) as e:  # nothing is pulled (no job_state yet) while draining
-                self.api.queue_job(low["job_id"])
-            self.assertEqual(e.exception.status, 404)
+            # Nothing is pulled while draining, but admission already wrote job_state (§16.4): QUEUED, not 404.
+            waiting = self.api.queue_job(low["job_id"])
+            self.assertEqual(waiting["job_state"]["state"], "QUEUED")
+            self.assertEqual(waiting["job_state"]["band"], "p4")
+            self.assertNotIn("claimed", self.types(waiting))
         finally:
             self.api.post("/v1/resume")
         lo, hi = self.api.queue_wait(low["job_id"]), self.api.queue_wait(high["job_id"])

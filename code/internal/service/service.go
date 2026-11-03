@@ -27,8 +27,11 @@ import (
 const (
 	BrokerName = "act3-processing-broker"
 	ServerName = "act3-processing-server"
-	label      = "com.act3ai.processing."
 )
+
+// launchd labels. They match the justfile (run, stop, broker-run, broker-stop load and unload them by label) and
+// pm/ai_processing_server.mdx §19.2.
+var darwinLabel = map[string]string{BrokerName: "ai.act3.nats-server", ServerName: "ai.act3.processing_server"}
 
 // Spec is what to run.
 type Spec struct {
@@ -41,8 +44,9 @@ type Spec struct {
 
 // Unit is one file to write (or, on Windows, one task to register).
 type Unit struct {
-	Name string
-	Path string // where it goes; "" on Windows
+	Name  string
+	Label string // launchd label (macOS only)
+	Path  string // where it goes; "" on Windows
 	Body string
 	Argv []string // the command it runs
 }
@@ -70,8 +74,9 @@ func Units(goos string, s Spec) ([]Unit, error) {
 		u := Unit{Name: v.name, Argv: v.argv}
 		switch goos {
 		case "darwin":
-			u.Path = filepath.Join(home, "Library", "LaunchAgents", label+short(v.name)+".plist")
-			u.Body = plist(label+short(v.name), v.argv, s.Root, filepath.Join(s.LogDir, v.name+".log"))
+			u.Label = darwinLabel[v.name]
+			u.Path = filepath.Join(home, "Library", "LaunchAgents", u.Label+".plist")
+			u.Body = plist(u.Label, v.argv, s.Root, filepath.Join(s.LogDir, v.name+".log"))
 		case "linux":
 			u.Path = filepath.Join(home, ".config", "systemd", "user", v.name+".service")
 			u.Body = systemdUnit(v.name, v.argv, s.Root)
@@ -84,8 +89,6 @@ func Units(goos string, s Spec) ([]Unit, error) {
 	}
 	return out, nil
 }
-
-func short(name string) string { return strings.TrimPrefix(name, "act3-processing-") }
 
 func plist(lbl string, argv []string, dir, log string) string {
 	var b strings.Builder
@@ -106,6 +109,7 @@ func plist(lbl string, argv []string, dir, log string) string {
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Standard</string>
+  <key>AbandonProcessGroup</key><true/>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
   <key>StandardOutPath</key><string>` + xmlEsc(log) + `</string>
   <key>StandardErrorPath</key><string>` + xmlEsc(log) + `</string>
@@ -147,10 +151,21 @@ func Install(units []Unit, logDir string) ([]string, error) {
 	for _, u := range units {
 		switch runtime.GOOS {
 		case "darwin":
+			// Idempotent, and never restarts a loaded service: `just build` calls this on every build, and a reload
+			// would bounce a running server. A changed plist takes effect at the next `just stop` / `just run`.
+			old, _ := os.ReadFile(u.Path)
+			loaded := run("launchctl", "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), u.Label)) == nil
+			if string(old) == u.Body && loaded {
+				did = append(did, fmt.Sprintf("%s already installed and loaded (%s)", u.Name, u.Path))
+				continue
+			}
 			if err := writeUnit(u); err != nil {
 				return did, err
 			}
-			_ = run("launchctl", "unload", u.Path) // an earlier install; errors when there is none
+			if loaded {
+				did = append(did, fmt.Sprintf("updated %s (%s); the loaded copy is older: takes effect after just stop / just run", u.Name, u.Path))
+				continue
+			}
 			if err := run("launchctl", "load", "-w", u.Path); err != nil {
 				return did, err
 			}

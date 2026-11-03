@@ -15,6 +15,10 @@ func TestUnitsPerOS(t *testing.T) {
 		!strings.Contains(mac[1].Body, "<key>SuccessfulExit</key><false/>") {
 		t.Fatalf("plist:\n%s\n%s", mac[0].Body, mac[1].Body)
 	}
+	if !strings.HasSuffix(mac[1].Path, "LaunchAgents/ai.act3.processing_server.plist") || mac[0].Label != "ai.act3.nats-server" ||
+		!strings.Contains(mac[1].Body, "<key>AbandonProcessGroup</key><true/>") {
+		t.Fatalf("labels must match the justfile: %s %s", mac[0].Label, mac[1].Path)
+	}
 	lin, _ := Units("linux", spec)
 	if !strings.Contains(lin[1].Body, "ExecStart=/r/ai_processing_server run") || !strings.Contains(lin[1].Body, "Restart=on-failure") ||
 		!strings.HasSuffix(lin[0].Path, "act3-processing-broker.service") {

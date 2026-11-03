@@ -303,15 +303,25 @@ func host(dir string) error {
 
 	tail := newTail(40)
 	var logMu sync.Mutex
+	// A runner that speaks our grammar (ACT3_STAGE / ACT3_PROGRESS) owns its progress: from its first such line on,
+	// tqdm bars it prints (Wan's "Loading checkpoint shards: 100%|") are not job progress. Without this a Wan render
+	// read 100% while still loading weights (2026-10-28, task act3_b415e3d31aac833bb9bbf031_a2).
+	var ownsProgress bool
 	line := func(s string) {
 		logMu.Lock()
 		fmt.Fprintln(logf, s)
+		st := ParseStage(s)
+		own := st != "" || reOwn.MatchString(s)
+		ownsProgress = ownsProgress || own
+		thirdPartyMuted := ownsProgress && !own
 		logMu.Unlock()
 		tail.add(s)
-		if st := ParseStage(s); st != "" {
+		if st != "" {
 			ev.add(Event{Type: "stage", Stage: st})
 		} else if p, ok := ParseProgress(s); ok {
-			ev.progress((before+weights[cur]*p)/total, s)
+			if !thirdPartyMuted {
+				ev.progress((before+weights[cur]*p)/total, s)
+			}
 		} else if strings.HasPrefix(s, "ACT3_NOTE ") {
 			ev.add(Event{Type: "note", Note: strings.TrimPrefix(s, "ACT3_NOTE ")})
 		}
@@ -320,6 +330,9 @@ func host(dir string) error {
 	var runErr error
 	for n, st := range steps {
 		cur = n
+		logMu.Lock()
+		ownsProgress = false // each step is its own process: it earns (or not) the right to mute tqdm afresh
+		logMu.Unlock()
 		if stepDone(dir, n, st, true) {
 			fmt.Fprintf(logf, "# step %d/%d %s: already done (checkpoint), skipped\n", n+1, len(steps), st.Name)
 			before += weights[n]
