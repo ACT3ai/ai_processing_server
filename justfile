@@ -5,7 +5,7 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
 version := "0.2.0"
 bin := if os_family() == "windows" { "ai_processing_server.exe" } else { "ai_processing_server" }
-git_sha := `git rev-parse --short HEAD 2>/dev/null || echo unknown`
+git_sha := if os_family() == "windows" { `$s = git rev-parse --short HEAD 2>$null; if ($s) { $s } else { 'unknown' }` } else { `git rev-parse --short HEAD 2>/dev/null || echo unknown` }
 ldflags := "-s -w -X main.version=" + version + " -X main.gitSHA=" + git_sha + " -X main.buildTime=" + datetime_utc("%Y-%m-%dT%H:%M:%SZ")
 
 export GOWORK := "off"        # a parent go.work (e.g. ~/BGit/act3/go.work) must not capture this module
@@ -17,6 +17,7 @@ default:
 
 # this_server.yaml is created once and never overwritten (pm/ai_processing_server.mdx §6.1).
 # Compile, install nats-server if missing, create this_server.yaml if missing, write the broker config
+[unix]
 build:
     @echo "building {{bin}} {{version}} (git {{git_sha}}) with `go version | cut -d' ' -f3`"
     @cd code && go build -trimpath -ldflags "{{ldflags}}" -o ../{{bin}} ./cmd/ai_processing_server
@@ -25,6 +26,18 @@ build:
     @just _broker-ensure
     @./{{bin}} init
     @./{{bin}} broker config >/dev/null 2>&1 && echo "broker config: `./{{bin}} broker config`" || echo "broker config: skipped until this_server.yaml loads"
+    @just _service-ensure
+
+# Compile, install nats-server if missing, create this_server.yaml if missing, write the broker config
+[windows]
+build:
+    @Write-Output "building {{bin}} {{version}} (git {{git_sha}}) with $((go version).Split(' ')[2])"
+    @go build -C code -trimpath -ldflags "{{ldflags}}" -o ../{{bin}} ./cmd/ai_processing_server
+    @Write-Output "built ./{{bin}}"
+    -@git config core.hooksPath .githooks
+    @just _broker-ensure
+    @./{{bin}} init
+    @$c = ./{{bin}} broker config 2>$null; if ($LASTEXITCODE -eq 0) { Write-Output "broker config: $c" } else { Write-Output "broker config: skipped until this_server.yaml loads" }
     @just _service-ensure
 
 # Start the server in the background and print where its API and logs are
@@ -65,6 +78,7 @@ run: _binary
 [windows]
 run: _binary
     if (./{{bin}} status 2>$null) { ./{{bin}} status; exit 0 }
+    if (Get-Command nats-server -ErrorAction SilentlyContinue) { ./{{bin}} broker status *> $null; if ($LASTEXITCODE -ne 0) { just broker-run; if ($LASTEXITCODE -ne 0) { Write-Output "warning: the broker did not start; the server runs direct mode only (just broker-status)" } } }
     New-Item -ItemType Directory -Force data/git_ignore/logs | Out-Null
     Start-Process -FilePath ./{{bin}} -ArgumentList run -WindowStyle Hidden -RedirectStandardOutput data/git_ignore/logs/server.stdout.log -RedirectStandardError data/git_ignore/logs/server.stderr.log
     Start-Sleep -Seconds 3
@@ -151,7 +165,7 @@ _broker-ensure:
 
 [windows]
 _broker-ensure:
-    try { just broker-install } catch { Write-Output "WARNING: nats-server is not installed; the task queue cannot start on this machine." }
+    just broker-install; if ($LASTEXITCODE -ne 0) { Write-Output "WARNING: nats-server is not installed; the task queue cannot start on this machine." }
 
 # Write this machine's nats-server config from this_server.yaml (to ~/.act3_processing/nats/, never hand edited)
 broker-config: _binary
@@ -180,6 +194,10 @@ broker-run: _binary
     done
     echo "nats-server did not answer; see $dir/nats-server.log"; tail -n 20 "$dir/nats-server.log"; exit 1
 
+[windows]
+broker-run: _binary
+    ./{{bin}} broker status *> $null; if ($LASTEXITCODE -eq 0) { ./{{bin}} broker status; exit 0 }; $conf = ./{{bin}} broker config; if ($LASTEXITCODE -ne 0) { exit 1 }; $dir = Split-Path $conf; $p = Start-Process -FilePath nats-server -ArgumentList '-c', "`"$conf`"" -WindowStyle Hidden -RedirectStandardOutput "$dir/nats-server.log" -RedirectStandardError "$dir/nats-server.err.log" -PassThru; $p.Id | Set-Content "$dir/nats-server.pid"; foreach ($i in 1..40) { ./{{bin}} broker status *> $null; if ($LASTEXITCODE -eq 0) { ./{{bin}} broker status; Write-Output "pid $($p.Id) · log $dir/nats-server.log · stop: just broker-stop"; exit 0 }; Start-Sleep -Milliseconds 250 }; Write-Output "nats-server did not answer; see $dir/nats-server.err.log"; exit 1
+
 # Stop the nats-server (LaunchAgent or broker-run's); queued jobs and claims stay in its store
 [unix]
 broker-stop:
@@ -187,6 +205,10 @@ broker-stop:
     if [ "$(uname)" = "Darwin" ] && launchctl bootout "gui/$(id -u)/ai.act3.nats-server" 2>/dev/null; then echo "stopped (LaunchAgent unloaded; just broker-run reloads it)"; exit 0; fi
     f="${APS_BROKER_DIR:-$HOME/.act3_processing/nats}/nats-server.pid"
     if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then kill "$(cat "$f")" && rm -f "$f" && echo stopped; else echo "no broker started by broker-run"; fi
+
+[windows]
+broker-stop:
+    $d = if ($env:APS_BROKER_DIR) { $env:APS_BROKER_DIR } else { "$HOME/.act3_processing/nats" }; $f = "$d/nats-server.pid"; if ((Test-Path $f) -and (Get-Process -Id (Get-Content $f) -ErrorAction SilentlyContinue)) { Stop-Process -Id (Get-Content $f); Remove-Item $f; Write-Output stopped } else { Write-Output "no broker started by broker-run" }
 
 # ---- start at login/boot (pm/ai_processing_server.mdx §19.2). install-service / uninstall-service / service-status
 # are below, next to render-setup: one Go implementation (code/internal/service), LaunchAgents ai.act3.* on macOS ----
@@ -267,7 +289,8 @@ check-secrets:
 
 # Go unit tests next to the code
 test-go:
-    cd code && go vet ./... && go test ./...
+    go vet -C code ./...
+    go test -C code ./...
 
 # Black-box suite: starts its own servers on free ports and calls the API (see tests/README.md)
 test-suite: build

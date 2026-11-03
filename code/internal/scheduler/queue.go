@@ -263,11 +263,15 @@ func (s *Server) acceptDelivery(ctx context.Context, q queue.Queue, d queue.Deli
 	def, known := s.cat.Services[env.Service]
 	offered := s.offers[env.Service].Parallel > 0
 	key := s.cfg.Server.Key
+	old := s.jobs[env.JobID]
 	s.mu.Unlock()
 	band := queue.BandFor(env.Priority)
 	base := queue.JobState{JobID: env.JobID, Caller: env.Caller, Service: env.Service, Band: band, Attempt: attempt, Server: key}
 	h := &heldJob{d: d, caller: env.Caller, band: band, attempt: attempt, maxAttempts: maxAttempts(env, def.Retry.MaxAttempts),
 		seq: int64(attempt) * eventSeqBase}
+	// Redelivered while this server still runs it (its claim lapsed during a long stall): the same attempt continuing,
+	// so neither the attempt count nor expires_at may end it.
+	continuing := old != nil && !old.State.Final()
 
 	if !known || !offered {
 		// Pulled for a service this server no longer offers (a reload raced the pull): let another worker have it.
@@ -294,10 +298,10 @@ func (s *Server) acceptDelivery(ctx context.Context, q queue.Queue, d queue.Deli
 	case ctl.Cancel:
 		s.settleDirect(ctx, q, h, base, queue.StateCancelled, &queue.Event{Type: "cancelled", By: ctl.By}, "ack")
 		return
-	case env.Expired(now):
+	case env.Expired(now) && !continuing:
 		s.settleDirect(ctx, q, h, base, queue.StateExpired, &queue.Event{Type: "expired", By: "queue"}, "ack")
 		return
-	case attempt > h.maxAttempts:
+	case attempt > h.maxAttempts && !continuing:
 		msg := fmt.Sprintf("gave up after %d deliveries (the service allows %d attempts)", attempt-1, h.maxAttempts)
 		s.settleDirect(ctx, q, h, base, queue.StateFailed, &queue.Event{Type: "failed", Kind: string(jobs.KindInfra), Message: msg}, "dead:"+msg)
 		return

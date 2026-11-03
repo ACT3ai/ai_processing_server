@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ACT3ai/ai_processing_server/internal/capability"
 	"github.com/ACT3ai/ai_processing_server/internal/config"
 	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
@@ -373,5 +374,43 @@ func TestStopLeavesATaskHostJobToTheNextController(t *testing.T) {
 	}
 	if st, _, _ := q.State(context.Background(), "r1"); st.State != queue.StateClaimed {
 		t.Fatalf("job_state %s after a stop; the claim must stay with this machine", st.State)
+	}
+}
+
+// A job with one attempt (film/servers sends max_attempts 1) whose claim lapsed while this server still ran it is
+// redelivered on attempt 2: that is the same render continuing, so it keeps its claim instead of being failed while
+// it renders on.
+func TestRedeliveryOfARunningJobContinues(t *testing.T) {
+	q := queuetest.NewMem()
+	ctx := context.Background()
+	s, _ := newQueueServer(t, q, t.TempDir())
+	s.cat.Services["sys.compute"] = config.ServiceDef{ID: "sys.compute", Runner: "compute"}
+	s.offers = map[string]capability.Offer{"sys.compute": {Service: "sys.compute", Parallel: 1}}
+	if _, err := q.Submit(ctx, &queue.Envelope{JobID: "c1", Caller: "local", Service: "sys.compute", Priority: 30, MaxAttempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	d1, err := q.Pull(ctx, testLane, time.Second)
+	if err != nil || d1 == nil {
+		t.Fatalf("pull: %v %v", d1, err)
+	}
+	s.mu.Lock()
+	j := &jobs.Job{ID: "c1", Type: "sys.compute", Queue: "local", CreatedAt: time.Now().UTC()}
+	j.Move(jobs.Active, jobs.StageRunning, "rendering")
+	s.jobs["c1"] = j
+	s.mu.Unlock()
+	d1.Requeue(ctx, 0) // the claim lapses
+	d2, err := q.Pull(ctx, testLane, time.Second)
+	if err != nil || d2 == nil || d2.Attempt() != 2 {
+		t.Fatalf("redelivery: %v %v", d2, err)
+	}
+	s.acceptDelivery(ctx, q, d2)
+	if st, _, _ := q.State(ctx, "c1"); st.State != queue.StateClaimed {
+		t.Fatalf("job_state %s after the redelivery of a running job, want CLAIMED", st.State)
+	}
+	s.mu.Lock()
+	held := s.held["c1"] != nil
+	s.mu.Unlock()
+	if !held {
+		t.Fatal("the redelivered claim is not held")
 	}
 }

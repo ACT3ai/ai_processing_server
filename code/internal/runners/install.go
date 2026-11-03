@@ -49,7 +49,7 @@ func seedvr2InstallProblem(dit string) string {
 	}
 	for _, w := range []string{seedvr2VAE, dit} {
 		if !fileAtLeast(filepath.Join(models, w), 100<<20) {
-			return fmt.Sprintf("SeedVR2 weight %s is missing or partial in %s", w, models)
+			return fmt.Sprintf("SeedVR2 is not installed for this quality: weight %s is missing or partial in %s", w, models)
 		}
 	}
 	return ""
