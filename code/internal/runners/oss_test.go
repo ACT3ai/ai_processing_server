@@ -221,8 +221,19 @@ func TestUpscaleChecks(t *testing.T) {
 	// Exactly what the internal web app sends (processing/tasks.ts envelopeFor): model seedvr2-<quality>, camelCase.
 	app := map[string]any{"render_type": "seedvr2", "model": "seedvr2-sharp", "quality": "sharp", "kind": "upscale",
 		"width": 3840, "height": 2160, "fps": 24, "durationSeconds": 31, "factor": 2, "target": "4k"}
-	if err := (OSSUpscale{}).Check(context.Background(), mk(app, "source_video"), env); err == nil || !strings.Contains(err.Error(), "30 s") {
+	err := (OSSUpscale{}).Check(context.Background(), mk(app, "source_video"), env)
+	if accelerator() == "mps" && (err == nil || !strings.Contains(err.Error(), "30 s")) {
 		t.Fatalf("app params not read (durationSeconds 31 must be refused on a Mac): %v", err)
+	}
+	if accelerator() != "mps" && err != nil {
+		t.Fatalf("a 31 s upscale is fine on CUDA: %v", err)
+	}
+	var up upscaleParams
+	b, _ := json.Marshal(app)
+	json.Unmarshal(b, &up)
+	up.defaults()
+	if up.DurationSeconds != 31 {
+		t.Fatalf("upscale camelCase durationSeconds not read: %+v", up)
 	}
 	var vp videoParams
 	json.Unmarshal([]byte(`{"model":"wan2.2-a14b","durationSeconds":3,"negativePrompt":"blur","prompt":"x"}`), &vp)

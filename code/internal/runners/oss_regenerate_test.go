@@ -595,6 +595,8 @@ func TestFakeRegenerateInATaskHost(t *testing.T) {
 		t.Skip("ffmpeg not on PATH")
 	}
 	env, job := setupFake(t)
+	t.Setenv("H3R_GPU_VRAM_GB", "31.8") // a 5090 with 128 GB, whatever the test machine has
+	t.Setenv("H3R_SYSTEM_RAM_GB", "128")
 	draft := filepath.Join(t.TempDir(), "draft.mp4")
 	if out, err := exec.Command("ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=672x384:rate=24:duration=2",
 		"-f", "lavfi", "-i", "sine=duration=2", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", draft).CombinedOutput(); err != nil {
