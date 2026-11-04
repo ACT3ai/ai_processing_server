@@ -1,7 +1,6 @@
 package runners
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/procs"
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
@@ -567,9 +567,14 @@ func planRegenerate(p regenParams, d draftInfo, hw regenHW) (regenPlan, error) {
 		}
 		warn("only the first %.2f s of the %.2f s draft is refined; %.2f s are dropped", float64(capF)/h3rFPS, d.Seconds, lost)
 	}
+	// The CLI pads to 124. The ComfyUI nodes refine 121-frame windows, each padded to 124, so memory is one window's
+	// whatever the length (§9.2).
 	grid := h3rCLIWindow + 3
 	if pl.Backend == "comfyui" {
-		grid = h3GridFrames(pl.WindowFrames)
+		grid = h3GridFrames(min(pl.WindowFrames, h3rCLIWindow))
+		if pl.WindowFrames > h3rCLIWindow {
+			warn("the %.2f s draft is refined in %d windows of 5 s; a seam can show where two meet", float64(pl.WindowFrames)/h3rFPS, (pl.WindowFrames+h3rCLIWindow-1)/h3rCLIWindow)
+		}
 	}
 	pl.OutputSeconds = math.Min(math.Round(d.Seconds*1000)/1000, math.Round(float64(pl.WindowFrames)/h3rFPS*1000)/1000)
 
@@ -643,7 +648,9 @@ func planRegenerate(p regenParams, d draftInfo, hw regenHW) (regenPlan, error) {
 		pl.Fwd = "sol_engine"
 	}
 	pl.VAE = "fast"
-	if peak := fastDecoderPeakGB(latentTokens(pl.Target, grid)); vramGB > 0 && peak > vramGB*0.9 {
+	if pl.Backend == "comfyui" {
+		pl.VAE = "standard" // the Olm nodes decode with the released H3 VAE, tiled
+	} else if peak := fastDecoderPeakGB(latentTokens(pl.Target, grid)); vramGB > 0 && peak > vramGB*0.9 {
 		pl.VAE = "standard"
 		warn("the fast decoder needs ~%.1f GB here; using the released decoder", peak)
 	}
@@ -673,25 +680,13 @@ func planRegenerate(p regenParams, d draftInfo, hw regenHW) (regenPlan, error) {
 		warn("the shot has dialogue but the draft has no audio track: the master will be silent")
 	}
 
-	// §9.2 LoRA
+	// §9.2 LoRA: both backends load NVIDIA's merged r576 (the CLI from --weights, the Olm nodes from the released bundle)
 	if l := squash(p.Lora); l != "" {
 		switch {
 		case strings.Contains(l, "draken"):
 			return pl, planErr("lora_unverified", "the DrakenZA conversion is unverified (no Sharp conditioning) and must not be used")
-		case strings.Contains(l, "128") || strings.Contains(l, "father"):
-			pl.Lora = "r128"
-		case strings.Contains(l, "384") || strings.Contains(l, "kijai"):
-			pl.Lora = "r384_kijai"
-			warn("Kijai's r384 is the refiner only: the workflow must also load LightX2V Turbo + LMS Sharp")
 		case !strings.Contains(l, "576") && !strings.Contains(l, "nvidia") && l != "default":
-			warn("LoRA %v is unknown; using NVIDIA's merged r576", p.Lora)
-		}
-		if pl.Lora != "r576" && pl.Backend == "cli" {
-			warn("the official CLI loads NVIDIA's merged r576 LoRA; %s applies to ComfyUI only", pl.Lora)
-			pl.Lora = "r576"
-		}
-		if pl.Lora == "r128" && (!h3 || pl.InputSize != "768p") {
-			warn("the rank-128 LoRA was built for raw H3 768P drafts (~124 frames)")
+			warn("LoRA %v: the installed refiners load NVIDIA's merged r576 only", p.Lora)
 		}
 	}
 
@@ -761,7 +756,7 @@ func (OSSRegenerate) Check(_ context.Context, job *jobs.Job, env Env) error {
 	if accelerator() != "cuda" {
 		return jobs.Errf(jobs.KindInfra, "Open-H3-Regenerate-2K runs on CUDA only; this machine has no port (h3_regenerate_2k.mdx §8)")
 	}
-	if st := regenInstall(env); !st.cli && !st.comfy {
+	if st := regenInstall(); !st.cli && !st.comfy {
 		return jobs.Errf(jobs.KindInfra, "%s", st.why)
 	}
 	return nil
@@ -783,7 +778,7 @@ func (OSSRegenerate) Run(ctx context.Context, job *jobs.Job, env Env, rep Report
 		}
 		hw := regenHW{VRAMGB: gpuVRAMGB(env), RAMGB: systemRAMGB()}
 		if !FakeModels() { // the plan picks among what is really installed here
-			st := regenInstall(env)
+			st := regenInstall()
 			hw.CLI, hw.Comfy = &st.cli, &st.comfy
 		}
 		pl, err := planRegenerate(p, d, hw)
@@ -800,11 +795,7 @@ func (OSSRegenerate) Run(ctx context.Context, job *jobs.Job, env Env, rep Report
 			t, _ := fakeTask(snap, out, draft, prompt, h3rTargets[pl.Target].w/8, h3rTargets[pl.Target].h/8)
 			return t, nil
 		}
-		comfy := comfyConfig(env)
-		if pl.Backend == "comfyui" && (comfy.url == "" || comfy.workflow == "" || comfy.inputDir == "") {
-			return detachedTask{}, jobs.Errf(jobs.KindInfra, "backend_not_installed: this plan needs the ComfyUI backend, which is not configured here: set H3R_COMFY_WORKFLOW and H3R_COMFY_INPUT_DIR (and run ComfyUI with the Open-H3 nodes)")
-		}
-		return regenTask(snap, pl, draft, prompt, out, comfy)
+		return regenTask(snap, env, pl, draft, prompt, out)
 	})
 	if err != nil || res == nil {
 		return res, err
@@ -825,18 +816,6 @@ func (OSSRegenerate) Run(ctx context.Context, job *jobs.Job, env Env, rep Report
 		res.Outputs[i].Meta = map[string]any{"license_cleared": H3RegenerateLicenseCleared, "delivery": deliveryOf(p.Delivery)}
 	}
 	return res, nil
-}
-
-type comfyCfg struct{ url, workflow, inputDir string }
-
-func comfyConfig(env Env) comfyCfg {
-	c := comfyCfg{url: os.Getenv("H3R_COMFY_URL"), workflow: os.Getenv("H3R_COMFY_WORKFLOW"), inputDir: os.Getenv("H3R_COMFY_INPUT_DIR")}
-	if c.url == "" {
-		if e := env.Engines["comfyui"]; e != nil && e.URL != "" {
-			c.url = strings.TrimSuffix(strings.TrimSuffix(e.URL, "/system_stats"), "/")
-		}
-	}
-	return c
 }
 
 // gpuVRAMGB is the total memory of the card this job holds: $H3R_GPU_VRAM_GB, else nvidia-smi for the slot's GPU,
@@ -867,24 +846,13 @@ var gpuVRAMGB = func(env Env) float64 {
 	return math.Round(mib/1024*10) / 10
 }
 
-// systemRAMGB: $H3R_SYSTEM_RAM_GB, else /proc/meminfo MemTotal (Linux, where CUDA render servers run), else 0 (unknown).
+// systemRAMGB: $H3R_SYSTEM_RAM_GB, else the machine's total RAM, else 0 (unknown).
 var systemRAMGB = func() float64 {
 	if v, err := strconv.ParseFloat(os.Getenv("H3R_SYSTEM_RAM_GB"), 64); err == nil && v > 0 {
 		return v
 	}
-	f, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if fs := strings.Fields(sc.Text()); len(fs) >= 2 && fs[0] == "MemTotal:" {
-			kb, err := strconv.ParseFloat(fs[1], 64)
-			if err == nil {
-				return math.Round(kb/1024/1024*10) / 10
-			}
-		}
+	if _, total, ok := hardware.FreeRAM(); ok {
+		return math.Round(total*10) / 10
 	}
 	return 0
 }
@@ -892,7 +860,7 @@ var systemRAMGB = func() float64 {
 // regenTask: the two checkpointed steps (refine → finish), from the snapshot (R1), scratch under the run dir (R10).
 // The prompt goes in a file (--prompt-file): one argv word of up to 40,000 characters is over Windows' 32,767-character
 // command line, and spec R8 keeps a Windows 5090 in play.
-func regenTask(snap snapshot.Snapshot, pl regenPlan, draft, prompt, out string, comfy comfyCfg) (detachedTask, error) {
+func regenTask(snap snapshot.Snapshot, env Env, pl regenPlan, draft, prompt, out string) (detachedTask, error) {
 	home := regenHome()
 	work := filepath.Join(filepath.Dir(filepath.Dir(out)), "work")
 	refined := filepath.Join(work, "refined.mp4")
@@ -903,12 +871,8 @@ func regenTask(snap snapshot.Snapshot, pl regenPlan, draft, prompt, out string, 
 	if err := os.WriteFile(promptFile, []byte(prompt), 0o600); err != nil {
 		return detachedTask{}, jobs.Wrap(jobs.KindInfra, err, "write the prompt file")
 	}
-	py := venvPython(home)
-	if pl.Backend == "comfyui" && !fileAtLeast(py, 1) {
-		// the script is stdlib-only; the model runs inside ComfyUI, so a ComfyUI-only server needs no model venv
-		py = map[bool]string{true: "python", false: "python3"}[filepath.Separator == '\\']
-	}
-	base := []string{py, snap.Path("code/scripts/video_gen/h3_regenerate/render_h3_regenerate.py")}
+	// the venv that runs ComfyUI also runs the stdlib-only script, which starts ComfyUI with its own interpreter
+	base := []string{venvPython(home), snap.Path("code/scripts/video_gen/h3_regenerate/render_h3_regenerate.py")}
 	common := []string{
 		"--backend", pl.Backend, "--home", home, "--weights", filepath.Join(home, "weights"),
 		"--draft", draft, "--prompt-file", promptFile, "--resolution", pl.Target, "--input-size", pl.InputSize,
@@ -930,10 +894,7 @@ func regenTask(snap snapshot.Snapshot, pl regenPlan, draft, prompt, out string, 
 	if pl.AllowTruncate {
 		common = append(common, "--allow-truncate")
 	}
-	if pl.Backend == "comfyui" {
-		common = append(common, "--comfy-url", comfy.url, "--comfy-workflow", comfy.workflow, "--comfy-input-dir", comfy.inputDir)
-	}
-	envv := []string{"PYTHONUNBUFFERED=1"}
+	envv := h3Env(env)
 	refine := append(append(append([]string{}, base...), "--stage", "refine"), common...)
 	finish := append(append(append([]string{}, base...), "--stage", "finish"), common...)
 	finish = append(finish, "--out", out, "--remux", pl.Remux, "--output-seconds", strconv.FormatFloat(pl.OutputSeconds, 'f', 3, 64))
@@ -948,13 +909,48 @@ func regenTask(snap snapshot.Snapshot, pl regenPlan, draft, prompt, out string, 
 }
 
 // regenInstallState: which backends this server can run. cli = venv + Sana checkout with infer.py + full-size
-// weights; comfy = a ComfyUI URL, an API-format workflow and its input dir. why names the first missing piece.
+// weights; comfy = the venv, ComfyUI with the Olm Open-H3 nodes and every model file (bms/oss_video/open_h3_regenerate_2k,
+// laid out like h3-regenerate-local.ts comfyChecks). why names the first missing piece of each.
 type regenInstallState struct {
 	cli, comfy bool
 	why        string
 }
 
-var regenInstall = func(env Env) regenInstallState {
+// h3rComfyFiles: the ComfyUI install, relative to <home>/ComfyUI, with size floors that catch a partial download.
+// refinerOnly marks what MiniMax H3 generation does not load (h3InstallProblem).
+var h3rComfyFiles = []struct {
+	rel         []string
+	min         int64
+	refinerOnly bool
+}{
+	{[]string{"main.py"}, 1, false},
+	{[]string{"custom_nodes", "ComfyUI-Olm-Open-H3-Regenerate-2K", "nodes.py"}, 1, true},
+	{[]string{"models", "diffusion_models", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"}, 20_000_000_000, false},
+	{[]string{"models", "text_encoders", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"}, 15_000_000_000, false},
+	{[]string{"models", "vae", "minimax_h3_video_vae_fp16.safetensors"}, 5_000_000_000, false},
+	{[]string{"models", "vae", "minimax_h3_audio_vae_fp32.safetensors"}, 500_000_000, false},
+	{[]string{"models", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"}, 600_000_000, true},
+	{[]string{"models", "open_h3_refiner", "Open-H3-Regenerate-2K", "lora", "open_h3_regenerate_2k_lora.safetensors"}, 12_000_000_000, true},
+	{[]string{"models", "open_h3_refiner", "Open-H3-Regenerate-2K", "lora", "sharp_curve_branches.safetensors"}, 1_000_000_000, true},
+	{[]string{"models", "open_h3_refiner", "Open-H3-Regenerate-2K", "lora", "adaln_t_table.bin"}, 32800, true},
+}
+
+func comfyPath(home string, rel []string) string {
+	return filepath.Join(append([]string{home, "ComfyUI"}, rel...)...)
+}
+
+// h3Env: both H3 scripts resolve ffmpeg / ffprobe through H3R_<TOOL>, then PATH.
+func h3Env(env Env) []string {
+	vars := []string{"PYTHONUNBUFFERED=1"}
+	for _, t := range []string{"ffmpeg", "ffprobe"} {
+		if p := enginePath(env, t); p != "" {
+			vars = append(vars, "H3R_"+strings.ToUpper(t)+"="+p)
+		}
+	}
+	return vars
+}
+
+var regenInstall = func() regenInstallState {
 	if accelerator() != "cuda" {
 		return regenInstallState{why: "Open-H3-Regenerate-2K runs on CUDA only (no Metal / MLX port yet, h3_regenerate_2k.mdx §8)"}
 	}
@@ -986,15 +982,22 @@ var regenInstall = func(env Env) regenInstallState {
 			cliWhy = "missing or partial " + c.path
 		}
 	}
-	c := comfyConfig(env)
-	st := regenInstallState{cli: cliWhy == "", comfy: c.url != "" && fileAtLeast(c.workflow, 2) && c.inputDir != ""}
+	comfyWhy := ""
+	if !fileAtLeast(venvPython(home), 1) {
+		comfyWhy = "missing " + venvPython(home)
+	}
+	for _, f := range h3rComfyFiles {
+		if p := comfyPath(home, f.rel); comfyWhy == "" && !fileAtLeast(p, f.min) {
+			comfyWhy = "missing or partial " + p
+		}
+	}
+	st := regenInstallState{cli: cliWhy == "", comfy: comfyWhy == ""}
 	if !st.cli && !st.comfy {
-		st.why = "Open-H3-Regenerate-2K is not installed on this server: CLI " + cliWhy +
-			"; ComfyUI needs H3R_COMFY_URL (or a detected ComfyUI), H3R_COMFY_WORKFLOW and H3R_COMFY_INPUT_DIR" +
-			" (install guide: ~/BGit/all/film/code/subp/video_gen_ai/nvidia/h3_regenerate_2k/README.md)"
+		st.why = "Open-H3-Regenerate-2K is not installed on this server: ComfyUI " + comfyWhy + "; CLI " + cliWhy +
+			" (install: ~/BGit/all/app/smartc/film/servers/bms/oss_video/open_h3_regenerate_2k, `just build` in app/code/film/servers)"
 	}
 	return st
 }
 
 // regenInstallProblem: "" when at least one backend is ready, else why not (InstallProblems in install.go reads it).
-func regenInstallProblem(env Env) string { return regenInstall(env).why }
+func regenInstallProblem() string { return regenInstall().why }

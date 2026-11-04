@@ -23,7 +23,7 @@ func InstallProblems() map[string]string {
 	if p := firstProblem(seedvr2InstallProblem(seedvr2Qualities["standard"].dit), flashvsrInstallProblem()); p != "" {
 		m[OSSUpscale{}.Name()] = p
 	}
-	if p := regenInstallProblem(Env{}); p != "" {
+	if p := regenInstallProblem(); p != "" {
 		m[OSSRegenerate{}.Name()] = p
 	}
 	return m
