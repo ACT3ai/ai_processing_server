@@ -941,9 +941,13 @@ func maxAttempts(e *queue.Envelope, service int) int {
 
 // toLocalEnvelope turns a task envelope into the server's job envelope.
 func toLocalEnvelope(e *queue.Envelope) (jobs.Envelope, error) {
+	params, err := withEnvelopeModel(e.Params, e.Model)
+	if err != nil {
+		return jobs.Envelope{}, err
+	}
 	out := jobs.Envelope{JobID: e.JobID, Platform: e.Caller, Service: e.Service, PlatformJobType: e.CallerJobType,
 		Priority: e.Priority, TraceID: e.TraceID, Tenant: e.Tenant, Deadline: e.Deadline, TimeoutSeconds: e.TimeoutSeconds,
-		Params: e.Params}
+		Params: params}
 	for name, raw := range map[string]json.RawMessage{"inputs": e.Inputs, "outputs": e.Outputs, "data_rules": e.DataRules} {
 		if len(raw) == 0 || string(raw) == "null" {
 			continue
@@ -967,6 +971,29 @@ func toLocalEnvelope(e *queue.Envelope) (jobs.Envelope, error) {
 		}
 	}
 	return out, nil
+}
+
+// withEnvelopeModel puts the envelope's model into the params runners read. The model fence (models.allow/deny) checks
+// the envelope's model, so params naming another one is refused rather than run; params without one (a caller that
+// sets only the envelope's) would otherwise run the runner's default model.
+func withEnvelopeModel(params json.RawMessage, model string) (json.RawMessage, error) {
+	if model == "" {
+		return params, nil
+	}
+	m := map[string]json.RawMessage{}
+	if len(params) > 0 && string(params) != "null" {
+		if err := json.Unmarshal(params, &m); err != nil {
+			return nil, fmt.Errorf("envelope params: %v", err)
+		}
+	}
+	if raw, ok := m["model"]; ok {
+		var have string
+		if err := json.Unmarshal(raw, &have); err != nil || (have != "" && have != model) {
+			return nil, fmt.Errorf("params.model %s disagrees with the envelope's model %q", raw, model)
+		}
+	}
+	m["model"], _ = json.Marshal(model)
+	return json.Marshal(m)
 }
 
 // ---- local API side ----
