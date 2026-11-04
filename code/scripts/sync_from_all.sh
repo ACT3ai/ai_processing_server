@@ -24,3 +24,5 @@ copy app/smartc/film/servers/bms/oss_video/flashvsr/code/run_flashvsr.py upscale
 	"the oss_upscale runner for FlashVSR (code/internal/runners/oss_flashvsr.go)"
 copy film/code/subp/video_gen_ai/nvidia/h3_regenerate_2k/render_h3_regenerate.py video_gen/h3_regenerate/render_h3_regenerate.py \
 	"the oss_regenerate runner (code/internal/runners/oss_regenerate.go)"
+copy film/code/subp/video_gen_ai/nvidia/h3_regenerate_2k/render_h3_generate.py video_gen/h3_regenerate/render_h3_generate.py \
+	"the oss_video runner for MiniMax H3 (code/internal/runners/oss_h3.go); it imports render_h3_regenerate.py beside it"
