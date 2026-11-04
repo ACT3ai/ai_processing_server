@@ -22,8 +22,10 @@ T2V and I2V have their own pair (--lightning, --lightning-i2v). When no pair is 
 Wan2.2-TI2V-5B (ACT3_WAN_MODEL=wan2.2-ti2v-5b, for GPUs that cannot hold A14B) runs through the same script: its
 model_index.json has one transformer (no boundary_ratio) and expand_timesteps, so it takes one guidance scale, a
 float32 VAE (its model card), no Lightning, and image-to-video from the same folder (--i2v-model = --model).
-On CUDA the script offloads whole components (model offload) when the largest one fits the GPU with headroom, and
-layer by layer (sequential offload, slower) when it does not, so the 5B renders on an 8 GB card.
+On CUDA PyTorch is capped at 95% of the card, so an overflow fails here instead of spilling into system RAM (the
+Windows driver's Sysmem Fallback froze the 5090). It offloads whole components (model offload) when the largest one
+fits under that cap with 4 GiB to spare, and layer by layer (sequential offload, slower) when it does not or when a
+render still runs out of GPU memory, so A14B renders on the 5090 and the 5B on an 8 GB card.
 """
 import argparse
 import importlib.util
@@ -105,6 +107,10 @@ def model_config(folder):
             return json.load(f)
     except (OSError, ValueError):
         return {}
+
+
+# PyTorch's share of the GPU on CUDA: the rest is the driver's, and an allocation past it fails instead of spilling
+VRAM_FRACTION = 0.95
 
 
 def largest_part_gib(p):
@@ -215,18 +221,27 @@ if pair:
 elif x.steps_full:
     steps = x.steps_full
 
+layer_by_layer = False
+
+
+def offload_layer_by_layer(why):
+    global layer_by_layer
+    print(f"ACT3_NOTE {why}: offloading layer by layer", flush=True)
+    pipe.enable_sequential_cpu_offload()
+    pipe.vae.enable_tiling()
+    layer_by_layer = True
+
+
 if x.device == "cuda":
-    gpu_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+    # Windows' driver puts a CUDA allocation that does not fit the card into system RAM instead of failing (Sysmem
+    # Fallback), which froze the 5090 on 2026-11-04: capped, an overflow is an out-of-memory error here instead.
+    torch.cuda.set_per_process_memory_fraction(VRAM_FRACTION)
+    cap_gib = VRAM_FRACTION * torch.cuda.get_device_properties(0).total_memory / 2**30
     part_gib = largest_part_gib(pipe)
-    if part_gib + 3 <= gpu_gib:
-        pipe.enable_model_cpu_offload()  # two 14B experts do not both fit 32 GB
+    if part_gib + 4 <= cap_gib:
+        pipe.enable_model_cpu_offload()  # one part on the GPU at a time, with room for its activations
     else:
-        print(
-            f"ACT3_NOTE low VRAM: offloading layer by layer (largest part {part_gib:.1f} GiB, GPU {gpu_gib:.1f} GiB)",
-            flush=True,
-        )
-        pipe.enable_sequential_cpu_offload()
-        pipe.vae.enable_tiling()
+        offload_layer_by_layer(f"largest part {part_gib:.1f} GiB, GPU cap {cap_gib:.1f} GiB")
 else:
     pipe.to("mps")
 print(f"loaded {'i2v' if i2v else 't2v'} in {time.time() - t0:.0f} s, {steps} steps", flush=True)
@@ -237,22 +252,33 @@ def on_step(_pipe, i, _t, kwargs):
     return kwargs
 
 
+def render():
+    return pipe(
+        prompt=x.prompt,
+        negative_prompt=x.negative or None,
+        width=x.width,
+        height=x.height,
+        num_frames=x.frames,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        guidance_scale_2=guidance_2,
+        generator=torch.Generator(device="cpu").manual_seed(x.seed),
+        callback_on_step_end=on_step,
+        **extra,
+    ).frames[0]
+
+
 stage("rendering")
-gen = torch.Generator(device="cpu").manual_seed(x.seed)
 extra = {"image": first_frame(x.image, x.width, x.height)} if i2v else {}
-frames = pipe(
-    prompt=x.prompt,
-    negative_prompt=x.negative or None,
-    width=x.width,
-    height=x.height,
-    num_frames=x.frames,
-    num_inference_steps=steps,
-    guidance_scale=guidance,
-    guidance_scale_2=guidance_2,
-    generator=gen,
-    callback_on_step_end=on_step,
-    **extra,
-).frames[0]
+try:
+    frames = render()
+except torch.cuda.OutOfMemoryError:
+    if x.device != "cuda" or layer_by_layer:
+        raise
+    pipe.remove_all_hooks()
+    torch.cuda.empty_cache()
+    offload_layer_by_layer("out of GPU memory with whole parts on the GPU")
+    frames = render()
 stage("encoding")
 os.makedirs(os.path.dirname(os.path.abspath(x.out)), exist_ok=True)
 n = write_mp4(frames, x.out, x.fps)

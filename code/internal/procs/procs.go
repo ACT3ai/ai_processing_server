@@ -6,6 +6,7 @@ package procs
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,6 +23,9 @@ var elog = errlog.For("procs")
 
 // GraceBeforeKill is how long a cancelled process gets after the interrupt before the tree is killed.
 var GraceBeforeKill = 10 * time.Second
+
+// ErrKillNow as a context cause skips that grace: the tree is killed at once (the machine is running out of memory).
+var ErrKillNow = errors.New("killed at once")
 
 // Spec is one command to run.
 type Spec struct {
@@ -70,6 +74,7 @@ func Run(ctx context.Context, s Spec) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", s.Name, err)
 	}
+	lowerPriority(cmd)
 	wg.Add(2)
 	go pipe(stdout, s.Stdout)
 	go pipe(stderr, s.Stderr)
@@ -81,6 +86,11 @@ func Run(ctx context.Context, s Spec) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		if errors.Is(context.Cause(ctx), ErrKillNow) {
+			killGroup(cmd)
+			<-done
+			return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
+		}
 		interruptGroup(cmd)
 		select {
 		case <-done:

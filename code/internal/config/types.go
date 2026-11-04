@@ -168,6 +168,10 @@ type Limits struct {
 	MaxParallelJobs int     `yaml:"max_parallel_jobs" json:"max_parallel_jobs"`
 	CPUReservePct   int     `yaml:"cpu_reserve_pct" json:"cpu_reserve_pct"`
 	RAMReserveGB    float64 `yaml:"ram_reserve_gb" json:"ram_reserve_gb"`
+	// RAMFloorGB: a running task is stopped when the machine's free RAM stays under this (0 = 5% of RAM, at least
+	// 4 GB). RAMReserveGB only decides which jobs start; this keeps a render that outgrows its booking from freezing
+	// the machine.
+	RAMFloorGB float64 `yaml:"ram_floor_gb" json:"ram_floor_gb"`
 	VRAMHeadroomGB  float64 `yaml:"vram_headroom_gb" json:"vram_headroom_gb"`
 	DiskMinFreeGB   float64 `yaml:"disk_min_free_gb" json:"disk_min_free_gb"`
 	GPUTempMaxC     int     `yaml:"gpu_temp_max_c" json:"gpu_temp_max_c"`

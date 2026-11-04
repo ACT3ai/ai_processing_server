@@ -1,0 +1,17 @@
+package hardware
+
+import (
+	"syscall"
+	"unsafe"
+)
+
+var globalMemoryStatusEx = syscall.NewLazyDLL("kernel32.dll").NewProc("GlobalMemoryStatusEx")
+
+func freeRAM() (float64, float64, bool) {
+	var m memoryStatusEx
+	m.Length = uint32(unsafe.Sizeof(m))
+	if r, _, _ := globalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&m))); r == 0 {
+		return 0, 0, false
+	}
+	return float64(m.AvailPhys) / (1 << 30), float64(m.TotalPhys) / (1 << 30), true
+}

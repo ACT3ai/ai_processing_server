@@ -394,6 +394,7 @@ limits:
   max_parallel_jobs: 4          # whole machine
   cpu_reserve_pct: 20           # never offered to jobs (the owner uses this machine)
   ram_reserve_gb: 16
+  ram_floor_gb: 0               # a running render is stopped when free RAM stays under this; 0 = 5% of RAM, >= 4 GB
   vram_headroom_gb: 1.5         # per GPU, kept free for the driver and the desktop
   disk_min_free_gb: 100         # below this, stop taking jobs that write locally
   gpu_temp_max_c: 85            # above this for 2 minutes: DEGRADED, no new GPU work (§12.4)
@@ -408,6 +409,16 @@ local_api:
   listen: "127.0.0.1:9440"      # loopback by default; LAN only on purpose (§16.4)
   token_file: "~/.credentials/ai_processing_server_local.token"
 ```
+
+`ram_reserve_gb` only decides which jobs start (each books its service's `ram_gb`); a render can still outgrow its
+booking, or another program can take the RAM. So every task host runs a low-memory guard (2026-11-04, after a Wan
+render froze the 5090 and needed a reboot): it reads the machine's free RAM every second, and after two readings under
+`ram_floor_gb` it kills the task tree at once and fails the job `infra` with "out of memory", which ACT3 re-plans as
+`limit`. Task processes also run at lowered CPU priority (below normal on Windows, nice 10 elsewhere), so the desktop
+and the server stay responsive while a render runs. Our CUDA scripts cap PyTorch at 95% of the card: Windows' driver
+otherwise spills an overflow into system RAM (Sysmem Fallback) instead of failing.
+`~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `host` (the guard), `ramFloor`
+`~/BGit/act3/ai_processing_server/code/internal/hardware/freeram.go` — `FreeRAM`
 
 Paths may start with `~`; the loader expands it. Credentials are **referenced, never inlined**: the file holds paths to
 files under `~/BGit/act3/act3ai-credentials/` or `~/.credentials/`, and `init` writes those paths with a comment telling

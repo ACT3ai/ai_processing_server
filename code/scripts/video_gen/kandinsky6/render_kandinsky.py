@@ -65,7 +65,9 @@ t0 = time.time()
 stage("loading")
 pipe = Kandinsky6TI2VAPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16)
 if x.device == "cuda":
-    gpu_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+    # capped, a GPU overflow fails here instead of spilling into system RAM (Windows' Sysmem Fallback)
+    torch.cuda.set_per_process_memory_fraction(0.95)
+    gpu_gib = 0.95 * torch.cuda.get_device_properties(0).total_memory / 2**30
     part_gib = largest_part_gib(pipe)
     if part_gib + 3 <= gpu_gib:
         pipe.enable_model_cpu_offload()

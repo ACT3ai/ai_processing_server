@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/ACT3ai/ai_processing_server/internal/fsx"
+	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/procs"
 )
 
@@ -70,6 +71,12 @@ var (
 	// MaxDeaths: after this many task hosts for one job died on this machine without finishing (a reboot or a
 	// crash each time, typically a step that takes the machine down), the controller stops starting it here.
 	MaxDeaths = 3
+	// MemoryPoll and MemoryStrikes: the low-memory guard reads the machine's free RAM this often and stops the task
+	// after this many readings in a row under the floor (one dip while weights load is not a reason).
+	MemoryPoll    = time.Second
+	MemoryStrikes = 2
+	// freeRAM is hardware.FreeRAM; tests replace it.
+	freeRAM = hardware.FreeRAM
 )
 
 // Task is task.json: everything the task host needs. Paths are absolute.
@@ -89,6 +96,16 @@ type Task struct {
 	// Steps, when set, replace Argv/Dir/Env: they run in order and each one is a checkpoint. The last step writes
 	// Output. Older controllers that do not know Steps only ever read this file, so RunVersion stays 1.
 	Steps []Step `json:"steps,omitempty"`
+	// MinFreeRAMGB is the low-memory guard's floor (limits.ram_floor_gb); 0 = 5% of the machine's RAM, at least 4 GB.
+	MinFreeRAMGB float64 `json:"min_free_ram_gb,omitempty"`
+}
+
+// ramFloor is the free RAM under which the guard stops the task.
+func ramFloor(set, totalGB float64) float64 {
+	if set > 0 {
+		return set
+	}
+	return max(4, totalGB*0.05)
 }
 
 // Step is one checkpointed part of a task. Weight is its share of the progress bar (0 counts as 1).
@@ -326,6 +343,34 @@ func host(dir string) error {
 			ev.add(Event{Type: "note", Note: strings.TrimPrefix(s, "ACT3_NOTE ")})
 		}
 	}
+	var lowMemory string // the guard's verdict, set before it cancels
+	go func() {
+		// A render that eats the machine's RAM freezes it (a reboot on the 5090, 2026-11-04): stop the render first.
+		tick := time.NewTicker(MemoryPoll)
+		defer tick.Stop()
+		strikes := 0
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+			}
+			free, total, ok := freeRAM()
+			floor := ramFloor(t.MinFreeRAMGB, total)
+			if !ok || free >= floor {
+				strikes = 0
+				continue
+			}
+			if strikes++; strikes < MemoryStrikes {
+				continue
+			}
+			lowMemory = fmt.Sprintf("out of memory: the machine had %.1f GB of RAM free, under the %.1f GB floor "+
+				"(limits.ram_floor_gb), so the render was stopped to keep the machine up", free, floor)
+			line("ACT3_ERROR infra: " + lowMemory)
+			cancel(fmt.Errorf("%w: %s", procs.ErrKillNow, lowMemory))
+			return
+		}
+	}()
 	fmt.Fprintf(logf, "# %s taskhost pid %d, snapshot %s, %d step(s)\n", started.Format(time.RFC3339), os.Getpid(), t.Snapshot, len(steps))
 	var runErr error
 	for n, st := range steps {
@@ -372,6 +417,8 @@ func host(dir string) error {
 		x.Code, x.Cancelled, x.Error = -1, true, "cancelled"
 	case errors.Is(cause, errTimedOut):
 		x.Code, x.TimedOut, x.Error = -1, true, fmt.Sprintf("timed out after %d s", t.TimeoutSeconds)
+	case errors.Is(cause, procs.ErrKillNow):
+		x.Code, x.Error = 1, lowMemory
 	case runErr != nil:
 		x.Code, x.Error = exitCode(runErr), runErr.Error()
 	}

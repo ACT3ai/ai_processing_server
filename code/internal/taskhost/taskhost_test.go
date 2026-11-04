@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ import (
 // The test binary doubles as the task host: Launch starts it again with APS_TASKHOST_TEST=1.
 func TestMain(m *testing.M) {
 	if os.Getenv("APS_TASKHOST_TEST") == "1" {
-		HeartbeatEvery, CancelPoll = 200*time.Millisecond, 100*time.Millisecond
+		HeartbeatEvery, CancelPoll, MemoryPoll = 200*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond
 		os.Exit(Main(os.Args[1:]))
 	}
 	os.Setenv("APS_TASKHOST_TEST", "1")
@@ -134,6 +135,33 @@ func TestCancelStopsTheTree(t *testing.T) {
 	}
 	if _, err := os.Stat(tk.Output); err == nil {
 		t.Fatal("a cancelled task wrote its output")
+	}
+}
+
+// A floor above this machine's RAM trips the real guard: the render is killed at once (no grace) and the exit says
+// out of memory as infra, so the controller fails it as "limit" and production re-plans it.
+func TestLowMemoryStopsTheRender(t *testing.T) {
+	dir := t.TempDir()
+	tk := shTask(dir, "5")
+	tk.MinFreeRAMGB = 1 << 20
+	start := time.Now()
+	if err := Launch(selfHost(), dir, tk); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	x, err := Watch(ctx, dir, nil)
+	if err != nil || x.Code != 1 || x.Cancelled || !strings.Contains(x.Error, "out of memory") || !strings.Contains(x.Tail, "ACT3_ERROR infra: out of memory") {
+		t.Fatalf("%+v %v", x, err)
+	}
+	if d := time.Since(start); d > 8*time.Second {
+		t.Fatalf("killed after %s: the grace period was not skipped", d)
+	}
+	if _, err := os.Stat(tk.Output); err == nil {
+		t.Fatal("a stopped task wrote its output")
+	}
+	if f := ramFloor(0, 128); f != 6.4 || ramFloor(0, 16) != 4 || ramFloor(10, 128) != 10 {
+		t.Fatalf("floors: %g", f)
 	}
 }
 

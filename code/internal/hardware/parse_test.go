@@ -63,3 +63,16 @@ func TestEffectiveMinRule(t *testing.T) {
 		t.Fatalf("want 2 error drifts, got %+v", drift)
 	}
 }
+
+func TestFreeRAMParsers(t *testing.T) {
+	avail, total := ParseMeminfoAvailableGB("MemTotal:       131072000 kB\nMemFree:          1048576 kB\nMemAvailable:    8388608 kB\n")
+	if avail != 8 || total != 125 {
+		t.Fatalf("meminfo: %g of %g", avail, total)
+	}
+	vm := "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               65536.\n" +
+		"Pages active:                            900000.\nPages inactive:                           65536.\nPages speculative:                        0.\n" +
+		"Pages purgeable:                          0.\nPages wired down:                         10.\n"
+	if g := ParseVMStatFreeGB(vm); g != 2 {
+		t.Fatalf("vm_stat: %g", g)
+	}
+}

@@ -39,6 +39,8 @@ type Env struct {
 	Inputs  map[string]string // staged input name → local path
 	Slot    jobs.Slot
 	Engines map[string]*hardware.Engine
+	// MinFreeRAMGB is limits.ram_floor_gb: a detached task is stopped when the machine's free RAM stays under it
+	MinFreeRAMGB float64
 	Logger  *slog.Logger
 }
 

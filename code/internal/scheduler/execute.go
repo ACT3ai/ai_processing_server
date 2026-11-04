@@ -63,7 +63,7 @@ func (s *Server) execute(ctx context.Context, cancel context.CancelCauseFunc, jo
 			}
 		}
 		env := runners.Env{WorkDir: workDir, OutDir: outDir, Inputs: map[string]string{}, Slot: *job.Slot,
-			Engines: engines, Logger: s.log.With("ctx", "runner."+def.Runner, "job_id", job.ID, "service", job.Type)}
+			Engines: engines, MinFreeRAMGB: s.cfg.Limits.RAMFloorGB, Logger: s.log.With("ctx", "runner."+def.Runner, "job_id", job.ID, "service", job.Type)}
 		rep.Log(fmt.Sprintf("attempt %d of %s on %s (timeout %s)", job.Retried+1, job.Type, job.Slot.ID, timeout))
 		if err := runner.Check(ctx, job, env); err != nil {
 			return err

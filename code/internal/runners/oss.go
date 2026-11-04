@@ -312,7 +312,7 @@ func launch(job *jobs.Job, env Env, rep Reporter, dir string, build buildFunc) e
 		timeout = MaxTaskSeconds
 	}
 	task := taskhost.Task{JobID: job.ID, Snapshot: snap.Key, Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output,
-		GPU: env.Slot.GPU, TimeoutSeconds: timeout, Steps: t.Steps, ExpectFrames: t.ExpectFrames}
+		GPU: env.Slot.GPU, TimeoutSeconds: timeout, Steps: t.Steps, ExpectFrames: t.ExpectFrames, MinFreeRAMGB: env.MinFreeRAMGB}
 	if err := os.MkdirAll(filepath.Dir(t.Output), 0o700); err != nil {
 		return jobs.Wrap(jobs.KindInfra, err, "create the output dir")
 	}

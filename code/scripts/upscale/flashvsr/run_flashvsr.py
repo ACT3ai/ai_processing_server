@@ -182,6 +182,8 @@ def init_pipeline():
     pipe.to(DEVICE)
     # A GPU under 16 GB cannot hold the DiT, VAE and decoder at once: keep the DiT's weights in RAM, streamed per layer
     small = DEVICE == "cuda" and torch.cuda.get_device_properties(0).total_memory < 16 * 2**30
+    if DEVICE == "cuda":  # capped, a GPU overflow fails here instead of spilling into system RAM (Windows' Sysmem Fallback)
+        torch.cuda.set_per_process_memory_fraction(0.95)
     pipe.enable_vram_management(num_persistent_param_in_dit=0 if small else None)
     ctx = torch.load(os.path.join(EXAMPLES, "prompt_tensor", "posi_prompt.pth"), map_location="cpu")
     pipe.init_cross_kv(context_tensor=ctx)
