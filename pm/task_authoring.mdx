@@ -401,7 +401,8 @@ snapshot, re-attach to the live one, or collect what it finished while the contr
 timeout it stops the task; on a controller shutdown it leaves it running. Implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/runners/oss.go` — `runDetached`, `stopsTheTask` (the `Reattacher` hook is in runner.go)
 
-Wan 2.2 A14B (t2v, i2v; Lightning when installed) for act3.video_gen_open_source is implemented in code:
+Wan 2.2 A14B (i2v and t2v; Lightning when installed) for act3.video_gen_open_source is implemented in code. Its I2V
+weights are part of the install, not an extra: shots almost always carry a first frame (2026-11-04).
 `~/BGit/act3/ai_processing_server/code/internal/runners/oss_video.go` — `OSSVideo.Check`, `OSSVideo.Run`, `wanTask`
 and the script it runs, a synced copy of the ACT3 original (`code/scripts/sync_from_all.sh`):
 `~/BGit/act3/ai_processing_server/code/scripts/video_gen/wan22/render_wan.py`
@@ -417,7 +418,7 @@ the same variable (`wan-local.ts` `WAN_MODELS`) to pick the model id it sends: s
 
 LTX-2.5 and Kandinsky 6.0 (2026-11-04) run on the same service, picked by the job's model. LTX-2.5 (`ltx-2.5`) runs
 `python -m ltx_pipelines.distilled` from the pinned Lightricks/LTX-2 checkout's venv (the repo is the model's code, not
-snapshotted), text-to-video with audio; on CUDA with `--quantization fp8-cast --offload cpu` so the 22B transformer
+snapshotted), image-to-video from the first frame (`--image <first_frame> 0 1.0`) or text-to-video, with audio; on CUDA with `--quantization fp8-cast --offload cpu` so the 22B transformer
 fits 32 GB (`LTX_ARGS` replaces them). Kandinsky (`kandinsky-6.0-lite`, `kandinsky-6.0-pro`) runs the snapshot's
 render_kandinsky.py; Pro is CUDA only and offloads layer by layer when it does not fit, and the pipeline's audio is
 muxed with the server's ffmpeg. The service is offered when any of its models is installed; a job for a missing one

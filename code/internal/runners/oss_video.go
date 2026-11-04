@@ -15,8 +15,8 @@ import (
 
 // OSSVideo is the runner behind act3.video_gen_open_source: open-source video generation on our own GPUs. The job's
 // model picks the family: Wan 2.2 (below), LTX-2.5 (oss_ltx.go), Kandinsky 6.0 Lite/Pro (oss_kandinsky.go).
-// Model "wan2.2-a14b" (the default): Wan 2.2 A14B text-to-video, or image-to-video from input "first_frame" when the
-// I2V weights are installed, on CUDA (B5090) or Metal (the Mac Studio). It runs code/scripts/video_gen/wan22/
+// Model "wan2.2-a14b" (the default): Wan 2.2 A14B image-to-video from input "first_frame" (the I2V weights are
+// required: shots almost always carry one), or text-to-video, on CUDA (B5090) or Metal (the Mac Studio). It runs code/scripts/video_gen/wan22/
 // render_wan.py from the job's snapshot with the install at ~/act3_render/wan_2_2/ (models are not code, R5).
 //
 // The argv rules are a port of the internal web app's plugin, which stays the reference for limits and flags:
@@ -124,7 +124,7 @@ func (OSSVideo) Check(_ context.Context, job *jobs.Job, env Env) error {
 	var installProblem func() string
 	switch q := kandinskyQuality(p.Model); {
 	case p.Model == LTXModel:
-		if err := ltxCheck(p); err != nil {
+		if err := ltxCheck(job, p); err != nil {
 			return err
 		}
 		installProblem = ltxInstallProblem
@@ -191,7 +191,7 @@ func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (
 		}
 		switch {
 		case p.Model == LTXModel:
-			return ltxTask(p, out, w, h, frames), nil
+			return ltxTask(p, inputs["first_frame"], out, w, h, frames), nil
 		case kandinskyQuality(p.Model) != "":
 			return kandinskyTask(snap, env, p, inputs["first_frame"], out, w, h, frames), nil
 		}

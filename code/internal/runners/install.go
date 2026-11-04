@@ -29,14 +29,19 @@ func InstallProblems() map[string]string {
 	return m
 }
 
-// wanInstallProblem checks what every job of one Wan 2.2 model needs: the venv and that model's diffusers weights.
+// wanInstallProblem checks what every job of one Wan 2.2 model needs: the venv and that model's diffusers weights,
+// image-to-video included (shots almost always carry a first frame).
 func wanInstallProblem(model string) string {
 	m, ok := wanModels[model]
 	if !ok {
 		return fmt.Sprintf("Wan model %q (ACT3_WAN_MODEL) is not one this server renders: %s", model, strings.Join(wanModelIDs(), ", "))
 	}
 	home := wanHome()
-	for _, f := range []string{venvPython(home), filepath.Join(home, "models", m.dir, "model_index.json")} {
+	need := []string{venvPython(home), filepath.Join(home, "models", m.dir, "model_index.json")}
+	if m.i2vDir != "" {
+		need = append(need, filepath.Join(home, "models", m.i2vDir, "model_index.json"))
+	}
+	for _, f := range need {
 		if !fileAtLeast(f, 1) {
 			return fmt.Sprintf("Wan 2.2 is not installed on this server: missing %s (install guide: ~/BGit/all/app/smartc/film/servers/bms/oss_video/wan_2_2/)", f)
 		}

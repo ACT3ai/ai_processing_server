@@ -104,6 +104,22 @@ func TestWan5BArgv(t *testing.T) {
 	if why := wanInstallProblem("wan2.2-nope"); !strings.Contains(why, "wan2.2-ti2v-5b") {
 		t.Fatalf("unknown model: %q", why)
 	}
+	// A14B is installed only with its I2V weights; the 5B renders image-to-video from its own folder
+	home := t.TempDir()
+	t.Setenv("ACT3_RENDER_HOME", home)
+	touch(t, venvPython(filepath.Join(home, "wan_2_2")), 1)
+	touch(t, filepath.Join(home, "wan_2_2", "models", "Wan2.2-T2V-A14B-Diffusers", "model_index.json"), 1)
+	touch(t, filepath.Join(home, "wan_2_2", "models", "Wan2.2-TI2V-5B-Diffusers", "model_index.json"), 1)
+	if why := wanInstallProblem(WanModel); !strings.Contains(why, "Wan2.2-I2V-A14B-Diffusers") {
+		t.Fatalf("A14B without I2V: %q", why)
+	}
+	if why := wanInstallProblem("wan2.2-ti2v-5b"); why != "" {
+		t.Fatalf("5B: %q", why)
+	}
+	touch(t, filepath.Join(home, "wan_2_2", "models", "Wan2.2-I2V-A14B-Diffusers", "model_index.json"), 1)
+	if why := wanInstallProblem(WanModel); why != "" {
+		t.Fatalf("A14B with I2V: %q", why)
+	}
 }
 
 // seedvr2-cli.ts seedvr2Argv for the Mac Studio and the 5090.

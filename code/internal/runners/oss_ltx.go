@@ -10,7 +10,7 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 )
 
-// LTX-2.5 (model "ltx-2.5") for act3.video_gen_open_source: text-to-video WITH audio through the official pipeline,
+// LTX-2.5 (model "ltx-2.5") for act3.video_gen_open_source: text- or image-to-video WITH audio through the official pipeline,
 // `python -m ltx_pipelines.distilled` in the pinned Lightricks/LTX-2 checkout at ~/act3_render/ltx_2_5/LTX-2 (the
 // install is the BMS child's recipes: ~/BGit/all/app/smartc/film/servers/bms/oss_video/ltx_2_5/). The repo is the
 // model's code, like weights: it is not frozen into the snapshot.
@@ -68,9 +68,12 @@ func ltxInstallProblem() string {
 	return ""
 }
 
-func ltxCheck(p videoParams) error {
-	if p.Kind != "t2v" {
-		return jobs.Errf(jobs.KindInvalidInput, "LTX-2.5 runs text-to-video here; %s is not wired yet (ltx_2_5.mdx §12.3)", p.Kind)
+func ltxCheck(job *jobs.Job, p videoParams) error {
+	if p.Kind != "t2v" && p.Kind != "i2v" {
+		return jobs.Errf(jobs.KindInvalidInput, "LTX-2.5 makes video from text or a first frame, not %q", p.Kind)
+	}
+	if p.Kind == "i2v" && !hasInput(job, "first_frame") {
+		return jobs.Errf(jobs.KindInvalidInput, "an i2v job needs the input \"first_frame\"")
 	}
 	if p.DurationSeconds <= 0 || p.DurationSeconds > float64(ltxMaxFrames)/ltxFPS+0.01 {
 		return jobs.Errf(jobs.KindInvalidInput, "LTX-2.5 makes at most %.1f s per clip here", float64(ltxMaxFrames)/ltxFPS)
@@ -87,7 +90,7 @@ func ltxFrame(p videoParams) (w, h, frames int) {
 	return
 }
 
-func ltxTask(p videoParams, out string, w, h, frames int) detachedTask {
+func ltxTask(p videoParams, image, out string, w, h, frames int) detachedTask {
 	home := ltxHome()
 	repo := filepath.Join(home, "LTX-2")
 	seed := int64(42)
@@ -106,6 +109,9 @@ func ltxTask(p videoParams, out string, w, h, frames int) detachedTask {
 		"--seed", fmt.Sprint(seed),
 		"--prompt", truncate(strings.TrimSpace(p.Prompt), 4000),
 		"--output-path", out,
+	}
+	if p.Kind == "i2v" && image != "" {
+		argv = append(argv, "--image", image, "0", "1.0") // frame 0 at full strength: the clip starts on the shot's frame
 	}
 	extra := os.Getenv("LTX_ARGS")
 	if extra == "" && accelerator() == "cuda" {

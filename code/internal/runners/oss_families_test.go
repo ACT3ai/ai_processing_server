@@ -58,19 +58,22 @@ func TestLTXArgv(t *testing.T) {
 	if w != 1280 || h != 704 || fr != 121 {
 		t.Fatalf("frame: %dx%d %d", w, h, fr)
 	}
-	a := ltxTask(p, "/o.mp4", w, h, fr)
+	a := ltxTask(p, "/in/first.png", "/o.mp4", w, h, fr)
 	if a.Argv[0] != venvPython("/r/ltx_2_5/LTX-2") || a.Argv[1] != "-m" || a.Argv[2] != "ltx_pipelines.distilled" || a.Dir != "/r/ltx_2_5/LTX-2" {
 		t.Fatalf("program: %v in %s", a.Argv[:3], a.Dir)
 	}
 	if argOf(a.Argv, "--num-frames") != "121" || argOf(a.Argv, "--frame-rate") != "24" || argOf(a.Argv, "--output-path") != "/o.mp4" {
 		t.Fatalf("flags: %v", a.Argv)
 	}
+	if slices.Contains(a.Argv, "--image") {
+		t.Fatalf("t2v must not pass an image: %v", a.Argv)
+	}
 	if want := runtime.GOOS != "darwin"; slices.Contains(a.Argv, "fp8-cast") != want {
 		t.Fatalf("CUDA memory flags (want %v): %v", want, a.Argv)
 	}
 	t.Setenv("LTX_ARGS", "--offload disk")
 	t.Setenv("LTX_TRANSFORMER_PATH", "/fp8.safetensors")
-	a = ltxTask(p, "/o.mp4", w, h, fr)
+	a = ltxTask(p, "/in/first.png", "/o.mp4", w, h, fr)
 	if slices.Contains(a.Argv, "fp8-cast") || argOf(a.Argv, "--offload") != "disk" || argOf(a.Argv, "--transformer-path") != "/fp8.safetensors" {
 		t.Fatalf("overrides: %v", a.Argv)
 	}
@@ -78,10 +81,17 @@ func TestLTXArgv(t *testing.T) {
 	if _, _, fr := ltxFrame(videoParams{Width: 1280, Height: 704, Frames: &n, FPS: 16}); fr != 121 {
 		t.Fatalf("frames from 16 fps: %d", fr)
 	}
-	if err := ltxCheck(videoParams{Kind: "i2v", DurationSeconds: 5}); kindOf(err) != jobs.KindInvalidInput {
-		t.Fatalf("i2v must be refused: %v", err)
+	p.Kind = "i2v"
+	if a = ltxTask(p, "/in/first.png", "/o.mp4", w, h, fr); argOf(a.Argv, "--image") != "/in/first.png" || a.Argv[slices.Index(a.Argv, "--image")+2] != "0" {
+		t.Fatalf("i2v must condition frame 0 on the first frame: %v", a.Argv)
 	}
-	if err := ltxCheck(videoParams{Kind: "t2v", DurationSeconds: 11}); kindOf(err) != jobs.KindInvalidInput {
+	if err := ltxCheck(familyJob(nil), videoParams{Kind: "i2v", DurationSeconds: 5}); kindOf(err) != jobs.KindInvalidInput {
+		t.Fatalf("i2v without a first frame must be refused: %v", err)
+	}
+	if err := ltxCheck(familyJob(nil, "first_frame"), videoParams{Kind: "i2v", DurationSeconds: 5}); err != nil {
+		t.Fatalf("i2v with a first frame: %v", err)
+	}
+	if err := ltxCheck(familyJob(nil), videoParams{Kind: "t2v", DurationSeconds: 11}); kindOf(err) != jobs.KindInvalidInput {
 		t.Fatalf("11 s must be refused: %v", err)
 	}
 }
