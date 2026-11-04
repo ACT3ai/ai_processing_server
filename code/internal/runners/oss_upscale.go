@@ -190,7 +190,7 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 			argv = append(argv, "--dit_offload_device", "cpu", "--blocks_to_swap", fmt.Sprint(swap))
 		}
 	}
-	if accel == "mps" && short >= 1080 {
+	if (accel == "mps" && short >= 1080) || (accel == "cuda" && short >= nvidiaHighRes) {
 		argv = append(argv, "--vae_encode_tiled")
 	}
 	if (accel == "mps" && short >= 1080) || short >= nvidiaHighRes {
@@ -221,6 +221,8 @@ const nvidiaHighRes = 1440
 
 func nvidiaBatch(size string, short int) int {
 	switch {
+	case size == "3b" && short >= nvidiaHighRes:
+		return 9 // 21 at 4K ran out of the 5090; 9 peaks at 27 GB (measured 2026-11-04)
 	case size == "3b":
 		return 21
 	case short >= nvidiaHighRes:
