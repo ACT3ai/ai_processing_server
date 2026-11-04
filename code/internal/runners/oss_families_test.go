@@ -96,7 +96,7 @@ func TestLTXArgv(t *testing.T) {
 	}
 }
 
-// Kandinsky: Pro takes 50 steps at guidance 5, Lite 10 at 1; i2v passes the first frame; frames 4n+1 up to 121.
+// Kandinsky: Pro-distill and Lite-distill both take 10 steps at guidance 1; i2v passes the first frame; frames 4n+1 up to 121.
 func TestKandinskyArgv(t *testing.T) {
 	t.Setenv("ACT3_RENDER_HOME", "/r")
 	snap := snapshot.Snapshot{Key: "k", Dir: "/snap/k"}
@@ -106,10 +106,10 @@ func TestKandinskyArgv(t *testing.T) {
 		t.Fatalf("frame: %dx%d %d", w, h, fr)
 	}
 	a := kandinskyTask(snap, Env{}, p, "/in/first.png", "/o.mp4", w, h, fr).Argv
-	if a[1] != "/snap/k/code/scripts/video_gen/kandinsky6/render_kandinsky.py" || argOf(a, "--model") != "/r/kandinsky_6/models/Kandinsky-6.0-Pro-5s-Diffusers" {
+	if a[1] != "/snap/k/code/scripts/video_gen/kandinsky6/render_kandinsky.py" || argOf(a, "--model") != "/r/kandinsky_6/models/Kandinsky-6.0-Pro-distill-5s-Diffusers" {
 		t.Fatalf("script/model: %v", a)
 	}
-	if argOf(a, "--steps") != "50" || argOf(a, "--guidance") != "5.0" || argOf(a, "--image") != "/in/first.png" || argOf(a, "--fps") != "24" {
+	if argOf(a, "--steps") != "10" || argOf(a, "--guidance") != "1.0" || argOf(a, "--image") != "/in/first.png" || argOf(a, "--fps") != "24" {
 		t.Fatalf("pro flags: %v", a)
 	}
 	p.Model, p.Kind = "kandinsky-6.0-lite", "t2v"

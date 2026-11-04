@@ -14,9 +14,10 @@ import (
 // Kandinsky 6.0 Video (models "kandinsky-6.0-lite" and "kandinsky-6.0-pro") for act3.video_gen_open_source, INTERNAL
 // EVALUATION ONLY: code/scripts/video_gen/kandinsky6/render_kandinsky.py from the job's snapshot, a synced copy of
 // ~/BGit/all/film/code/subp/video_gen_ai/kandinsky/video_pro_6_0/local/render_kandinsky.py, with the install at
-// ~/act3_render/kandinsky_6/ (the BMS child's recipes). Lite-distill (3B) runs on CUDA and MPS; Pro (29B, what
-// production sends) is CUDA only, offloaded layer by layer when it does not fit the GPU. The clip carries the
-// pipeline's audio. Port of kandinsky-local.ts: 24 fps, at most 121 frames (5 s), sides multiple of 16.
+// ~/act3_render/kandinsky_6/ (the BMS child's recipes). Lite-distill (3B) runs on CUDA and MPS; Pro-distill (what
+// production sends) is CUDA only, its 56 GB transformer streamed to the GPU in block groups. Both are the 10-step
+// distilled checkpoints at guidance 1 (the 50-step Pro took ~4.7 min a step on the 5090, 2026-11-04). The clip carries
+// the pipeline's audio. Port of kandinsky-local.ts: 24 fps, at most 121 frames (5 s), sides multiple of 16.
 // Spec: kandinsky_video_pro_6_0.mdx §10.6, §12.3.
 const (
 	kandinskyFPS       = 24
@@ -26,7 +27,7 @@ const (
 
 var kandinskyCheckpoints = map[string]struct{ dir, env string }{
 	"lite": {"Kandinsky-6.0-Lite-distill-5s-Diffusers", "KANDINSKY_LITE_DIR"},
-	"pro":  {"Kandinsky-6.0-Pro-5s-Diffusers", "KANDINSKY_PRO_DIR"},
+	"pro":  {"Kandinsky-6.0-Pro-distill-5s-Diffusers", "KANDINSKY_PRO_DIR"},
 }
 
 func kandinskyHome() string { return renderHome("kandinsky_6") }
@@ -86,10 +87,7 @@ func kandinskyFrame(p videoParams) (w, h, frames int) {
 
 func kandinskyTask(snap snapshot.Snapshot, env Env, p videoParams, image, out string, w, h, frames int) detachedTask {
 	q := kandinskyQuality(p.Model)
-	steps, guidance := 10, "1.0" // Lite-distill: 10 steps, no CFG
-	if q == "pro" {
-		steps, guidance = 50, "5.0"
-	}
+	steps, guidance := 10, "1.0" // both checkpoints are distilled: 10 steps, no CFG
 	if p.Steps != nil && *p.Steps > 0 {
 		steps = *p.Steps
 	}

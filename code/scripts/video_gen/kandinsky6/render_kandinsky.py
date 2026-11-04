@@ -8,8 +8,9 @@ Generalizes the BMS smoke test (~/BGit/all/app/smartc/film/servers/bms/oss_video
 including its audio: the pipeline returns 44.1 kHz audio with the video, written to a WAV and muxed as AAC with ffmpeg
 ($ACT3_FFMPEG, else ffmpeg on PATH). Prints "ACT3_PROGRESS <pct>" per step and "ACT3_STAGE <name>".
 
-On CUDA it offloads whole components (model offload) when the largest one fits the GPU with headroom, and layer by
-layer (sequential offload) when it does not: Pro's 29B transformer does not fit the RTX 5090's 32 GB in BF16.
+On CUDA it offloads whole components (model offload) when the largest one fits the GPU with headroom, and streams
+block groups to the GPU (group offload with CUDA streams) when it does not: Pro's 56 GB transformer does not fit the
+RTX 5090's 32 GB in BF16.
 On MPS an unsupported op is a FINDING, not a bug: the stderr tail says which op.
 Spec: ~/BGit/all/film/pm/subp/video_gen_ai/kandinsky/video_pro_6_0/kandinsky_video_pro_6_0.mdx §10.6, §12.3.
 """
@@ -74,11 +75,24 @@ if x.device == "cuda":
     if part_gib + 3 <= gpu_gib:
         pipe.enable_model_cpu_offload()
     else:
+        # Weights streamed to the GPU while it computes (each layer's copy overlaps the one before it); the math stays
+        # on the GPU. Layer-by-layer sequential offload, which waits for every copy, took ~4.7 min a step for Pro on the
+        # 5090. leaf_level splits any component, the 15 GB Qwen text encoder included; low_cpu_mem_usage pins as it goes
+        # rather than a second copy of the whole model.
         print(
-            f"ACT3_NOTE low VRAM: offloading layer by layer (largest part {part_gib:.1f} GiB, GPU {gpu_gib:.1f} GiB)",
+            f"ACT3_NOTE low VRAM: streaming blocks to the GPU (largest part {part_gib:.1f} GiB, GPU {gpu_gib:.1f} GiB)",
             flush=True,
         )
-        pipe.enable_sequential_cpu_offload()
+        from diffusers.hooks import apply_group_offloading
+
+        for name, part in pipe.components.items():
+            if not isinstance(part, torch.nn.Module):
+                continue
+            if sum(t.numel() * t.element_size() for t in part.parameters()) < 4 * 2**30:
+                part.to("cuda")  # the VAEs, vocoder and CLIP stay whole: the audio VAE's decode reads weights outside hooks
+            else:
+                apply_group_offloading(part, onload_device=torch.device("cuda"), offload_device=torch.device("cpu"),
+                                       offload_type="leaf_level", use_stream=True, low_cpu_mem_usage=True)
     # decoding 121 frames at 720p in one pass wanted 8.4 GiB more than the 5090 had left (2026-11-04)
     pipe.vae.enable_tiling()
 else:
