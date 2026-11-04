@@ -324,6 +324,11 @@ check-secrets:
     if [ -n "$hits" ]; then echo "PRIVATE KEY material in tracked files (revoke that key, then remove it):"; echo "$hits"; exit 1; fi
     echo "check-secrets: no private keys in tracked files"
 
+# \x22 instead of a double quote: Windows PowerShell 5.1 strips double quotes from a native command's arguments
+[windows]
+check-secrets:
+    $hits = @(git grep -l -E '^-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' -- . ':!*_test.go') + @(git grep -l -P '\x22d\x22[[:space:]]*:' -- '*.json' '*.jwk'); if ($hits.Count) { Write-Output 'PRIVATE KEY material in tracked files (revoke that key, then remove it):'; $hits; exit 1 }; Write-Output 'check-secrets: no private keys in tracked files'
+
 # Go unit tests next to the code
 test-go:
     go vet -C code ./...
