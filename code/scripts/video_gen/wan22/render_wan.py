@@ -25,7 +25,7 @@ float32 VAE (its model card), no Lightning, and image-to-video from the same fol
 On CUDA PyTorch is capped at 95% of the card, so an overflow fails here instead of spilling into system RAM (the
 Windows driver's Sysmem Fallback froze the 5090). It offloads whole components (model offload) when the largest one
 fits under that cap with 4 GiB to spare, and layer by layer (sequential offload, slower) when it does not or when a
-render still runs out of GPU memory, so A14B renders on the 5090 and the 5B on an 8 GB card.
+render still runs out of GPU memory, so A14B renders on a 32 GB card and the 5B on an 8 GB one.
 """
 import argparse
 import importlib.util
@@ -193,7 +193,7 @@ if pair_found:
 t0 = time.time()
 stage("loading")
 # Read each shard and let it go: with mmap, Windows keeps every fp32 shard of an expert mapped while its bf16 copy is
-# built, and loading A14B's second expert took the 5090 to 3 GB free (2026-11-04).
+# built, and loading A14B's second expert nearly exhausted a 128 GB machine's RAM.
 extra_load = {"disable_mmap": True}
 if cfg.get("expand_timesteps"):
     from diffusers import AutoencoderKLWan
@@ -236,7 +236,7 @@ def offload_layer_by_layer(why):
 
 if x.device == "cuda":
     # Windows' driver puts a CUDA allocation that does not fit the card into system RAM instead of failing (Sysmem
-    # Fallback), which froze the 5090 on 2026-11-04: capped, an overflow is an out-of-memory error here instead.
+    # Fallback), which can freeze the machine: capped, an overflow is an out-of-memory error here instead.
     torch.cuda.set_per_process_memory_fraction(VRAM_FRACTION)
     cap_gib = VRAM_FRACTION * torch.cuda.get_device_properties(0).total_memory / 2**30
     part_gib = largest_part_gib(pipe)

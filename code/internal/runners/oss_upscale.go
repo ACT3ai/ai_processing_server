@@ -222,7 +222,7 @@ const nvidiaHighRes = 1440
 func nvidiaBatch(size string, short int) int {
 	switch {
 	case size == "3b" && short >= nvidiaHighRes:
-		return 9 // 21 at 4K ran out of the 5090; 9 peaks at 27 GB (measured 2026-11-04)
+		return 9 // 21 at 4K runs a 32 GB card out of memory; 9 peaks at ~27 GB
 	case size == "3b":
 		return 21
 	case short >= nvidiaHighRes:

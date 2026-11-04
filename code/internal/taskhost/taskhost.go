@@ -345,7 +345,7 @@ func host(dir string) error {
 	}
 	var lowMemory string // the guard's verdict, set before it cancels
 	go func() {
-		// A render that eats the machine's RAM freezes it (a reboot on the 5090, 2026-11-04): stop the render first.
+		// A render that eats the machine's RAM freezes it until a reboot: stop the render first.
 		tick := time.NewTicker(MemoryPoll)
 		defer tick.Stop()
 		strikes := 0

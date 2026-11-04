@@ -70,7 +70,7 @@ func Fetch(ctx context.Context, in jobs.Input, dir string, allowLocal bool) (str
 var reExt = regexp.MustCompile(`^\.[A-Za-z0-9]{1,8}$`)
 
 // sourceExt keeps the source's extension when the input's name has none: tools decide by it (SeedVR2's CLI refused
-// "in/source_video" as "Unsupported input type"; PC-10, 2026-11-04).
+// "in/source_video" as "Unsupported input type").
 func sourceExt(in jobs.Input) string {
 	if filepath.Ext(in.Name) != "" {
 		return ""

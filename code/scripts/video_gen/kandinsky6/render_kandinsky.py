@@ -65,7 +65,7 @@ if x.image and not os.path.exists(x.image):
 t0 = time.time()
 stage("loading")
 # mmap stays on: the weights are already bf16, so tensors use the mapped file as is. Pro's transformer is ONE 65 GB file,
-# and disable_mmap read it whole before copying it, which took the 5090 to 2.6 GB free (2026-11-04).
+# and disable_mmap read it whole before copying it, which nearly exhausted a 128 GB machine's RAM.
 pipe = Kandinsky6TI2VAPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16)
 if x.device == "cuda":
     # capped, a GPU overflow fails here instead of spilling into system RAM (Windows' Sysmem Fallback)
@@ -93,7 +93,7 @@ if x.device == "cuda":
             else:
                 apply_group_offloading(part, onload_device=torch.device("cuda"), offload_device=torch.device("cpu"),
                                        offload_type="leaf_level", use_stream=True, low_cpu_mem_usage=True)
-    # decoding 121 frames at 720p in one pass wanted 8.4 GiB more than the 5090 had left (2026-11-04)
+    # decoding 121 frames at 720p in one pass wants ~8 GiB more than a 32 GB card has left
     pipe.vae.enable_tiling()
 else:
     pipe.to("mps")

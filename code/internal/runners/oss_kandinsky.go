@@ -16,7 +16,7 @@ import (
 // ~/BGit/all/film/code/subp/video_gen_ai/kandinsky/video_pro_6_0/local/render_kandinsky.py, with the install at
 // ~/act3_render/kandinsky_6/ (the BMS child's recipes). Lite-distill (3B) runs on CUDA and MPS; Pro-distill (what
 // production sends) is CUDA only, its 56 GB transformer streamed to the GPU in block groups. Both are the 10-step
-// distilled checkpoints at guidance 1 (the 50-step Pro took ~4.7 min a step on the 5090, 2026-11-04). The clip carries
+// distilled checkpoints at guidance 1 (the 50-step Pro takes minutes a step when streamed on a 32 GB card). The clip carries
 // the pipeline's audio. Port of kandinsky-local.ts: 24 fps, at most 121 frames (5 s), sides multiple of 16.
 // Spec: kandinsky_video_pro_6_0.mdx §10.6, §12.3.
 const (

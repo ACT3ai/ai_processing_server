@@ -9,7 +9,7 @@ import (
 )
 
 // The runner reads params.model; the model fence checks the envelope's. A caller that sets only the envelope's model
-// used to get the runner's default model (a FlashVSR job ran as SeedVR2 on PC-10, 2026-11-04).
+// used to get the runner's default model (a FlashVSR job once ran as SeedVR2).
 func TestEnvelopeModelReachesTheRunner(t *testing.T) {
 	model := func(params string, envModel string) (string, error) {
 		local, err := toLocalEnvelope(&queue.Envelope{JobID: "j", Caller: "local", Service: "s", Model: envModel, Params: json.RawMessage(params)})

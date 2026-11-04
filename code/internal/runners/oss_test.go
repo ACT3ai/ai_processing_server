@@ -138,7 +138,7 @@ func TestSeedVR2Argv(t *testing.T) {
 		!slices.Contains(a, "--vae_encode_tiled") || !slices.Contains(a, "--vae_decode_tiled") {
 		t.Fatalf("5090 7B 4K: %v", a)
 	}
-	// 3B at 4K: 21 frames per batch ran out of the 5090; 9 fits (measured 2026-11-04). 1080p keeps 21.
+	// 3B at 4K: 21 frames per batch runs a 32 GB card out of memory; 9 fits. 1080p keeps 21.
 	a = seedvr2Task(upscaleParams{Quality: "standard", Width: 3840, Height: 2160}, "/in.mp4", "/out.mp4", "cuda").Argv
 	if argOf(a, "--batch_size") != "9" || slices.Contains(a, "--blocks_to_swap") || !slices.Contains(a, "--vae_encode_tiled") {
 		t.Fatalf("5090 3B 4K: %v", a)
@@ -485,7 +485,7 @@ func TestDiskFullIsInfra(t *testing.T) {
 	}
 }
 
-// The error a script prints on stderr can be read before its last stdout progress line (PC-10 run, 2026-11-04).
+// The error a script prints on stderr can be read before its last stdout progress line.
 func TestLastLineSkipsOurGrammar(t *testing.T) {
 	tail := "ACT3_STAGE rendering\nRuntimeError: CUDA out of memory\nACT3_PROGRESS 100.0\n"
 	if l := lastLine(tail); l != "RuntimeError: CUDA out of memory" {
@@ -494,7 +494,7 @@ func TestLastLineSkipsOurGrammar(t *testing.T) {
 	if l := lastLine("ACT3_PROGRESS 10.0\n"); l != "no output" {
 		t.Errorf("only progress: got %q", l)
 	}
-	// SeedVR2 on PC-10, 2026-11-04: the error, then a cleanup section and its sponsor banner
+	// SeedVR2's output: the error, then a cleanup section and its sponsor banner
 	seedvr2 := "torch.OutOfMemoryError: Allocation on device 0 would exceed allowed memory. (out of memory)\n" +
 		"[08:39:12.928] Process 2816552 terminating - VRAM will be automatically freed\n" +
 		"[08:39:12.928] Questions? Updates? Watch, star & sponsor if you can!\n" +
