@@ -216,7 +216,7 @@ def largest_8n1_leq(n):
 
 def prepare(frames, scale):
     n, h0, w0, _ = frames.shape
-    sW, sH = int(round(w0 * scale)), int(round(h0 * scale))
+    sW, sH = 2 * round(w0 * scale / 2), 2 * round(h0 * scale / 2)  # even: libx264 yuv420p refuses odd sides
     tW, tH = math.ceil(sW / BLOCK) * BLOCK, math.ceil(sH / BLOCK) * BLOCK
     idx = list(range(n)) + [n - 1] * 4
     Fn = largest_8n1_leq(len(idx))
