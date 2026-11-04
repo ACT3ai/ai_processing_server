@@ -406,6 +406,15 @@ Wan 2.2 A14B (t2v, i2v; Lightning when installed) for act3.video_gen_open_source
 and the script it runs, a synced copy of the ACT3 original (`code/scripts/sync_from_all.sh`):
 `~/BGit/act3/ai_processing_server/code/scripts/video_gen/wan22/render_wan.py`
 
+Which Wan model a machine renders (2026-11-04): `ACT3_WAN_MODEL` in the server's own environment, `wan2.2-a14b`
+when unset, or `wan2.2-ti2v-5b` on a GPU that cannot hold A14B. The service catalog's `model_env` / `models:`
+(`data/services/act3.video_gen_open_source.yaml`) sizes the offer from it (5B: 6 GB VRAM, 48 GB RAM per job), and an
+unknown name stops the server at load. The runner keeps each model's folder, fps and limits (`wanModels`), and a job's
+frame count made at another fps keeps its duration (production counts 81 at 16 fps; the 5B renders 121 at 24).
+render_wan.py offloads layer by layer when the model's largest part does not fit the GPU. The internal web app reads
+the same variable (`wan-local.ts` `WAN_MODELS`) to pick the model id it sends: set it for both processes.
+`~/BGit/act3/ai_processing_server/code/internal/config/load.go` — `ServiceDef.pickModel`
+
 SeedVR2 upscaling for act3.upscale_open_source (Mac Studio profile on Metal, RTX 5090 profile on CUDA) is
 implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/runners/oss_upscale.go` — `OSSUpscale.Check`, `OSSUpscale.Run`, `seedvr2Task`

@@ -73,6 +73,39 @@ func TestWanArgv(t *testing.T) {
 	}
 }
 
+// TI2V-5B: its own folder (image-to-video from the same weights), 24 fps, sides of 32, no Lightning, full steps.
+func TestWan5BArgv(t *testing.T) {
+	t.Setenv("ACT3_RENDER_HOME", "/r")
+	p := videoParams{Model: "wan2.2-ti2v-5b", Kind: "i2v", Prompt: "a boat", Width: 1920, Height: 1080, DurationSeconds: 5}
+	w, h, fr := wanFrame(p)
+	if w != 1248 || h != 704 || fr != 121 {
+		t.Fatalf("frame: %dx%d %d", w, h, fr)
+	}
+	a := wanTask(snapshot.Snapshot{Key: "k", Dir: "/snap/k"}, p, "/in.png", "/o.mp4", w, h, fr).Argv
+	if argOf(a, "--model") != "/r/wan_2_2/models/Wan2.2-TI2V-5B-Diffusers" || argOf(a, "--i2v-model") != argOf(a, "--model") {
+		t.Fatalf("model dirs: %v", a)
+	}
+	if argOf(a, "--fps") != "24" || argOf(a, "--lightning") != "" || argOf(a, "--steps-full") != "" || argOf(a, "--steps") == "4" {
+		t.Fatalf("5B flags: %v", a)
+	}
+	n := 81 // production counts 5 s at 16 fps; the 5B keeps the 5 s at its 24
+	if _, _, fr := wanFrame(videoParams{Model: "wan2.2-ti2v-5b", Width: 1280, Height: 720, Frames: &n, FPS: 16}); fr != 121 {
+		t.Fatalf("frames at 24 fps: %d", fr)
+	}
+	if _, _, fr := wanFrame(videoParams{Width: 1280, Height: 720, Frames: &n, FPS: 16}); fr != 81 {
+		t.Fatalf("A14B frames: %d", fr)
+	}
+	t.Setenv("ACT3_WAN_MODEL", "wan2.2-ti2v-5b")
+	q := videoParams{Prompt: "x"}
+	q.defaults()
+	if q.Model != "wan2.2-ti2v-5b" {
+		t.Fatalf("machine model not the default: %q", q.Model)
+	}
+	if why := wanInstallProblem("wan2.2-nope"); !strings.Contains(why, "wan2.2-ti2v-5b") {
+		t.Fatalf("unknown model: %q", why)
+	}
+}
+
 // seedvr2-cli.ts seedvr2Argv for the Mac Studio and the 5090.
 func TestSeedVR2Argv(t *testing.T) {
 	t.Setenv("ACT3_RENDER_HOME", "/r")

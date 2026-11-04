@@ -238,6 +238,17 @@ type ServiceDef struct {
 	Timeouts           ServiceTimeouts `yaml:"timeouts" json:"timeouts"`
 	Retry              RetryPolicy     `yaml:"retry" json:"retry"`
 	PlatformJobTypes   []string        `yaml:"platform_job_types" json:"platform_job_types,omitempty"`
+	// ModelEnv names the environment variable that picks which of Models this machine renders; that model's
+	// requirements replace the defaults above (a smaller model offered on a smaller GPU).
+	ModelEnv string               `yaml:"model_env" json:"model_env,omitempty"`
+	Models   map[string]ModelNeed `yaml:"models" json:"models,omitempty"`
+}
+
+// ModelNeed is what one model of a multi-model service needs, where it differs from the service's defaults.
+type ModelNeed struct {
+	MinVRAMGB       float64   `yaml:"min_vram_gb" json:"min_vram_gb,omitempty"`
+	MinUnifiedMemGB float64   `yaml:"min_unified_memory_gb" json:"min_unified_memory_gb,omitempty"`
+	ResourcesPerJob Resources `yaml:"resources_per_job" json:"resources_per_job"`
 }
 
 type Requires struct {

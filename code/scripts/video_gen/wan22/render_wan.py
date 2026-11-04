@@ -18,9 +18,16 @@ The Lightning pair (lightx2v/Wan2.2-Lightning) is one LoRA per expert: high_nois
 `transformer`, low_noise_model.safetensors into `transformer_2` (diffusers >= 0.35 `load_into_transformer_2`).
 T2V and I2V have their own pair (--lightning, --lightning-i2v). When no pair is loaded and the plugin passed
 --steps-full, that step count is used instead of the 4-step Lightning count.
+
+Wan2.2-TI2V-5B (ACT3_WAN_MODEL=wan2.2-ti2v-5b, for GPUs that cannot hold A14B) runs through the same script: its
+model_index.json has one transformer (no boundary_ratio) and expand_timesteps, so it takes one guidance scale, a
+float32 VAE (its model card), no Lightning, and image-to-video from the same folder (--i2v-model = --model).
+On CUDA the script offloads whole components (model offload) when the largest one fits the GPU with headroom, and
+layer by layer (sequential offload, slower) when it does not, so the 5B renders on an 8 GB card.
 """
 import argparse
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -92,6 +99,24 @@ def lora_pair(folder):
     return (high, low) if os.path.exists(high) and os.path.exists(low) else None
 
 
+def model_config(folder):
+    try:
+        with open(os.path.join(folder, "model_index.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def largest_part_gib(p):
+    """The biggest component's weights: model offload moves one component at a time onto the GPU."""
+    sizes = [
+        sum(t.numel() * t.element_size() for t in m.parameters())
+        for m in p.components.values()
+        if isinstance(m, torch.nn.Module)
+    ]
+    return max(sizes, default=0) / 2**30
+
+
 def first_frame(path, width, height):
     """The first frame cropped to the target aspect (centre) and sized to width x height."""
     from PIL import Image
@@ -126,7 +151,11 @@ if x.image:
             flush=True,
         )
 
-pair_found = lora_pair(x.lightning_i2v if i2v else x.lightning)
+cfg = model_config(x.i2v_model if i2v else x.model)
+# A14B: two experts switched at boundary_ratio. TI2V-5B: one transformer, boundary_ratio null. No readable config:
+# the A14B behaviour this script always had.
+two_experts = cfg.get("boundary_ratio") is not None if cfg else True
+pair_found = lora_pair(x.lightning_i2v if i2v else x.lightning) if two_experts else None
 # Fail in a second, before loading two 14B experts, when the venv lacks what this run needs. A job on 2026-10-27
 # loaded both experts, then died at load_lora_weights because peft was missing (~/to/1_22.txt).
 missing = [m for m in (["peft"] if pair_found else []) + ["imageio"] if importlib.util.find_spec(m) is None]
@@ -157,16 +186,25 @@ if pair_found:
 
 t0 = time.time()
 stage("loading")
+extra_load = {}
+if cfg.get("expand_timesteps"):
+    from diffusers import AutoencoderKLWan
+
+    extra_load["vae"] = AutoencoderKLWan.from_pretrained(
+        x.i2v_model if i2v else x.model, subfolder="vae", torch_dtype=torch.float32
+    )
 if i2v:
     from diffusers import WanImageToVideoPipeline
 
-    pipe = WanImageToVideoPipeline.from_pretrained(x.i2v_model, torch_dtype=torch.bfloat16)
+    pipe = WanImageToVideoPipeline.from_pretrained(x.i2v_model, torch_dtype=torch.bfloat16, **extra_load)
     guidance, guidance_2 = 3.5, 3.5
 else:
     from diffusers import WanPipeline
 
-    pipe = WanPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16)
+    pipe = WanPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16, **extra_load)
     guidance, guidance_2 = 4.0, 3.0
+if not two_experts:
+    guidance, guidance_2 = 5.0, None  # diffusers refuses guidance_scale_2 without a boundary_ratio
 pair = pair_found
 steps = x.steps
 if pair:
@@ -176,8 +214,19 @@ if pair:
     print("lightning LoRAs loaded", flush=True)
 elif x.steps_full:
     steps = x.steps_full
+
 if x.device == "cuda":
-    pipe.enable_model_cpu_offload()  # two 14B experts do not both fit 32 GB
+    gpu_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+    part_gib = largest_part_gib(pipe)
+    if part_gib + 3 <= gpu_gib:
+        pipe.enable_model_cpu_offload()  # two 14B experts do not both fit 32 GB
+    else:
+        print(
+            f"ACT3_NOTE low VRAM: offloading layer by layer (largest part {part_gib:.1f} GiB, GPU {gpu_gib:.1f} GiB)",
+            flush=True,
+        )
+        pipe.enable_sequential_cpu_offload()
+        pipe.vae.enable_tiling()
 else:
     pipe.to("mps")
 print(f"loaded {'i2v' if i2v else 't2v'} in {time.time() - t0:.0f} s, {steps} steps", flush=True)

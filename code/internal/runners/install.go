@@ -3,6 +3,7 @@ package runners
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 )
 
 // InstallProblems names, per runner, why its model is not installed on this machine ("" or absent = ready).
@@ -14,7 +15,7 @@ func InstallProblems() map[string]string {
 	if FakeModels() {
 		return m
 	}
-	if p := wanInstallProblem(); p != "" {
+	if p := wanInstallProblem(wanMachineModel()); p != "" {
 		m[OSSVideo{}.Name()] = p
 	}
 	if p := seedvr2InstallProblem(seedvr2Qualities["standard"].dit); p != "" {
@@ -26,10 +27,14 @@ func InstallProblems() map[string]string {
 	return m
 }
 
-// wanInstallProblem checks what every Wan 2.2 job needs: the venv and the T2V diffusers weights.
-func wanInstallProblem() string {
+// wanInstallProblem checks what every job of one Wan 2.2 model needs: the venv and that model's diffusers weights.
+func wanInstallProblem(model string) string {
+	m, ok := wanModels[model]
+	if !ok {
+		return fmt.Sprintf("Wan model %q (ACT3_WAN_MODEL) is not one this server renders: %s", model, strings.Join(wanModelIDs(), ", "))
+	}
 	home := wanHome()
-	for _, f := range []string{venvPython(home), filepath.Join(home, "models", "Wan2.2-T2V-A14B-Diffusers", "model_index.json")} {
+	for _, f := range []string{venvPython(home), filepath.Join(home, "models", m.dir, "model_index.json")} {
 		if !fileAtLeast(f, 1) {
 			return fmt.Sprintf("Wan 2.2 is not installed on this server: missing %s (install guide: ~/BGit/all/app/smartc/film/servers/bms/oss_video/wan_2_2/)", f)
 		}
