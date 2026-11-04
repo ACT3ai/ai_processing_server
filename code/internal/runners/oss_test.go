@@ -427,3 +427,14 @@ func TestDiskFullIsInfra(t *testing.T) {
 		t.Errorf("plain failure: %s", k)
 	}
 }
+
+// The error a script prints on stderr can be read before its last stdout progress line (PC-10 run, 2026-11-04).
+func TestLastLineSkipsOurGrammar(t *testing.T) {
+	tail := "ACT3_STAGE rendering\nRuntimeError: CUDA out of memory\nACT3_PROGRESS 100.0\n"
+	if l := lastLine(tail); l != "RuntimeError: CUDA out of memory" {
+		t.Errorf("got %q", l)
+	}
+	if l := lastLine("ACT3_PROGRESS 10.0\n"); l != "no output" {
+		t.Errorf("only progress: got %q", l)
+	}
+}

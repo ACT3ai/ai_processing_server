@@ -357,10 +357,14 @@ func validateVideo(ffprobe, path string, expect int) error {
 	return nil
 }
 
+// reGrammar: our own stage, progress and note lines never explain a failure. stdout and stderr are read
+// separately, so the error a script prints on stderr can land before its last progress line.
+var reGrammar = regexp.MustCompile(`^ACT3_(STAGE|PROGRESS|NOTE)\b`)
+
 func lastLine(tail string) string {
 	lines := strings.Split(strings.TrimSpace(tail), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		if l := strings.TrimSpace(lines[i]); l != "" {
+		if l := strings.TrimSpace(lines[i]); l != "" && !reGrammar.MatchString(l) {
 			return truncate(l, 400)
 		}
 	}
