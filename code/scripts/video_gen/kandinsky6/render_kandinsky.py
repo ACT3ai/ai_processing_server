@@ -63,8 +63,9 @@ if x.image and not os.path.exists(x.image):
 
 t0 = time.time()
 stage("loading")
-# disable_mmap: read each shard and let it go, so loading never holds the files mapped beside the model (Windows)
-pipe = Kandinsky6TI2VAPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16, disable_mmap=True)
+# mmap stays on: the weights are already bf16, so tensors use the mapped file as is. Pro's transformer is ONE 65 GB file,
+# and disable_mmap read it whole before copying it, which took the 5090 to 2.6 GB free (2026-11-04).
+pipe = Kandinsky6TI2VAPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16)
 if x.device == "cuda":
     # capped, a GPU overflow fails here instead of spilling into system RAM (Windows' Sysmem Fallback)
     torch.cuda.set_per_process_memory_fraction(0.95)
@@ -78,6 +79,8 @@ if x.device == "cuda":
             flush=True,
         )
         pipe.enable_sequential_cpu_offload()
+    # decoding 121 frames at 720p in one pass wanted 8.4 GiB more than the 5090 had left (2026-11-04)
+    pipe.vae.enable_tiling()
 else:
     pipe.to("mps")
 print(f"loaded in {time.time() - t0:.0f} s", flush=True)

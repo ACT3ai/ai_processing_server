@@ -49,6 +49,7 @@ BLOCK = 128  # Block-Sparse-Attention's block size (wan_video_dit.py windows are
 ATTN = os.environ.get("FLASHVSR_ATTN", "sparse")
 CHUNK_ELEMS = int(os.environ.get("FLASHVSR_ATTN_CHUNK_ELEMS", str(1 << 28)))
 GATHER_BLOCKS = int(os.environ.get("FLASHVSR_ATTN_BLOCKS", str(1 << 15)))
+_gather = [GATHER_BLOCKS]  # halved on a CUDA out-of-memory: the gathered keys/values of one batch are ~2 GiB at the default
 BUCKET = 16  # rows are padded to a multiple of 16 key blocks so few batch shapes are needed
 
 
@@ -88,15 +89,25 @@ def _sparse(qh, kh, vh, mask, scale):
     out = torch.empty_like(qb)
     for K in torch.unique(padded).tolist():
         rows = torch.nonzero(padded == K).squeeze(1)
-        for s in range(0, rows.numel(), max(1, GATHER_BLOCKS // K)):
-            r = rows[s:s + max(1, GATHER_BLOCKS // K)]
-            kidx = order[r, :K]                                                        # n K
-            flat = (head_base[r, None] + kidx).reshape(-1)
-            kk = kf.index_select(0, flat).reshape(-1, 1, K * BLOCK, D)
-            vv = vf.index_select(0, flat).reshape(-1, 1, K * BLOCK, D)
-            ok = (torch.arange(K, device=qh.device)[None, :] < count[r, None])[:, :, None] & tok_ok[kidx]
-            out[r] = F.scaled_dot_product_attention(qb[r].unsqueeze(1), kk, vv, attn_mask=ok.reshape(-1, 1, 1, K * BLOCK),
-                                                    scale=scale).squeeze(1)
+        s = 0
+        while s < rows.numel():
+            r = rows[s:s + max(1, _gather[0] // K)]
+            try:
+                kidx = order[r, :K]                                                    # n K
+                flat = (head_base[r, None] + kidx).reshape(-1)
+                kk = kf.index_select(0, flat).reshape(-1, 1, K * BLOCK, D)
+                vv = vf.index_select(0, flat).reshape(-1, 1, K * BLOCK, D)
+                ok = (torch.arange(K, device=qh.device)[None, :] < count[r, None])[:, :, None] & tok_ok[kidx]
+                out[r] = F.scaled_dot_product_attention(qb[r].unsqueeze(1), kk, vv,
+                                                        attn_mask=ok.reshape(-1, 1, 1, K * BLOCK), scale=scale).squeeze(1)
+            except torch.cuda.OutOfMemoryError:
+                if _gather[0] <= 256:
+                    raise
+                kk = vv = ok = None
+                torch.cuda.empty_cache()
+                _gather[0] //= 2  # same result, smaller batches
+                continue
+            s += r.numel()
     return out.reshape(H, nq * BLOCK, D)[:, :Sq].unsqueeze(0)
 
 
@@ -253,6 +264,94 @@ def write_video(frames_u8, path, rate, src, has_audio):
         shutil.move(tmp, path)
 
 
+def upscale(pipe, frames, a, p0, p1):
+    """One FlashVSR pass over frames (n h w 3 uint8): exactly scale x the input, as uint8 (n H W 3)."""
+    n = frames.shape[0]
+    LQ, Fn, tH, tW, sH, sW = prepare(frames, a.scale)
+    print(f"target {sW}x{sH} (padded {tW}x{tH}), {Fn} frames in", flush=True)
+    total = (Fn - 1) // 8 - 2
+    real_tqdm = tiny.tqdm
+
+    def tq(it, *args, **kw):
+        for i, x in enumerate(it):
+            progress(p0 + (p1 - p0) * i / max(1, total), f"chunk {i + 1}/{total}")
+            yield x
+    tiny.tqdm = tq
+    try:
+        video = pipe(prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=a.seed,
+                     LQ_video=LQ, num_frames=Fn, height=tH, width=tW, is_full_block=False, if_buffer=True,
+                     topk_ratio=a.sparse_ratio * 768 * 1280 / (tH * tW), kv_ratio=3.0,
+                     local_range=a.local_range, color_fix=True)
+    finally:
+        tiny.tqdm = real_tqdm
+    video = video[0] if video.dim() == 5 else video  # C T H W
+    out = ((video.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+    out = out[:, :n, :sH, :sW].permute(1, 2, 3, 0).cpu().numpy()
+    del video, LQ
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+    if out.shape[0] < n:
+        print(f"note: model returned {out.shape[0]} of {n} frames; last frame repeated", flush=True)
+        out = np.concatenate([out, np.repeat(out[-1:], n - out.shape[0], 0)])
+    return out
+
+
+def tile_side(scale):
+    """The input tile edge whose output fits this GPU, or None for one pass (MPS: unified memory). The activations grow
+    with the output area: 2560x1536 ran out of a 32 GB RTX 5090, so a tile's output is kept near (cap - 6) / 10 Mpx;
+    FLASHVSR_TILE_MPX overrides."""
+    if DEVICE != "cuda":
+        return None
+    mpx = float(os.environ.get("FLASHVSR_TILE_MPX") or 0)
+    if mpx <= 0:
+        cap = 0.95 * torch.cuda.get_device_properties(0).total_memory / 2**30
+        mpx = max(0.2, (cap - 6) / 10)
+    return max(64, int(math.sqrt(mpx * 1e6) / scale) // 16 * 16)
+
+
+def starts(n, size, overlap):
+    if n <= size:
+        return [0]
+    return list(range(0, n - size, size - overlap)) + [n - size]
+
+
+def upscale_tiled(pipe, frames, a, side, sW, sH):
+    """Overlapping input tiles, each upscaled on its own and blended with linear ramps across the overlap."""
+    n, h0, w0, _ = frames.shape
+    ov = max(16, side // 8)
+    ys, xs = starts(h0, side, ov), starts(w0, side, ov)
+    print(f"tiled: {len(ys) * len(xs)} tiles of {side}px (overlap {ov}px) for a {sW}x{sH} output", flush=True)
+    acc = np.zeros((n, sH, sW, 3), np.float16)
+    wsum = np.zeros((sH, sW), np.float32)
+    ramp = max(1, round(ov * a.scale))
+    k, count = 0, len(ys) * len(xs)
+    for y in ys:
+        for x in xs:
+            th, tw = min(side, h0 - y), min(side, w0 - x)
+            p0 = 10 + 80 * k / count
+            t = upscale(pipe, np.ascontiguousarray(frames[:, y:y + th, x:x + tw]), a, p0, p0 + 80 / count)
+            oy, ox = round(y * a.scale), round(x * a.scale)
+            hh, ww = min(t.shape[1], sH - oy), min(t.shape[2], sW - ox)
+            wy = np.ones(hh, np.float32)
+            wx = np.ones(ww, np.float32)
+            r = np.arange(1, ramp + 1, dtype=np.float32) / ramp
+            if y > 0:
+                wy[:ramp] = np.minimum(wy[:ramp], r[:hh])
+            if y + th < h0:
+                wy[-ramp:] = np.minimum(wy[-ramp:], r[::-1][-hh:] if hh < ramp else r[::-1])
+            if x > 0:
+                wx[:ramp] = np.minimum(wx[:ramp], r[:ww])
+            if x + tw < w0:
+                wx[-ramp:] = np.minimum(wx[-ramp:], r[::-1][-ww:] if ww < ramp else r[::-1])
+            wmap = wy[:, None] * wx[None, :]
+            acc[:, oy:oy + hh, ox:ox + ww] += (t[:, :hh, :ww].astype(np.float32) * wmap[None, :, :, None]).astype(np.float16)
+            wsum[oy:oy + hh, ox:ox + ww] += wmap
+            k += 1
+    out = (acc.astype(np.float32) / np.maximum(wsum, 1e-6)[None, :, :, None]).round().clip(0, 255).astype(np.uint8)
+    return out
+
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -277,35 +376,17 @@ def main():
     progress(2, "loading models")
     pipe = init_pipeline()
     progress(10, "models loaded")
-    LQ, Fn, tH, tW, sH, sW = prepare(frames, a.scale)
-    print(f"target {sW}x{sH} (padded {tW}x{tH}), {Fn} frames in", flush=True)
-
-    total = (Fn - 1) // 8 - 2
-    real_tqdm = tiny.tqdm
-
-    def tq(it, *args, **kw):
-        for i, x in enumerate(it):
-            progress(10 + 80 * i / max(1, total), f"chunk {i + 1}/{total}")
-            yield x
-    tiny.tqdm = tq
-    try:
-        video = pipe(prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=a.seed,
-                     LQ_video=LQ, num_frames=Fn, height=tH, width=tW, is_full_block=False, if_buffer=True,
-                     topk_ratio=a.sparse_ratio * 768 * 1280 / (tH * tW), kv_ratio=3.0,
-                     local_range=a.local_range, color_fix=True)
-    finally:
-        tiny.tqdm = real_tqdm
+    sW, sH = 2 * round(w0 * a.scale / 2), 2 * round(h0 * a.scale / 2)
+    side = tile_side(a.scale)
+    if side is None or (w0 <= side and h0 <= side):
+        out = upscale(pipe, frames, a, 10, 90)
+    else:
+        out = upscale_tiled(pipe, frames, a, side, sW, sH)
     progress(92, "encoding")
-    video = video[0] if video.dim() == 5 else video  # C T H W
-    out = ((video.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
-    out = out[:, :n, :sH, :sW].permute(1, 2, 3, 0).cpu().numpy()
-    if out.shape[0] < n:
-        print(f"note: model returned {out.shape[0]} of {n} frames; last frame repeated", flush=True)
-        out = np.concatenate([out, np.repeat(out[-1:], n - out.shape[0], 0)])
     os.makedirs(os.path.dirname(os.path.abspath(a.output)), exist_ok=True)
     write_video(out, a.output, rate, a.input, has_audio)
     progress(100, "done")
-    print(f"done {a.output} {sW}x{sH} {n} frames in {time.time() - t0:.1f} s", flush=True)
+    print(f"done {a.output} {out.shape[2]}x{out.shape[1]} {n} frames in {time.time() - t0:.1f} s", flush=True)
 
 
 if __name__ == "__main__":
