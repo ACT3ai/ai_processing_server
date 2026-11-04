@@ -470,4 +470,15 @@ func TestLastLineSkipsOurGrammar(t *testing.T) {
 	if l := lastLine("ACT3_PROGRESS 10.0\n"); l != "no output" {
 		t.Errorf("only progress: got %q", l)
 	}
+	// SeedVR2 on PC-10, 2026-11-04: the error, then a cleanup section and its sponsor banner
+	seedvr2 := "torch.OutOfMemoryError: Allocation on device 0 would exceed allowed memory. (out of memory)\n" +
+		"[08:39:12.928] Process 2816552 terminating - VRAM will be automatically freed\n" +
+		"[08:39:12.928] Questions? Updates? Watch, star & sponsor if you can!\n" +
+		"[08:39:12.928] https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler\n"
+	if l := lastLine(seedvr2); !strings.HasPrefix(l, "torch.OutOfMemoryError") {
+		t.Errorf("banner after the error: got %q", l)
+	}
+	if l := lastLine("loading\nall done, but no file\n"); l != "all done, but no file" {
+		t.Errorf("no error line: got %q", l)
+	}
 }

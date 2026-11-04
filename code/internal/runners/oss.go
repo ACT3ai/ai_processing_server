@@ -361,14 +361,30 @@ func validateVideo(ffprobe, path string, expect int) error {
 // separately, so the error a script prints on stderr can land before its last progress line.
 var reGrammar = regexp.MustCompile(`^ACT3_(STAGE|PROGRESS|NOTE)\b`)
 
+// reErrorLine: a line that reports the failure. Verbose tools print a cleanup section and a banner after it (SeedVR2
+// ends every run with its sponsor links), so the last line is often not the reason.
+var reErrorLine = regexp.MustCompile(`(?i)\b\w*(error|exception)\b|out of memory|traceback|killed|no such file|not found|failed`)
+
+// lastLine names the failure: the last line that reports an error, else the last line of output.
 func lastLine(tail string) string {
 	lines := strings.Split(strings.TrimSpace(tail), "\n")
+	last := ""
 	for i := len(lines) - 1; i >= 0; i-- {
-		if l := strings.TrimSpace(lines[i]); l != "" && !reGrammar.MatchString(l) {
+		l := strings.TrimSpace(lines[i])
+		if l == "" || reGrammar.MatchString(l) {
+			continue
+		}
+		if reErrorLine.MatchString(l) && !strings.HasPrefix(l, "Traceback") {
 			return truncate(l, 400)
 		}
+		if last == "" {
+			last = l
+		}
 	}
-	return "no output"
+	if last == "" {
+		return "no output"
+	}
+	return truncate(last, 400)
 }
 
 func truncate(s string, n int) string {

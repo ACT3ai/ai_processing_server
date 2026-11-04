@@ -301,7 +301,7 @@ func host(dir string) error {
 	var before float64 // weight of the steps already done, for the overall progress fraction
 	cur := 0
 
-	tail := newTail(40)
+	tail := newTail(200) // verbose tools (SeedVR2) log a cleanup section and a banner after the error
 	var logMu sync.Mutex
 	// A runner that speaks our grammar (ACT3_STAGE / ACT3_PROGRESS) owns its progress: from its first such line on,
 	// tqdm bars it prints (Wan's "Loading checkpoint shards: 100%|") are not job progress. Without this a Wan render
