@@ -108,5 +108,7 @@ func cleanEnv(s Spec) []string {
 	if s.GPU != nil {
 		env = append(env, "CUDA_VISIBLE_DEVICES="+strconv.Itoa(*s.GPU))
 	}
+	// Python's UTF-8 mode: on Windows a piped stdout is cp1252, and a printed emoji (SeedVR2's) kills the run
+	env = append(env, "PYTHONUTF8=1")
 	return append(env, s.Env...)
 }
