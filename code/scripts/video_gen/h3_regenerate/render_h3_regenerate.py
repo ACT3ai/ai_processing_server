@@ -2,18 +2,18 @@
 # is frozen into each snapshot (pm/task_authoring.mdx R1, R2). Edit the source in the all repo, then run
 # code/scripts/sync_from_all.sh. Run by the oss_regenerate runner (code/internal/runners/oss_regenerate.go).
 """render_h3_regenerate.py: regenerate ONE draft take at 768P / 1080P / 2K / 4K with NVIDIA Open-H3-Regenerate-2K on an
-ACT3 render server (CUDA), through the official CLI (infer.py) or the ComfyUI port. Python 3 standard library only:
-the model itself runs in its own process (infer.py in the model venv, or a ComfyUI server).
+ACT3 render server (CUDA), through the official CLI (infer.py, ~150 GB cards) or ComfyUI with the Olm Open-H3 nodes (the
+RTX 5090). Python 3 standard library only: the model runs in its own process (infer.py, or a private ComfyUI server
+this script starts on a free localhost port and stops when the refine ends).
 
 Called by the render server's task host (ai_processing_server runner oss_regenerate, or the internal web app's plugin
 ./h3-regenerate-local.ts, which builds this exact argv). Two checkpointed stages (h3_regenerate_2k.mdx §10.2):
 
   --stage refine   probe + re-check the draft (refusing a crop or a cut the caller did not accept), run the refine (CLI:
-                   --save-latents; ComfyUI: the workflow's own Save Refined Latent), write the silent refined video to
+                   --save-latents; ComfyUI: one workflow, 5 s windows), write the refined video to
                    --refined, <refined>.meta.json (timings, peak VRAM, Sana commit, weights revision) and a settings
                    stamp. A re-run with the same settings whose output and stamp are already there does nothing.
-                   There is NO decode-only resume: a decode OOM re-runs the last pass once with the released VAE; the
-                   saved latent is kept for a human to decode (the port's Decode Saved Latent workflow).
+                   CLI only: a decode OOM re-runs the last pass once with the released VAE (no decode-only resume).
   --stage finish   trim the H3 frame-grid pad back to the draft's length, re-mux the draft's own audio (audio is never
                    regenerated, §2.5), encode H.264 yuv420p 24 fps +faststart, write --out atomically.
   --stage all      both, in one process (the internal web app's executor runs one argv).
@@ -35,10 +35,13 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -89,8 +92,45 @@ class Fail(Exception):
         self.kind = kind
 
 
+_OUT = threading.Lock()
+
+
 def say(line):
-    print(line, flush=True)
+    """One whole line per write: the main thread, the heartbeat and the ComfyUI pump all print."""
+    with _OUT:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
+def setup_process():
+    """UTF-8 output whatever the console's code page (a progress bar's █ must not kill the pump), and SIGTERM unwinds
+    like Ctrl-C so the finally blocks stop the private ComfyUI instead of leaving it on the GPU."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    def interrupt(*_):
+        raise KeyboardInterrupt
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, interrupt)
+
+
+def error_exit(e):
+    """The one ACT3_ERROR line and its exit code, for a Fail or anything unexpected."""
+    if isinstance(e, Fail):
+        kind, msg = e.kind, str(e)
+    elif isinstance(e, KeyboardInterrupt):
+        kind, msg = "internal", "interrupted"
+    else:
+        traceback.print_exc()
+        text = f"{type(e).__name__}: {e}"
+        infra = isinstance(e, (urllib.error.URLError, ConnectionError, TimeoutError)) or RE_DISK.search(text)
+        kind, msg = ("infra" if infra else "internal"), text
+    print(f"ACT3_ERROR {kind}: {msg}", file=sys.stderr, flush=True)
+    return EXIT.get(kind, 1)
 
 
 def stage(name):
@@ -371,7 +411,7 @@ def classify(code, tail, prompt=""):
         return Fail("not_installed", "the model venv is missing a package: " + last_line(tail))
     if RE_MISSING_FILE.search(tail):
         return Fail("not_installed", "a model file is missing: " + last_line(tail))
-    return Fail("internal", f"infer.py exited {code}: {last_line(tail)}")
+    return Fail("internal", f"the model process exited {code}: {last_line(tail)}")
 
 
 def last_line(tail):
@@ -413,7 +453,31 @@ def refine_cli(x, refined, prog):
         raise Fail("internal", "infer.py exited 0 but wrote no video")
 
 
-# ── the ComfyUI port (§9.2) ───────────────────────────────────────────────────────────────────────────────────────
+# ── the ComfyUI path (§9.2): a private ComfyUI with the Olm Open-H3 nodes, started for this job ───────────────────
+#
+# Installed by ~/BGit/all/app/smartc/film/servers/bms/oss_video/open_h3_regenerate_2k/ (ComfyUI v0.44.0 + the Olm nodes,
+# pinned, weights under ComfyUI/models). The server is this process's child on a free localhost port, so the task
+# host's memory guard and cancel stop it with the job, and nothing holds the GPU between jobs.
+
+OLM_NODES = "ComfyUI-Olm-Open-H3-Regenerate-2K"
+# the Olm loader's inputs and the file each must resolve to (the child's model.yaml weights)
+COMFY_FILES = {
+    "base_model": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "text_encoder": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "video_vae": "minimax_h3_video_vae_fp16.safetensors",
+    "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+    "upscaler": "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+    "adapters": "Open-H3-Regenerate-2K",
+}
+# the canvas the nodes render (multiples of 32); finish crops 1088 → 1080 and 2176 → 2160
+RENDER_SIZE = {"768p": (1344, 768), "1080p": (1920, 1088), "2k": (2560, 1440), "4k": (3840, 2176)}
+NVIDIA_SCHEDULES = {(3, 0.909375): "NVIDIA three-step", (2, 0.7): "NVIDIA two-step"}  # the released grids, verbatim
+DOC_START_SIGMA = {3: 0.909375, 2: 0.7}
+COMFY_WINDOW = 121  # the nodes refine in windows of this many frames (+ H3's pad), the context the model was tuned on
+RE_WINDOW = re.compile(r"Open-H3 window (\d+)/(\d+)")
+RE_PORT_TAKEN = re.compile(r"address already in use|Errno 98|WinError 10048", re.I)
+RE_NO_NODE = re.compile(r"missing_node_type|does not exist", re.I)
+RE_BAD_VALUE = re.compile(r"value_(?:smaller|bigger)_than_(?:min|max)|value_not_in_list", re.I)
 
 
 def http_json(url, body=None, timeout=60):
@@ -423,263 +487,292 @@ def http_json(url, body=None, timeout=60):
         return json.loads(r.read().decode() or "{}")
 
 
-# §9.2 alternative LoRAs: the file each LoRA id reads (same table as h3-regenerate-job.ts LORAS)
-LORA_FILES = {
-    "r576": "open_h3_regenerate_2k_lora.safetensors",
-    "r128": "minimax_h3_open_regenerate_2k_r128_comfyui_bf16.safetensors",
-    "r384_kijai": "minimax_h3_open_regenerate_2k_refiner_rank_384_bf16.safetensors",
-}
-DOC_START_SIGMA = {3: 0.909375, 2: 0.7}  # §9.2 Sigmas node: the 3-step and 2-step grids
+def comfy_dir(x, olm=True):
+    d = x.comfy_home or os.path.join(x.home, "ComfyUI")
+    if not os.path.isfile(os.path.join(d, "main.py")):
+        raise Fail("not_installed", f"ComfyUI is not installed at {d} (install: bms/oss_video/open_h3_regenerate_2k, just build)")
+    if olm and not os.path.isfile(os.path.join(d, "custom_nodes", OLM_NODES, "nodes.py")):
+        raise Fail("not_installed", f"the Olm Open-H3 nodes are not in {os.path.join(d, 'custom_nodes')}")
+    return d
 
 
-def _is_link(v):
-    return isinstance(v, list) and len(v) == 2 and isinstance(v[0], (str, int))
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
-def patch_workflow(wf, values):
-    """Set inputs BY NAME in an API-format workflow ({node_id: {class_type, inputs, _meta}}). Node class names are not
-    relied on (the port is days old, §11 R4). Returns (done, kinds): "node.input" it set, and which kinds of decision
-    landed somewhere ("prompt", "video", "seed", "sigma", "max_frames", "input_size", "resolution", "audio", "lora")."""
-    done = []
-    kinds = set()
-    for nid, node in wf.items():
-        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
-            continue
-        ins = node["inputs"]
-        cls = str(node.get("class_type", "")).lower()
-        title = str((node.get("_meta") or {}).get("title", "")).lower()
-        where = cls + " " + title
+def schedule_inputs(steps, start_sigma):
+    """The Olm node's schedule: a released NVIDIA grid when it is one, else Custom (equal spacing before shift 6)."""
+    start = start_sigma if start_sigma is not None else DOC_START_SIGMA[steps]
+    for (n, s), name in NVIDIA_SCHEDULES.items():
+        if n == steps and abs(start - s) < 1e-6:
+            return {"schedule": name}
+    return {"schedule": "Custom", "schedule.steps": steps, "schedule.start_noise": round(start, 6)}
 
-        def put(key, value, kind=None):
-            ins[key] = value
-            done.append(f"{nid}.{key}")
-            if kind:
-                kinds.add(kind)
 
-        for key in list(ins.keys()):
-            k = key.lower()
-            if _is_link(ins[key]):  # a link to another node: never overwrite wiring
+def combo_options(spec):
+    """object_info's combo spec: [[options], {...}] (classic) or ["COMBO", {"options": [...]}] (V3)."""
+    if isinstance(spec, list) and spec:
+        if isinstance(spec[0], list):
+            return spec[0]
+        if len(spec) > 1 and isinstance(spec[1], dict):
+            return spec[1].get("options") or []
+    return []
+
+
+def node_option(base, node, field, want):
+    """The option ComfyUI lists for one input of a core node whose file name is `want` (a subfolder may lead it)."""
+    info = http_json(f"{base}/object_info/{node}").get(node) or {}
+    opts = [str(o) for o in combo_options(((info.get("input") or {}).get("required") or {}).get(field))]
+    hit = next((o for o in opts if o.replace("\\", "/").split("/")[-1] == want), None)
+    if not hit:
+        raise Fail("not_installed", f"{want} is not in ComfyUI's models ({node}.{field}; it lists: {', '.join(opts[:4]) or 'nothing'}); "
+                   "run the weights step of bms/oss_video/open_h3_regenerate_2k")
+    return hit
+
+
+def loader_files(base):
+    """Each loader input resolved to the option ComfyUI lists for it (paths inside models/ can carry a subfolder)."""
+    info = http_json(f"{base}/object_info/OlmOpenH3RefinerLoader").get("OlmOpenH3RefinerLoader")
+    if not info:
+        raise Fail("not_installed", "ComfyUI started without the Olm Open-H3 nodes (an import error above, or a ComfyUI "
+                   "without native MiniMax-H3)")
+    req = (info.get("input") or {}).get("required") or {}
+    out = {}
+    for kind, want in COMFY_FILES.items():
+        opts = [str(o) for o in combo_options(req.get(kind))]
+        hit = next((o for o in opts if o.replace("\\", "/").split("/")[-1] == want), None)
+        if not hit:
+            raise Fail("not_installed", f"{want} is not in ComfyUI's models ({kind}; it lists: {', '.join(opts[:4]) or 'nothing'}); "
+                       "run the weights and table steps of bms/oss_video/open_h3_regenerate_2k")
+        out[kind] = hit
+    return out
+
+
+def comfy_workflow(x, files, video, prefix, draft_audio=True):
+    """API-format graph: Load Video → components → Olm refiner → Create Video → Save Video (H.264, near lossless)."""
+    w, h = RENDER_SIZE[x.resolution]
+    refine = {
+        "images": ["2", 0], "refiner": ["3", 0], "prompt": x.prompt_text, "fps": ["2", 2], "width": w, "height": h,
+        "seed": x.seed, "vae_tile_size": 256, "sparse_attention": True, "input_size": x.input_size,
+        "window_frames": COMFY_WINDOW, **schedule_inputs(x.steps, x.start_sigma),
+    }
+    if x.model_audio == "draft" and draft_audio:  # Fidelity holds the draft's soundtrack as fixed conditioning (keeps lip sync, §2.5)
+        refine["audio"] = ["2", 1]
+    return {
+        "1": {"class_type": "LoadVideo", "inputs": {"file": video}},
+        "2": {"class_type": "GetVideoComponents", "inputs": {"video": ["1", 0]}},
+        "3": {"class_type": "OlmOpenH3RefinerLoader", "inputs": {**files, "text_encoder_device": "auto"}},
+        "4": {"class_type": "OlmOpenH3RefineVideo", "inputs": refine},
+        "5": {"class_type": "CreateVideo", "inputs": {"images": ["4", 0], "fps": ["4", 2]}},
+        "6": {"class_type": "SaveVideo", "inputs": {
+            "video": ["5", 0], "filename_prefix": prefix, "format": "mp4", "format.codec": "h264",
+            "format.codec.encoding": "re-encode", "format.codec.encoding.crf": 12.0}},
+    }
+
+
+class ComfyServer:
+    """`python main.py` on a private port under `work`, its output streamed into ours (and read for progress). A context
+    manager: leaving it stops the server and removes `work`."""
+
+    def __init__(self, x, root, work, prog):
+        self.prog, self.tail, self.windows, self.work = prog, [], (0, 1), work
+        shutil.rmtree(work, ignore_errors=True)
+        self.port = free_port()
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.dirs = {k: os.path.join(work, k) for k in ("input", "output", "temp", "user")}
+        for d in self.dirs.values():
+            os.makedirs(d, exist_ok=True)
+        argv = [x.comfy_python or sys.executable, os.path.join(root, "main.py"), "--listen", "127.0.0.1",
+                "--port", str(self.port), "--disable-auto-launch", "--log-stdout", "--disable-metadata",
+                "--disable-assets", "--offline", "--database-url", "sqlite:///:memory:",
+                "--input-directory", self.dirs["input"], "--output-directory", self.dirs["output"],
+                "--temp-directory", self.dirs["temp"], "--user-directory", self.dirs["user"]]
+        say(f"ACT3_NOTE starting ComfyUI on 127.0.0.1:{self.port}")
+        try:
+            self.proc = subprocess.Popen(argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                         encoding="utf-8", errors="replace", bufsize=1,
+                                         env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"})
+        except OSError as e:
+            shutil.rmtree(work, ignore_errors=True)
+            raise Fail("not_installed", f"ComfyUI's python cannot be started ({argv[0]}): {e}")
+        self.pump = threading.Thread(target=self._pump, daemon=True)
+        self.pump.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.stop()
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def _pump(self):
+        for raw in self.proc.stdout:
+            try:
+                self._line(raw.rstrip("\n").split("\r")[-1])
+            except Exception as e:  # keep draining: a stalled pipe would block ComfyUI itself
+                say(f"ACT3_NOTE ComfyUI output unreadable: {e}")
+
+    def _line(self, line):
+        if not line.strip():
+            return
+        say(f"comfy| {line}")
+        self.tail.append(line)
+        del self.tail[:-120]
+        m = RE_WINDOW.search(line)
+        if m:
+            self.windows = (int(m.group(1)) - 1, max(1, int(m.group(2))))
+            self.prog.frac(self.windows[0] / self.windows[1])
+            return
+        m = RE_PCT.search(line)
+        f = float(m.group(1)) / 100 if m else None
+        if f is None:
+            m = RE_TQDM.search(line)
+            f = int(m.group(1)) / int(m.group(2)) if m and int(m.group(2)) > 0 else None
+        if f is not None:  # the sampler's bar inside the current window
+            i, n = self.windows
+            self.prog.frac((i + min(1.0, f)) / n)
+
+    def log(self):
+        return "\n".join(self.tail)
+
+    def exited(self):
+        """The exit code once ComfyUI has ended (its last lines read first), else None."""
+        if self.proc.poll() is None:
+            return None
+        self.pump.join(timeout=5)
+        return self.proc.returncode
+
+    def wait_ready(self, timeout=600):
+        """Until OUR ComfyUI answers (its argv names our output dir) on a CUDA device."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            code = self.exited()
+            if code is not None:
+                tail = self.log()
+                if RE_MISSING_PKG.search(tail):
+                    raise Fail("not_installed", "ComfyUI could not start, a package is missing: " + last_line(tail))
+                if RE_PORT_TAKEN.search(tail):
+                    raise Fail("infra", f"port {self.port} was taken while ComfyUI started")
+                raise Fail("internal", f"ComfyUI exited {code} while starting: {last_line(tail)}")
+            try:
+                stats = http_json(f"{self.base}/system_stats", timeout=5)
+            except (urllib.error.URLError, OSError, ValueError):
+                time.sleep(1)
                 continue
-            if k in ("seed", "noise_seed"):
-                put(key, values["seed"], "seed")
-            elif k == "max_frames":
-                put(key, values["max_frames"], "max_frames")
-            elif k in ("start_sigma", "sigma_start", "denoise_start_sigma"):
-                put(key, values["start_sigma"], "sigma")
-            elif k == "steps" and "sigma" in where:
-                put(key, values["steps"], "sigma")
-            elif k in ("input_size", "draft_size", "input_resolution"):
-                put(key, values["input_size"], "input_size")
-            elif k in ("resolution", "target_resolution", "target", "output_resolution") and (
-                    "upscale" in where or "regenerate" in where or "finish" in where or k != "resolution"):
-                put(key, values["resolution"], "resolution")
-            elif k in ("text", "prompt", "positive") and ("encode" in cls or "prompt" in title or "text" in cls):
-                put(key, values["prompt"], "prompt")
-            elif k in ("video", "video_path", "file", "filename", "path") and ("load" in cls or "draft" in cls or "draft" in title):
-                put(key, values["video"], "video")
-            elif k in ("audio_mode", "draft_audio", "audio_source"):
-                put(key, values["audio"], "audio")
-            elif k in ("lora_name", "lora", "lora_file") and "lora" in where and values.get("lora_file"):
-                put(key, values["lora_file"], "lora")
-            elif k == "filename_prefix":
-                put(key, values["prefix"])
-    return done, kinds
+            if self.dirs["output"] not in ((stats.get("system") or {}).get("argv") or []):
+                time.sleep(1)
+                continue
+            devices = [str(d.get("type", "")) for d in stats.get("devices") or [] if isinstance(d, dict)]
+            if "cuda" not in devices:
+                raise Fail("not_installed", f"ComfyUI sees no CUDA GPU (devices: {', '.join(devices) or 'none'}); "
+                           "H3 runs on CUDA only")
+            return
+        raise Fail("infra", f"ComfyUI did not answer within {timeout} s of starting")
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=30)
 
 
-def wire_decoder(wf, decoder):
-    """Apply the plan's decoder choice (§7.2, §9.2). "fast": the Fast VAE Decode node must be there. "standard": route a
-    VAE into the Fast VAE Decode node's optional `vae` fallback input (or the workflow already decodes with ComfyUI's
-    own VAE Decode). Returns a sentence for the log; raises not_installed when the workflow cannot express the choice
-    (never runs a different decoder than the plan silently). Unverified: that a wired `vae` input makes the node
-    decode with it, rather than only on its own OOM fallback — the port's README calls it "a fallback"."""
-    nodes = {nid: n for nid, n in wf.items() if isinstance(n, dict) and isinstance(n.get("inputs"), dict)}
-    def where(n):
-        return (str(n.get("class_type", "")) + " " + str((n.get("_meta") or {}).get("title", ""))).lower()
-    fast = [nid for nid, n in nodes.items() if "fast" in where(n) and "decode" in where(n)]
-    plain = [nid for nid, n in nodes.items() if "vaedecode" in where(n).replace(" ", "") and nid not in fast]
-    if decoder == "fast":
-        if fast:
-            return f"fast decoder: node {fast[0]}"
-        raise Fail("not_installed", "the plan chose the fast H3 VAE decoder but the ComfyUI workflow has no Fast VAE Decode "
-                   "node: export the port's Draft Video workflow in API format")
-    if not fast:
-        if plain:
-            return f"released decoder: the workflow decodes with node {plain[0]}"
-        raise Fail("not_installed", "the ComfyUI workflow has no VAE decode node at all")
-    src = None
-    for nid, n in nodes.items():
-        if nid in fast:
-            continue
-        v = n["inputs"].get("vae")
-        if _is_link(v):
-            src = list(v)
-            break
-    if src is None:
-        loaders = [nid for nid, n in nodes.items() if "vaeloader" in where(n).replace(" ", "")]
-        if loaders:
-            src = [loaders[0], 0]
-    if src is None:
-        raise Fail("not_installed", "the plan needs the released VAE decoder (the fast one does not fit here, §7.2), but the "
-                   "ComfyUI workflow has no VAE to route into Fast VAE Decode's `vae` input: add a VAE loader to the workflow")
-    for nid in fast:
-        nodes[nid]["inputs"]["vae"] = src
-        for key in list(nodes[nid]["inputs"].keys()):  # a toggle, when the node has one (unverified input names)
-            if key.lower() in ("use_fallback", "force_vae", "use_vae", "fallback"):
-                nodes[nid]["inputs"][key] = True
-    return f"released decoder: VAE {src[0]} routed into Fast VAE Decode node(s) {', '.join(fast)}"
-
-
-def required_kinds(x):
-    """Which decisions MUST land in the workflow: anything that differs from the port's defaults (§9.2 "Defaults
-    matching the official recipe": 3-step grid from 0.909375, 121 frames, input 768p, Draft Video → 2560x1440, silent
-    audio, merged r576 LoRA). A decision the workflow cannot take fails the job instead of running another one."""
-    need = {"prompt", "video", "seed"}
-    start = x.start_sigma if x.start_sigma is not None else DOC_START_SIGMA.get(x.steps, 0.909375)
-    if x.steps != 3 or abs(start - 0.909375) > 1e-6:
-        need.add("sigma")
-    if x.window_frames != CLI_WINDOW_FRAMES:
-        need.add("max_frames")
-    if x.input_size != "768p":
-        need.add("input_size")
-    if x.resolution != "2k":
-        need.add("resolution")
-    if x.model_audio == "draft":
-        need.add("audio")
-    if x.lora != "r576":
-        need.add("lora")
-    return need
+def deadline_override():
+    """$H3R_DEADLINE_S, for runs by hand (ai_processing_server passes no such variable to a task)."""
+    try:
+        v = float(os.environ.get("H3R_DEADLINE_S", ""))
+        return v if v > 0 else None
+    except ValueError:
+        return None
 
 
 def comfy_deadline(x):
-    """How long a ComfyUI refine may take before we call it lost: ~20 min per 5 s at 2K (§7.4: 3-5 min measured, 4x
-    margin), scaled by length and rung, 15 min to 6 h. $H3R_COMFY_DEADLINE_S overrides."""
-    env = os.environ.get("H3R_COMFY_DEADLINE_S", "")
-    try:
-        if env and float(env) > 0:
-            return float(env)
-    except ValueError:
-        pass
+    """How long a refine may take before we call it stuck: ~20 min per 5 s window at 2K (measured ~2-4 min, §7.4),
+    scaled by windows and rung, 15 min to 6 h."""
     rung = {"768p": 0.5, "1080p": 0.7, "2k": 1.0, "4k": 4.0}.get(x.resolution, 1.0)
-    return max(15 * 60.0, min(6 * 3600.0, 20 * 60.0 * max(1.0, x.window_frames / CLI_WINDOW_FRAMES) * rung + 600))
+    windows = max(1, -(-x.window_frames // COMFY_WINDOW))
+    return deadline_override() or max(15 * 60.0, min(6 * 3600.0, 20 * 60.0 * windows * rung + 600))
 
 
-def _queue_ids(q):
-    ids = set()
-    for key in ("queue_running", "queue_pending"):
-        for item in (q or {}).get(key) or []:
-            if isinstance(item, (list, tuple)) and len(item) > 1:
-                ids.add(str(item[1]))
-            elif isinstance(item, dict) and item.get("prompt_id"):
-                ids.add(str(item["prompt_id"]))
-    return ids
+def stage_draft(x, info, dest):
+    """The draft as ComfyUI loads it: copied, or cut to the planned window when the caller accepted the cut."""
+    if info["seconds"] * FPS <= x.window_frames + 1:
+        shutil.copyfile(x.draft, dest)
+        return
+    secs = x.window_frames / FPS
+    out = subprocess.run([tool("ffmpeg"), "-y", "-v", "error", "-i", x.draft, "-t", f"{secs:.3f}", "-c:v", "libx264",
+                          "-crf", "0", "-preset", "veryfast", "-c:a", "aac", "-b:a", "256k", dest], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise Fail("internal", f"cutting the draft to {secs:.2f} s failed: {out.stderr.strip()[-300:]}")
 
 
-def refine_comfy(x, refined, prog):
-    if not x.comfy_url:
-        raise Fail("not_installed", "the ComfyUI backend needs --comfy-url (the ComfyUI server with the Open-H3 nodes)")
-    if not x.comfy_workflow or not os.path.isfile(x.comfy_workflow):
-        raise Fail("not_installed", "the ComfyUI backend needs --comfy-workflow: an API-format export of the port's "
-                   "'Draft Video' example workflow")
+def run_workflow(srv, wf, x, deadline_s):
+    """Queue one API workflow on a private ComfyUI, wait for it, return the path of the video it saved. Failures are
+    classified with the prompt scrubbed out (an echoed prompt never decides the kind)."""
     try:
-        with open(x.comfy_workflow, encoding="utf-8") as fh:
-            wf = json.load(fh)
-    except (OSError, ValueError) as e:
-        raise Fail("not_installed", f"the ComfyUI workflow is not readable JSON: {e}")
-    if not isinstance(wf, dict) or not wf:
-        raise Fail("not_installed", "the ComfyUI workflow is not an API-format export ({node_id: {class_type, inputs}})")
-    if not x.comfy_input_dir or not os.path.isdir(x.comfy_input_dir):
-        raise Fail("not_installed", "the ComfyUI backend needs --comfy-input-dir (ComfyUI's input/ folder) to hand it the draft")
-    name = f"act3_h3r_{hashlib.sha256(os.path.abspath(x.draft).encode()).hexdigest()[:12]}{os.path.splitext(x.draft)[1] or '.mp4'}"
-    shutil.copyfile(x.draft, os.path.join(x.comfy_input_dir, name))
-    prefix = f"act3_h3r/{os.path.basename(os.path.dirname(os.path.abspath(refined)))}"
-    done, kinds = patch_workflow(wf, {
-        "seed": x.seed, "max_frames": x.window_frames,
-        "start_sigma": x.start_sigma if x.start_sigma is not None else DOC_START_SIGMA.get(x.steps, 0.909375),
-        "steps": x.steps, "input_size": x.input_size, "resolution": x.resolution, "prompt": x.prompt_text, "video": name,
-        "audio": x.model_audio, "prefix": prefix, "lora_file": LORA_FILES.get(x.lora, ""),
-    })
-    missing = sorted(required_kinds(x) - kinds)
-    if missing:
-        raise Fail("not_installed", f"the ComfyUI workflow has no input for {', '.join(missing)}, which this job decided "
-                   "(it would run a different job than planned): export the port's Draft Video workflow in API format")
-    say("ACT3_NOTE ComfyUI inputs set: " + ", ".join(done))
-    say("ACT3_NOTE " + wire_decoder(wf, x.vae))
-    base = x.comfy_url.rstrip("/")
-    try:
-        r = http_json(f"{base}/prompt", {"prompt": wf, "client_id": str(uuid.uuid4())})
+        r = http_json(f"{srv.base}/prompt", {"prompt": wf, "client_id": str(uuid.uuid4())})
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        raise classify(1, body, x.prompt_text) if RE_OOM.search(scrub(body, x.prompt_text)) else \
-            Fail("internal", f"ComfyUI refused the workflow: {e.code} {scrub(body, x.prompt_text)[:400]}")
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        raise Fail("infra", f"ComfyUI is not reachable at {base}: {e}")
+        body = scrub(e.read().decode(errors="replace"), x.prompt_text)
+        kind = "not_installed" if RE_NO_NODE.search(body) else "invalid_input" if RE_BAD_VALUE.search(body) else "internal"
+        raise Fail(kind, f"ComfyUI refused the workflow: {e.code} {body[:600]}")
     pid = r.get("prompt_id") if isinstance(r, dict) else None
     if not pid:
         raise Fail("internal", f"ComfyUI returned no prompt_id: {json.dumps(r)[:300]}")
     x.comfy_prompt_id = pid
-    prog.band(5, 95, "ComfyUI refine")
     t0 = time.time()
-    last_ok = t0
-    deadline = t0 + comfy_deadline(x)
-    poll = max(0.01, float(os.environ.get("H3R_COMFY_POLL_S", "2") or 2))
-    lost = 0
+    deadline = t0 + deadline_s
     while True:
-        time.sleep(poll)
-        now = time.time()
-        if now > deadline:
-            raise Fail("infra", f"ComfyUI did not finish this refine within {int((deadline - t0) / 60)} min (prompt {pid}); "
-                       "it may be stuck or far slower than measured")
+        time.sleep(2)
+        code = srv.exited()
+        if code is not None:
+            err = classify(code, srv.log(), x.prompt_text)
+            raise err if err.kind != "internal" else Fail("internal", f"ComfyUI exited {code} during the render: {last_line(scrub(srv.log(), x.prompt_text))}")
+        if time.time() > deadline:
+            raise Fail("infra", f"the render did not finish within {int((deadline - t0) / 60)} min")
         try:
-            h = http_json(f"{base}/history/{urllib.parse.quote(str(pid))}")
-            last_ok = now
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            if now - last_ok > 600:
-                raise Fail("infra", f"ComfyUI stopped answering for 10 min: {e}")
+            entry = http_json(f"{srv.base}/history/{urllib.parse.quote(str(pid))}").get(pid)
+        except (urllib.error.URLError, OSError, ValueError):
             continue
-        entry = h.get(pid) if isinstance(h, dict) else None
         if not entry:
-            # Not in history: queued, running — or lost (ComfyUI restarted, or the queue was cleared). /queue tells.
-            try:
-                ids = _queue_ids(http_json(f"{base}/queue"))
-                lost = 0 if str(pid) in ids else lost + 1
-            except (urllib.error.URLError, OSError, ValueError):
-                pass
-            if lost >= 3:
-                raise Fail("infra", f"ComfyUI lost the refine (prompt {pid} is neither queued, running nor in history: "
-                           "a ComfyUI restart or a cleared queue)")
-            prog.frac(min(0.9, (now - t0) / 600))  # creep the bar so the job never looks hung
             continue
         status = entry.get("status") or {}
         if status.get("status_str") == "error":
-            msgs = scrub(json.dumps(status.get("messages", [])), x.prompt_text)[-1500:]
-            raise classify(1, msgs, x.prompt_text) if RE_OOM.search(msgs) else Fail("internal", f"ComfyUI run failed: {msgs[-400:]}")
-        files = []
-        for out in (entry.get("outputs") or {}).values():
-            if not isinstance(out, dict):
-                continue
-            for key in ("videos", "gifs", "images", "files"):
-                for f in out.get(key, []) or []:
-                    if isinstance(f, dict) and str(f.get("filename", "")).lower().endswith((".mp4", ".mov", ".webm", ".mkv")):
-                        files.append(f)
+            msgs = scrub(json.dumps(status.get("messages", [])) + "\n" + srv.log(), x.prompt_text)
+            err = classify(1, msgs, "")
+            raise err if err.kind != "internal" else Fail("internal", f"ComfyUI run failed: {msgs[-600:]}")
+        files = [f for out in (entry.get("outputs") or {}).values() if isinstance(out, dict)
+                 for key in ("videos", "images", "gifs") for f in (out.get(key) or [])
+                 if isinstance(f, dict) and str(f.get("filename", "")).lower().endswith(".mp4")]
         if not files:
             if status.get("completed") is False:
-                continue  # in history but still running (some ComfyUI versions write the entry early)
+                continue
             raise Fail("internal", "ComfyUI finished without a video output")
         f = files[-1]
-        q = urllib.parse.urlencode({"filename": f["filename"], "subfolder": f.get("subfolder", ""), "type": f.get("type", "output")})
-        tmp = refined + ".part"
-        try:
-            with urllib.request.urlopen(f"{base}/view?{q}", timeout=600) as resp, open(tmp, "wb") as out:
-                shutil.copyfileobj(resp, out)
-        except (urllib.error.URLError, OSError) as e:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise Fail("infra", f"downloading the refined video from ComfyUI failed: {e}")
-        if os.path.getsize(tmp) == 0:
-            os.remove(tmp)
-            raise Fail("internal", "ComfyUI's refined video is empty")
-        os.replace(tmp, refined)
-        return
+        src = os.path.join(srv.dirs["output"], f.get("subfolder") or "", f["filename"])
+        if not os.path.isfile(src) or os.path.getsize(src) == 0:
+            raise Fail("internal", f"ComfyUI's video is missing or empty: {src}")
+        return src
+
+
+def refine_comfy(x, refined, prog):
+    if x.vae != "standard":
+        raise Fail("invalid_input", "the ComfyUI path decodes with the released H3 VAE (tiled): plan --vae standard")
+    if x.lora != "r576":
+        raise Fail("invalid_input", "the Olm nodes load NVIDIA's merged r576 adapters only: plan --lora r576")
+    root = comfy_dir(x)
+    info = getattr(x, "draft_info", None) or probe(x.draft)
+    with ComfyServer(x, root, os.path.join(os.path.dirname(os.path.abspath(refined)), "comfy"), prog) as srv:
+        prog.band(3, 8, "starting ComfyUI")
+        srv.wait_ready()
+        name = "draft" + (os.path.splitext(x.draft)[1] or ".mp4")
+        stage_draft(x, info, os.path.join(srv.dirs["input"], name))
+        wf = comfy_workflow(x, loader_files(srv.base), name, "act3_h3r/refined", draft_audio=info["has_audio"])
+        prog.band(8, 95, "refining")
+        os.replace(run_workflow(srv, wf, x, comfy_deadline(x)), refined)
 
 
 # ── finish: trim the pad, re-mux the draft audio (§2.5, §10.2 result) ────────────────────────────────────────────
@@ -863,9 +956,8 @@ def main(argv=None):
     a.add_argument("--output-seconds", type=float, default=0)
     a.add_argument("--delivery", choices=["internal", "customer"], default="customer")
     a.add_argument("--license-cleared", action="store_true")
-    a.add_argument("--comfy-url", default="")
-    a.add_argument("--comfy-workflow", default="")
-    a.add_argument("--comfy-input-dir", default="")
+    a.add_argument("--comfy-home", default="", help="ComfyUI checkout with the Olm Open-H3 nodes (default <home>/ComfyUI)")
+    a.add_argument("--comfy-python", default="", help="python that runs ComfyUI (default: this interpreter, the model venv)")
     a.add_argument("--extra-args", default=os.environ.get("H3R_EXTRA_ARGS", ""), help="appended to every infer.py call (unverified flags)")
     a.add_argument("--dry-run", action="store_true", help="print the plan as JSON and exit")
     x = a.parse_args(argv)
@@ -908,7 +1000,7 @@ def main(argv=None):
             return 0
 
         stage("probing")
-        info = probe(x.draft)
+        info = x.draft_info = probe(x.draft)
         check_draft(info, x.backend, x.window_frames, x.allow_crop, x.allow_truncate)
         prog.set(2)
 
@@ -961,15 +1053,12 @@ def main(argv=None):
                 json.dump(meta, f, indent=2)
             say(f"wrote {x.out} ({os.path.getsize(x.out)} bytes)")
         return 0
-    except Fail as e:
-        print(f"ACT3_ERROR {e.kind}: {e}", file=sys.stderr, flush=True)
-        return EXIT.get(e.kind, 1)
-    except KeyboardInterrupt:
-        print("ACT3_ERROR internal: interrupted", file=sys.stderr, flush=True)
-        return 1
+    except (Exception, KeyboardInterrupt) as e:
+        return error_exit(e)
     finally:
         prog.close()
 
 
 if __name__ == "__main__":
+    setup_process()
     sys.exit(main())
