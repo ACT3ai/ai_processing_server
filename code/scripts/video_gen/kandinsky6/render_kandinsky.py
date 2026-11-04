@@ -63,7 +63,8 @@ if x.image and not os.path.exists(x.image):
 
 t0 = time.time()
 stage("loading")
-pipe = Kandinsky6TI2VAPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16)
+# disable_mmap: read each shard and let it go, so loading never holds the files mapped beside the model (Windows)
+pipe = Kandinsky6TI2VAPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16, disable_mmap=True)
 if x.device == "cuda":
     # capped, a GPU overflow fails here instead of spilling into system RAM (Windows' Sysmem Fallback)
     torch.cuda.set_per_process_memory_fraction(0.95)

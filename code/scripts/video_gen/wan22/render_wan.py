@@ -192,7 +192,9 @@ if pair_found:
 
 t0 = time.time()
 stage("loading")
-extra_load = {}
+# Read each shard and let it go: with mmap, Windows keeps every fp32 shard of an expert mapped while its bf16 copy is
+# built, and loading A14B's second expert took the 5090 to 3 GB free (2026-11-04).
+extra_load = {"disable_mmap": True}
 if cfg.get("expand_timesteps"):
     from diffusers import AutoencoderKLWan
 
