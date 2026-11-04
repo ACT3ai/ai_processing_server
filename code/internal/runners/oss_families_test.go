@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -122,6 +123,103 @@ func TestKandinskyArgv(t *testing.T) {
 	}
 	if err := kandinskyCheck(familyJob(nil), videoParams{Model: "kandinsky-6.0-lite", Kind: "i2v", DurationSeconds: 5}); kindOf(err) != jobs.KindInvalidInput {
 		t.Fatalf("i2v without a first frame must be refused: %v", err)
+	}
+}
+
+func TestH3CanvasArgvAndChecks(t *testing.T) {
+	for _, c := range []struct{ w, h, ww, wh int }{
+		{1920, 1080, 1344, 768}, {1280, 720, 1344, 768}, {1080, 1920, 768, 1344}, {1024, 1024, 768, 768}, {1280, 704, 1376, 768},
+	} {
+		if w, h := h3Frame(videoParams{Width: c.w, Height: c.h}); w != c.ww || h != c.wh || w*h > h3MaxPixels+32*768 {
+			t.Errorf("%dx%d → %dx%d, want %dx%d (768 short edge, area cap, /32)", c.w, c.h, w, h, c.ww, c.wh)
+		}
+	}
+	t.Setenv("ACT3_RENDER_HOME", t.TempDir())
+	snap := snapshot.Snapshot{Key: "k", Dir: "/snap/k"}
+	run := t.TempDir()
+	out := filepath.Join(run, "out", "output.mp4")
+	sixteen := 81
+	p := videoParams{Model: H3Model, Kind: "i2v", Prompt: "integrated_multimodal_description: [Shot 1] a boat", Width: 1280, Height: 720, Frames: &sixteen, FPS: 16}
+	tk, err := h3Task(snap, Env{}, p, "/in/first.png", out, 1344, 768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := tk.Argv
+	if a[1] != "/snap/k/code/scripts/video_gen/h3_regenerate/render_h3_generate.py" || argOf(a, "--image") != "/in/first.png" ||
+		argOf(a, "--seconds") != "5.062" || argOf(a, "--steps") != "20" || argOf(a, "--width") != "1344" {
+		t.Fatalf("argv (81 frames counted at 16 fps keep their 5.06 s): %v", a)
+	}
+	if b, _ := os.ReadFile(argOf(a, "--prompt-file")); !strings.HasPrefix(string(b), "integrated_multimodal_description:") || slices.Contains(a, "--prompt") {
+		t.Fatalf("the prompt travels in a file: %q", b)
+	}
+	p.Kind = "t2v"
+	if tk, _ = h3Task(snap, Env{}, p, "/in/first.png", out, 1344, 768); argOf(tk.Argv, "--image") != "" {
+		t.Fatalf("t2v sends no first frame: %v", tk.Argv)
+	}
+	internal := func(v videoParams) videoParams { v.Model, v.Delivery = H3Model, "internal"; return v }
+	refused := func(err error, kind jobs.ErrorKind, says string) bool {
+		return kindOf(err) == kind && strings.Contains(fmt.Sprint(err), says)
+	}
+	if err := h3Check(familyJob(nil), Env{}, internal(videoParams{Kind: "i2v", DurationSeconds: 5})); !refused(err, jobs.KindInvalidInput, "first_frame") {
+		t.Fatalf("i2v without a first frame must be refused: %v", err)
+	}
+	if err := h3Check(familyJob(nil), Env{}, internal(videoParams{Kind: "t2v", DurationSeconds: 20})); !refused(err, jobs.KindInvalidInput, "at most") {
+		t.Fatalf("20 s must be refused: %v", err)
+	}
+	many := 150
+	if err := h3Check(familyJob(nil), Env{}, internal(videoParams{Kind: "t2v", DurationSeconds: 5, Steps: &many})); !refused(err, jobs.KindInvalidInput, "1..100") {
+		t.Fatalf("150 steps must be refused: %v", err)
+	}
+	for _, d := range []any{nil, "customer", "prod"} {
+		if err := h3Check(familyJob(nil), Env{}, videoParams{Model: H3Model, Kind: "t2v", DurationSeconds: 5, Delivery: d}); !refused(err, jobs.KindInvalidInput, "license_not_cleared") {
+			t.Fatalf("delivery %v must fail closed: %v", d, err)
+		}
+	}
+	cust := familyJob(nil)
+	cust.Payload.DataRules.CustomerData = true
+	if err := h3Check(cust, Env{}, internal(videoParams{Kind: "t2v", DurationSeconds: 5})); !refused(err, jobs.KindInvalidInput, "license_not_cleared") {
+		t.Fatalf("customer data must be refused: %v", err)
+	}
+	t.Setenv("APS_FAKE_MODELS", "1")
+	if err := h3Check(familyJob(nil), Env{}, internal(videoParams{Kind: "t2v", DurationSeconds: 5})); err != nil {
+		t.Fatalf("an internal t2v job passes: %v", err)
+	}
+}
+
+func TestH3InstallNeedsGenerationFilesOnly(t *testing.T) {
+	if accelerator() != "cuda" {
+		if why := h3InstallProblem(); !strings.Contains(why, "CUDA") {
+			t.Fatalf("no CUDA: %q", why)
+		}
+		t.Skip("the file checks run on CUDA hosts")
+	}
+	home := t.TempDir()
+	t.Setenv("ACT3_RENDER_HOME", home)
+	if h3InstallProblem() == "" {
+		t.Fatal("an empty home is not an install")
+	}
+	touch := func(p string, n int64) {
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		f, _ := os.Create(p)
+		_ = f.Truncate(n)
+		_ = f.Close()
+	}
+	touch(venvPython(regenHome()), 1)
+	for _, f := range h3rComfyFiles {
+		if !f.refinerOnly {
+			touch(comfyPath(regenHome(), f.rel), f.min-1)
+		}
+	}
+	if why := h3InstallProblem(); !strings.Contains(why, "partial") {
+		t.Fatalf("files under their floor are a partial download: %q", why)
+	}
+	for _, f := range h3rComfyFiles {
+		if !f.refinerOnly {
+			touch(comfyPath(regenHome(), f.rel), f.min)
+		}
+	}
+	if why := h3InstallProblem(); why != "" {
+		t.Fatalf("generation needs no refiner files: %q", why)
 	}
 }
 

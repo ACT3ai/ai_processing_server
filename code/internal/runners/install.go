@@ -17,7 +17,7 @@ func InstallProblems() map[string]string {
 	}
 	// A runner with several models is offered when any of them is installed: film/servers verifies each model on its
 	// own, and a job naming one that is missing fails its Check with "not installed".
-	if p := firstProblem(wanInstallProblem(wanMachineModel()), ltxInstallProblem(), kandinskyInstallProblem("lite"), kandinskyInstallProblem("pro")); p != "" {
+	if p := firstProblem(wanInstallProblem(wanMachineModel()), ltxInstallProblem(), kandinskyInstallProblem("lite"), kandinskyInstallProblem("pro"), h3InstallProblem()); p != "" {
 		m[OSSVideo{}.Name()] = p
 	}
 	if p := firstProblem(seedvr2InstallProblem(seedvr2Qualities["standard"].dit), flashvsrInstallProblem()); p != "" {

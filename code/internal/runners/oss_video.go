@@ -14,7 +14,8 @@ import (
 )
 
 // OSSVideo is the runner behind act3.video_gen_open_source: open-source video generation on our own GPUs. The job's
-// model picks the family: Wan 2.2 (below), LTX-2.5 (oss_ltx.go), Kandinsky 6.0 Lite/Pro (oss_kandinsky.go).
+// model picks the family: Wan 2.2 (below), LTX-2.5 (oss_ltx.go), Kandinsky 6.0 Lite/Pro (oss_kandinsky.go), MiniMax H3
+// (oss_h3.go).
 // Model "wan2.2-a14b" (the default): Wan 2.2 A14B image-to-video from input "first_frame" (the I2V weights are
 // required: shots almost always carry one), or text-to-video, on CUDA (B5090) or Metal (the Mac Studio). It runs code/scripts/video_gen/wan22/
 // render_wan.py from the job's snapshot with the install at ~/act3_render/wan_2_2/ (models are not code, R5).
@@ -74,6 +75,7 @@ type videoParams struct {
 	Seed            *int64  `json:"seed"`
 	Prompt          string  `json:"prompt"`
 	NegativePrompt  string  `json:"negative_prompt"`
+	Delivery        any     `json:"delivery"` // minimax-h3: internal|customer (deliveryOf)
 
 	// The internal web app spreads its LocalJob params as they are (camelCase): accepted as aliases.
 	DurationSecondsAlt float64 `json:"durationSeconds"`
@@ -133,6 +135,11 @@ func (OSSVideo) Check(_ context.Context, job *jobs.Job, env Env) error {
 			return err
 		}
 		installProblem = func() string { return kandinskyInstallProblem(q) }
+	case p.Model == H3Model:
+		if err := h3Check(job, env, p); err != nil {
+			return err
+		}
+		installProblem = h3InstallProblem
 	default:
 		if err := wanCheck(job, p); err != nil {
 			return err
@@ -167,7 +174,7 @@ func wanCheck(job *jobs.Job, p videoParams) error {
 
 // videoModelIDs: every model this runner renders, for "not built" answers.
 func videoModelIDs() []string {
-	return append(wanModelIDs(), LTXModel, "kandinsky-6.0-lite", "kandinsky-6.0-pro")
+	return append(wanModelIDs(), LTXModel, "kandinsky-6.0-lite", "kandinsky-6.0-pro", H3Model)
 }
 
 func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (*Result, error) {
@@ -176,13 +183,15 @@ func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (
 		return nil, err
 	}
 	p.defaults()
-	return runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
+	res, err := runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
 		var w, h, frames int
 		switch {
 		case p.Model == LTXModel:
 			w, h, frames = ltxFrame(p)
 		case kandinskyQuality(p.Model) != "":
 			w, h, frames = kandinskyFrame(p)
+		case p.Model == H3Model:
+			w, h = h3Frame(p)
 		default:
 			w, h, frames = wanFrame(p)
 		}
@@ -194,9 +203,17 @@ func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (
 			return ltxTask(p, inputs["first_frame"], out, w, h, frames), nil
 		case kandinskyQuality(p.Model) != "":
 			return kandinskyTask(snap, env, p, inputs["first_frame"], out, w, h, frames), nil
+		case p.Model == H3Model:
+			return h3Task(snap, env, p, inputs["first_frame"], out, w, h)
 		}
 		return wanTask(snap, p, inputs["first_frame"], out, w, h, frames), nil
 	})
+	if err == nil && res != nil && p.Model == H3Model {
+		for i := range res.Outputs {
+			res.Outputs[i].Meta = map[string]any{"license_cleared": H3RegenerateLicenseCleared, "delivery": deliveryOf(p.Delivery)}
+		}
+	}
+	return res, err
 }
 
 func wanModelIDs() []string {
