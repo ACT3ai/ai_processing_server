@@ -8,6 +8,7 @@ import (
 // $ACT3_WAN_MODEL sizes the Wan offer: TI2V-5B fits an 8 GB card, an unknown name refuses to load.
 func TestServiceModelPicksItsNeeds(t *testing.T) {
 	const id = "act3.video_gen_open_source"
+	t.Setenv("ACT3_WAN_MODEL", "") // a 5B machine's shell must not decide the default
 	c, err := LoadCatalog("../../../data")
 	if err != nil {
 		t.Fatal(err)

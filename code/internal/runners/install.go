@@ -15,10 +15,12 @@ func InstallProblems() map[string]string {
 	if FakeModels() {
 		return m
 	}
-	if p := wanInstallProblem(wanMachineModel()); p != "" {
+	// A runner with several models is offered when any of them is installed: film/servers verifies each model on its
+	// own, and a job naming one that is missing fails its Check with "not installed".
+	if p := firstProblem(wanInstallProblem(wanMachineModel()), ltxInstallProblem(), kandinskyInstallProblem("lite"), kandinskyInstallProblem("pro")); p != "" {
 		m[OSSVideo{}.Name()] = p
 	}
-	if p := seedvr2InstallProblem(seedvr2Qualities["standard"].dit); p != "" {
+	if p := firstProblem(seedvr2InstallProblem(seedvr2Qualities["standard"].dit), flashvsrInstallProblem()); p != "" {
 		m[OSSUpscale{}.Name()] = p
 	}
 	if p := regenInstallProblem(Env{}); p != "" {
@@ -58,4 +60,14 @@ func seedvr2InstallProblem(dit string) string {
 		}
 	}
 	return ""
+}
+
+// firstProblem is "" when any check passed (that model is installed), else the first check's problem.
+func firstProblem(problems ...string) string {
+	for _, p := range problems {
+		if p == "" {
+			return ""
+		}
+	}
+	return problems[0]
 }

@@ -13,7 +13,8 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
 )
 
-// OSSVideo is the runner behind act3.video_gen_open_source: open-source video generation on our own GPUs.
+// OSSVideo is the runner behind act3.video_gen_open_source: open-source video generation on our own GPUs. The job's
+// model picks the family: Wan 2.2 (below), LTX-2.5 (oss_ltx.go), Kandinsky 6.0 Lite/Pro (oss_kandinsky.go).
 // Model "wan2.2-a14b" (the default): Wan 2.2 A14B text-to-video, or image-to-video from input "first_frame" when the
 // I2V weights are installed, on CUDA (B5090) or Metal (the Mac Studio). It runs code/scripts/video_gen/wan22/
 // render_wan.py from the job's snapshot with the install at ~/act3_render/wan_2_2/ (models are not code, R5).
@@ -114,9 +115,43 @@ func (OSSVideo) Check(_ context.Context, job *jobs.Job, env Env) error {
 		return err
 	}
 	p.defaults()
+	if p.Width < 16 || p.Height < 16 || p.Width > 4096 || p.Height > 4096 {
+		return jobs.Errf(jobs.KindInvalidInput, "width and height must be 16..4096")
+	}
+	if strings.TrimSpace(p.Prompt) == "" {
+		return jobs.Errf(jobs.KindInvalidInput, "prompt is required")
+	}
+	var installProblem func() string
+	switch q := kandinskyQuality(p.Model); {
+	case p.Model == LTXModel:
+		if err := ltxCheck(p); err != nil {
+			return err
+		}
+		installProblem = ltxInstallProblem
+	case q != "":
+		if err := kandinskyCheck(job, p); err != nil {
+			return err
+		}
+		installProblem = func() string { return kandinskyInstallProblem(q) }
+	default:
+		if err := wanCheck(job, p); err != nil {
+			return err
+		}
+		installProblem = func() string { return wanInstallProblem(p.Model) }
+	}
+	if FakeModels() {
+		return nil
+	}
+	if why := installProblem(); why != "" {
+		return jobs.Errf(jobs.KindInfra, "%s", why)
+	}
+	return nil
+}
+
+func wanCheck(job *jobs.Job, p videoParams) error {
 	m, ok := wanModels[p.Model]
 	if !ok {
-		return jobs.Errf(jobs.KindInvalidInput, "model %q is not built on this server yet (built: %s)", p.Model, strings.Join(wanModelIDs(), ", "))
+		return jobs.Errf(jobs.KindInvalidInput, "model %q is not built on this server (built: %s)", p.Model, strings.Join(videoModelIDs(), ", "))
 	}
 	if p.Kind != "t2v" && p.Kind != "i2v" {
 		return jobs.Errf(jobs.KindInvalidInput, "Wan 2.2 makes video from a prompt (t2v) or a first frame (i2v), not %q", p.Kind)
@@ -124,22 +159,15 @@ func (OSSVideo) Check(_ context.Context, job *jobs.Job, env Env) error {
 	if p.DurationSeconds <= 0 || p.DurationSeconds > float64(m.maxFrames)/float64(m.fps)+0.01 {
 		return jobs.Errf(jobs.KindInvalidInput, "Wan 2.2 makes at most %.2f s per clip", float64(m.maxFrames)/float64(m.fps))
 	}
-	if p.Width < 16 || p.Height < 16 || p.Width > 4096 || p.Height > 4096 {
-		return jobs.Errf(jobs.KindInvalidInput, "width and height must be 16..4096")
-	}
-	if strings.TrimSpace(p.Prompt) == "" {
-		return jobs.Errf(jobs.KindInvalidInput, "prompt is required")
-	}
 	if p.Kind == "i2v" && !hasInput(job, "first_frame") {
 		return jobs.Errf(jobs.KindInvalidInput, "an i2v job needs the input \"first_frame\"")
 	}
-	if FakeModels() {
-		return nil
-	}
-	if why := wanInstallProblem(p.Model); why != "" {
-		return jobs.Errf(jobs.KindInfra, "%s", why)
-	}
 	return nil
+}
+
+// videoModelIDs: every model this runner renders, for "not built" answers.
+func videoModelIDs() []string {
+	return append(wanModelIDs(), LTXModel, "kandinsky-6.0-lite", "kandinsky-6.0-pro")
 }
 
 func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (*Result, error) {
@@ -149,9 +177,23 @@ func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (
 	}
 	p.defaults()
 	return runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
-		w, h, frames := wanFrame(p)
+		var w, h, frames int
+		switch {
+		case p.Model == LTXModel:
+			w, h, frames = ltxFrame(p)
+		case kandinskyQuality(p.Model) != "":
+			w, h, frames = kandinskyFrame(p)
+		default:
+			w, h, frames = wanFrame(p)
+		}
 		if FakeModels() {
 			return fakeTask(snap, out, "", p.Prompt, w, h)
+		}
+		switch {
+		case p.Model == LTXModel:
+			return ltxTask(p, out, w, h, frames), nil
+		case kandinskyQuality(p.Model) != "":
+			return kandinskyTask(snap, env, p, inputs["first_frame"], out, w, h, frames), nil
 		}
 		return wanTask(snap, p, inputs["first_frame"], out, w, h, frames), nil
 	})
@@ -178,15 +220,7 @@ func wanFrame(p videoParams) (w, h, frames int) {
 	scale := math.Min(1, math.Min(maxW/float64(max(1, p.Width)), maxH/float64(max(1, p.Height))))
 	w = floorTo(int(float64(p.Width)*scale), m.multipleOf)
 	h = floorTo(int(float64(p.Height)*scale), m.multipleOf)
-	if p.Frames != nil && *p.Frames > 0 {
-		want := *p.Frames
-		if p.FPS > 0 && p.FPS != m.fps {
-			want = int(math.Round(float64(want-1)*float64(m.fps)/float64(p.FPS))) + 1
-		}
-		frames = framesKn1(want, 4, m.maxFrames)
-	} else {
-		frames = framesKn1(int(math.Round(p.DurationSeconds*float64(m.fps)))+1, 4, m.maxFrames)
-	}
+	frames = framesKn1(framesWanted(p, m.fps), 4, m.maxFrames)
 	return
 }
 

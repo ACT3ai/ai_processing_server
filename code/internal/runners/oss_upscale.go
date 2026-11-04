@@ -35,6 +35,7 @@ type upscaleParams struct {
 	DurationSeconds float64 `json:"duration_seconds"`
 	// SegmentSeconds: source seconds per checkpointed segment (R8); 0 = never segment; absent = the default.
 	SegmentSeconds *float64 `json:"segment_seconds"`
+	Factor         float64  `json:"factor"` // FlashVSR: the scale; 0 = target width over the source's
 
 	DurationSecondsAlt float64 `json:"durationSeconds"` // the internal web app's camelCase
 }
@@ -78,8 +79,20 @@ func (OSSUpscale) Check(_ context.Context, job *jobs.Job, env Env) error {
 		return err
 	}
 	p.defaults()
+	if isFlashVSR(p.Model) {
+		if err := flashvsrCheck(job, p); err != nil {
+			return err
+		}
+		if FakeModels() {
+			return nil
+		}
+		if why := flashvsrInstallProblem(); why != "" {
+			return jobs.Errf(jobs.KindInfra, "%s", why)
+		}
+		return nil
+	}
 	if p.Model != "seedvr2" {
-		return jobs.Errf(jobs.KindInvalidInput, "upscaler %q is not built on this server yet (built: seedvr2)", p.Model)
+		return jobs.Errf(jobs.KindInvalidInput, "upscaler %q is not built on this server (built: seedvr2, %s)", p.Model, FlashVSRModel)
 	}
 	q, ok := seedvr2Qualities[p.Quality]
 	if !ok {
@@ -113,6 +126,17 @@ func (OSSUpscale) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter)
 	}
 	p.defaults()
 	accel := accelerator()
+	if isFlashVSR(p.Model) {
+		return runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
+			src := inputs["source_video"]
+			if FakeModels() {
+				return fakeTask(snap, out, src, "", p.Width, p.Height)
+			}
+			scale := flashvsrScale(p, enginePath(env, "ffprobe"), src)
+			rep.Log(fmt.Sprintf("FlashVSR x%g", scale))
+			return flashvsrTask(snap, env, scale, src, out), nil
+		})
+	}
 	return runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
 		src := inputs["source_video"]
 		one := func(in, o string) detachedTask { return seedvr2Task(p, in, o, accel) }

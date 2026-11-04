@@ -415,6 +415,24 @@ render_wan.py offloads layer by layer when the model's largest part does not fit
 the same variable (`wan-local.ts` `WAN_MODELS`) to pick the model id it sends: set it for both processes.
 `~/BGit/act3/ai_processing_server/code/internal/config/load.go` — `ServiceDef.pickModel`
 
+LTX-2.5 and Kandinsky 6.0 (2026-11-04) run on the same service, picked by the job's model. LTX-2.5 (`ltx-2.5`) runs
+`python -m ltx_pipelines.distilled` from the pinned Lightricks/LTX-2 checkout's venv (the repo is the model's code, not
+snapshotted), text-to-video with audio; on CUDA with `--quantization fp8-cast --offload cpu` so the 22B transformer
+fits 32 GB (`LTX_ARGS` replaces them). Kandinsky (`kandinsky-6.0-lite`, `kandinsky-6.0-pro`) runs the snapshot's
+render_kandinsky.py; Pro is CUDA only and offloads layer by layer when it does not fit, and the pipeline's audio is
+muxed with the server's ffmpeg. The service is offered when any of its models is installed; a job for a missing one
+fails its Check as infra "not installed".
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss_ltx.go` — `ltxCheck`, `ltxFrame`, `ltxTask`
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss_kandinsky.go` — `kandinskyCheck`, `kandinskyFrame`, `kandinskyTask`
+
+FlashVSR v1.1 (`flashvsr-1.1`, 2026-11-04) runs on act3.upscale_open_source through the snapshot's run_flashvsr.py,
+the ACT3 port that replaces upstream's CUDA-only Block-Sparse-Attention with the same block mask in plain torch, so it
+runs on MPS and CUDA without a kernel build. Scale: the job's `factor`, else target width over the source's.
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss_flashvsr.go` — `flashvsrCheck`, `flashvsrScale`, `flashvsrTask`
+
+Every model's install (macOS, Windows, Linux) is the BMS smart-contract child's recipes, run by `just build` in
+`~/BGit/all/app/code/film/servers`: `~/BGit/all/app/smartc/film/servers/bms/oss_video/common/setup.mjs`.
+
 SeedVR2 upscaling for act3.upscale_open_source (Mac Studio profile on Metal, RTX 5090 profile on CUDA) is
 implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/runners/oss_upscale.go` — `OSSUpscale.Check`, `OSSUpscale.Run`, `seedvr2Task`
