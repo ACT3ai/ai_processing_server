@@ -110,8 +110,18 @@ func h3Seconds(p videoParams) float64 {
 }
 
 // h3Frame: H3's canvas for the job's aspect (ComfyUI nodes_minimax_h3.py adapt_canvas): a 768 short edge, the area
-// capped at 768×1344 before each side is rounded to 32.
+// capped at 768×1344 before each side is rounded to 32. A smaller frame the job asks for (production's 480p / 720p
+// tiers) is kept, on the 32 grid, the way the node keeps a reference video smaller than its canvas.
 func h3Frame(p videoParams) (w, h int) {
+	cw, ch := h3Canvas(p)
+	if p.Width > 0 && p.Height > 0 && p.Width*p.Height < cw*ch {
+		round := func(v int) int { return max(32, int(math.Round(float64(v)/32))*32) }
+		return round(p.Width), round(p.Height)
+	}
+	return cw, ch
+}
+
+func h3Canvas(p videoParams) (w, h int) {
 	ratio := float64(max(1, p.Width)) / float64(max(1, p.Height))
 	nw, nh := h3ShortEdge*ratio, float64(h3ShortEdge)
 	if ratio < 1 {
