@@ -338,7 +338,8 @@ func host(dir string) error {
 		if st != "" {
 			ev.add(Event{Type: "stage", Stage: st})
 		} else if p, ok := ParseProgress(s); ok {
-			if !thirdPartyMuted {
+			// a loading bar (checkpoint shards, a download) reaching 100% is not the render reaching 100%
+			if !thirdPartyMuted && (own || !reLoading.MatchString(s)) {
 				ev.progress((before+weights[cur]*p)/total, s)
 			}
 		} else if strings.HasPrefix(s, "ACT3_NOTE ") {
@@ -524,6 +525,8 @@ var (
 	rePct   = regexp.MustCompile(`(\d{1,3}(?:\.\d+)?)\s*%\s*\|`)
 	reRatio = regexp.MustCompile(`(?i)\b(?:step|steps|batch|frames?|chunk|segment)\b[^0-9]{0,12}(\d+)\s*(?:/|of)\s*(\d+)`)
 	reStage = regexp.MustCompile(`ACT3_STAGE\s+(\S+)`)
+	// third-party bars that measure loading, not rendering
+	reLoading = regexp.MustCompile(`(?i)\b(?:loading|load|shards?|fetching|downloading)\b`)
 )
 
 // ParseProgress reads a 0..1 fraction from one output line.
