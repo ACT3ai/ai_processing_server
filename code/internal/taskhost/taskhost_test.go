@@ -374,3 +374,27 @@ func TestRecordDeathCountsEachHostOnce(t *testing.T) {
 		t.Fatalf("deaths not carried: %v %v", Deaths(dir2), err)
 	}
 }
+
+// A heartbeat caught mid-replace (Windows refuses the read during the rename) is one bad look, not a death.
+func TestWatchSurvivesOneUnreadableHeartbeat(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, TaskFile), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hb := filepath.Join(dir, HeartbeatFile)
+	if err := os.WriteFile(hb, []byte("{half a fi"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(WatchPoll + WatchPoll/2)
+		_ = writeJSONAtomic(hb, Heartbeat{PID: os.Getpid(), Boot: BootID(), StartedAt: time.Now(), At: time.Now()})
+		time.Sleep(3 * WatchPoll)
+		_ = writeJSONAtomic(filepath.Join(dir, ExitFile), Exit{Code: 0})
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ex, err := Watch(ctx, dir, nil)
+	if err != nil || ex.Code != 0 {
+		t.Fatalf("Watch = %+v, %v; want the exit record", ex, err)
+	}
+}

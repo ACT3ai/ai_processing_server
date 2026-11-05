@@ -63,7 +63,9 @@ var (
 	StaleAfter     = 30 * time.Second // no heartbeat for this long and no exit.json: the task host is gone
 	CancelPoll     = 2 * time.Second
 	WatchPoll      = 1 * time.Second
-	StartGrace     = 20 * time.Second // a fresh launch gets this long to write its first heartbeat
+	// DeadPolls: consecutive Watch polls a task host must look dead before it is taken for gone
+	DeadPolls  = 3
+	StartGrace = 20 * time.Second // a fresh launch gets this long to write its first heartbeat
 	// StaleHard: a task host whose process is still alive (same boot, same pid) but whose heartbeat stopped is only
 	// declared dead after this long. A disk stall or a swap storm can pause the heartbeat for more than StaleAfter;
 	// declaring such a host dead started a second one on the same run directory while the first still rendered.
@@ -751,6 +753,7 @@ func Watch(ctx context.Context, dir string, onEvent func(Event)) (Exit, error) {
 	}
 	t := time.NewTicker(WatchPoll)
 	defer t.Stop()
+	dead := 0
 	for {
 		flush()
 		switch Alive(dir) {
@@ -758,7 +761,13 @@ func Watch(ctx context.Context, dir string, onEvent func(Event)) (Exit, error) {
 			flush()
 			return ReadExit(dir)
 		case Dead, Missing:
-			return Exit{}, ErrDead
+			// one look can land on a heartbeat being replaced (Windows refuses the read mid-rename): the task host
+			// is gone only when it looks gone DeadPolls times in a row
+			if dead++; dead >= DeadPolls {
+				return Exit{}, ErrDead
+			}
+		default:
+			dead = 0
 		}
 		select {
 		case <-ctx.Done():
