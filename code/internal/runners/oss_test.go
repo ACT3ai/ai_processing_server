@@ -143,6 +143,11 @@ func TestSeedVR2Argv(t *testing.T) {
 	if argOf(a, "--batch_size") != "9" || slices.Contains(a, "--blocks_to_swap") || !slices.Contains(a, "--vae_encode_tiled") {
 		t.Fatalf("5090 3B 4K: %v", a)
 	}
+	// 3B at 1080p keeps 21 frames, but an untiled decode of them outgrows the card
+	a = seedvr2Task(upscaleParams{Quality: "standard", Width: 1920, Height: 1080}, "/in.mp4", "/out.mp4", "cuda").Argv
+	if argOf(a, "--batch_size") != "21" || !slices.Contains(a, "--vae_decode_tiled") || slices.Contains(a, "--vae_encode_tiled") {
+		t.Fatalf("5090 3B 1080p: %v", a)
+	}
 	if a = seedvr2Task(upscaleParams{Quality: "standard", Width: 1920, Height: 1080}, "/in.mp4", "/out.mp4", "cuda").Argv; argOf(a, "--batch_size") != "21" || slices.Contains(a, "--vae_encode_tiled") {
 		t.Fatalf("5090 3B 1080p: %v", a)
 	}

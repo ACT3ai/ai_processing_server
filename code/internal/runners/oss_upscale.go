@@ -193,7 +193,8 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 	if (accel == "mps" && short >= 1080) || (accel == "cuda" && short >= nvidiaHighRes) {
 		argv = append(argv, "--vae_encode_tiled")
 	}
-	if (accel == "mps" && short >= 1080) || short >= nvidiaHighRes {
+	// untiled, a 21-frame 1080p decode outgrows a 32 GB card (Windows spills it to shared memory, ~3 min a batch)
+	if short >= 1080 {
 		argv = append(argv, "--vae_decode_tiled")
 	}
 	argv = append(argv, strings.Fields(os.Getenv("SEEDVR2_EXTRA_ARGS"))...)
