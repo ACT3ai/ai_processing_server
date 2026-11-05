@@ -99,15 +99,22 @@ def media_seconds(path):
         raise Fail("invalid_input", f"the reference audio cannot be read: {os.path.basename(path)}")
 
 
+def audio_shares(seconds):
+    """Each clip's share of H3's 15 s: the short ones whole, the rest evenly, so no clip (and no <Audio N> the prompt
+    names) is lost."""
+    keep, left = [0.0] * len(seconds), MAX_REF_AUDIO_SECONDS
+    order = sorted(range(len(seconds)), key=lambda j: seconds[j])
+    for k, j in enumerate(order):
+        keep[j] = min(seconds[j], left / (len(order) - k))
+        left -= keep[j]
+    return keep
+
+
 def stage_audio(srcs, input_dir):
     """Each reference audio as a WAV in ComfyUI's input dir, cut so all of them fit H3's 15 s total."""
-    names, left = [], MAX_REF_AUDIO_SECONDS
-    for j, src in enumerate(srcs):
-        secs = media_seconds(src)
-        if left < 1.0:
-            say(f"ACT3_NOTE reference audio {j + 1} dropped: the {MAX_REF_AUDIO_SECONDS:.0f} s reference budget is used up")
-            break
-        keep = min(secs, left)
+    names = []
+    seconds = [media_seconds(src) for src in srcs]
+    for j, (src, secs, keep) in enumerate(zip(srcs, seconds, audio_shares(seconds))):
         if keep < secs:
             say(f"ACT3_NOTE reference audio {j + 1} cut from {secs:.1f} s to {keep:.1f} s (H3 takes {MAX_REF_AUDIO_SECONDS:.0f} s of reference audio in all)")
         name = f"ref_audio_{j}.wav"
@@ -116,7 +123,6 @@ def stage_audio(srcs, input_dir):
         if r.returncode != 0:
             raise Fail("invalid_input", f"reference audio {j + 1} cannot be decoded: {r.stderr.strip()[-300:]}")
         names.append(name)
-        left -= keep
     return names
 
 
