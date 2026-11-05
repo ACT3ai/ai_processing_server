@@ -129,8 +129,8 @@ func TestKandinskyArgv(t *testing.T) {
 func TestH3CanvasArgvAndChecks(t *testing.T) {
 	for _, c := range []struct{ w, h, ww, wh int }{
 		{1920, 1080, 1344, 768}, {1080, 1920, 768, 1344}, {1024, 1024, 768, 768},
-		// a smaller frame (production's 480p / 720p tiers) is kept on the 32 grid, never raised to the canvas
-		{832, 480, 832, 480}, {1248, 704, 1248, 704}, {1280, 720, 1280, 736},
+		// a smaller frame (production's 480p / 720p tiers) is kept, rounded down to the 32 grid and at least 256
+		{832, 480, 832, 480}, {1248, 704, 1248, 704}, {1280, 720, 1280, 704}, {400, 224, 384, 256},
 	} {
 		if w, h := h3Frame(videoParams{Width: c.w, Height: c.h}); w != c.ww || h != c.wh || w*h > h3MaxPixels+32*768 {
 			t.Errorf("%dx%d → %dx%d, want %dx%d (768 short edge, area cap, /32; smaller kept)", c.w, c.h, w, h, c.ww, c.wh)
@@ -266,6 +266,17 @@ func TestH3InstallNeedsGenerationFilesOnly(t *testing.T) {
 	}
 	if why := h3InstallProblem(); why != "" {
 		t.Fatalf("generation needs no refiner files: %q", why)
+	}
+	// a Seedance-fed job (references) needs the Ref2VA base too; a first-frame job does not
+	if why := h3InstallProblemFor(familyJob(nil, "first_frame")); why != "" {
+		t.Fatalf("FL2VA job: %q", why)
+	}
+	if why := h3InstallProblemFor(familyJob(nil, "reference_image_1")); !strings.Contains(why, "ref2va") {
+		t.Fatalf("Ref2VA job without its base: %q", why)
+	}
+	touch(comfyPath(regenHome(), h3Ref2VABase), 19_000_000_000)
+	if why := h3InstallProblemFor(familyJob(nil, "reference_image_1", "audio_2")); why != "" {
+		t.Fatalf("Ref2VA installed: %q", why)
 	}
 }
 

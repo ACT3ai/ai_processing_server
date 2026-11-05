@@ -49,6 +49,23 @@ func h3InstallProblem() string {
 	return ""
 }
 
+// h3InstallProblemFor: what this job needs, the Ref2VA base too when it carries references (the FL2VA install alone
+// renders text and first-frame jobs, so the server still offers H3 without it).
+func h3InstallProblemFor(job *jobs.Job) string {
+	if why := h3InstallProblem(); why != "" {
+		return why
+	}
+	names := inputNames(job)
+	if len(roleInputs(names, "reference_image"))+len(roleInputs(names, "audio")) > 0 {
+		if p := comfyPath(regenHome(), h3Ref2VABase); !fileAtLeast(p, 19_000_000_000) {
+			return h3Missing(p)
+		}
+	}
+	return ""
+}
+
+var h3Ref2VABase = []string{"models", "diffusion_models", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"}
+
 func h3Missing(p string) string {
 	return fmt.Sprintf("MiniMax H3 is not installed on this server: missing or partial %s (install: ~/BGit/all/app/smartc/film/servers/bms/oss_video/open_h3_regenerate_2k/)", p)
 }
@@ -111,11 +128,11 @@ func h3Seconds(p videoParams) float64 {
 
 // h3Frame: H3's canvas for the job's aspect (ComfyUI nodes_minimax_h3.py adapt_canvas): a 768 short edge, the area
 // capped at 768×1344 before each side is rounded to 32. A smaller frame the job asks for (production's 480p / 720p
-// tiers) is kept, on the 32 grid, the way the node keeps a reference video smaller than its canvas.
+// tiers) is kept, rounded down to the 32 grid, the way the node keeps a reference video smaller than its canvas.
 func h3Frame(p videoParams) (w, h int) {
 	cw, ch := h3Canvas(p)
 	if p.Width > 0 && p.Height > 0 && p.Width*p.Height < cw*ch {
-		round := func(v int) int { return max(32, int(math.Round(float64(v)/32))*32) }
+		round := func(v int) int { return max(256, v/32*32) } // down to the grid, never under the script's floor
 		return round(p.Width), round(p.Height)
 	}
 	return cw, ch

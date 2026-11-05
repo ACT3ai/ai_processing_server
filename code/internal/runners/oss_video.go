@@ -141,7 +141,7 @@ func (OSSVideo) Check(_ context.Context, job *jobs.Job, env Env) error {
 		if err := h3Check(job, env, p); err != nil {
 			return err
 		}
-		installProblem = h3InstallProblem
+		installProblem = func() string { return h3InstallProblemFor(job) }
 	default:
 		if err := wanCheck(job, p); err != nil {
 			return err
