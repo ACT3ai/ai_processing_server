@@ -689,7 +689,7 @@ func Alive(dir string) State {
 		return Missing
 	}
 	var hb Heartbeat
-	if err := readJSON(filepath.Join(dir, HeartbeatFile), &hb); err != nil {
+	if err := readHeartbeat(filepath.Join(dir, HeartbeatFile), &hb); err != nil {
 		return Dead
 	}
 	if cur := BootID(); hb.Boot != "" && cur != "" && hb.Boot != cur {
@@ -842,6 +842,20 @@ func Watch(ctx context.Context, dir string, onEvent func(Event)) (Exit, error) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+
+// readHeartbeat reads a heartbeat, looking again briefly when it cannot: on Windows the file is unreadable for an
+// instant while the task host renames a new one over it, and one unlucky look must not start a second host.
+func readHeartbeat(path string, hb *Heartbeat) (err error) {
+	for try := 0; try < 3; try++ {
+		if try > 0 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err = readJSON(path, hb); err == nil {
+			return nil
+		}
+	}
+	return err
+}
 
 func readJSON(path string, v any) error {
 	b, err := os.ReadFile(path)
