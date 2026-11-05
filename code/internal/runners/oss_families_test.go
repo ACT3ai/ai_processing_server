@@ -59,7 +59,7 @@ func TestLTXArgv(t *testing.T) {
 	if w != 1280 || h != 704 || fr != 121 {
 		t.Fatalf("frame: %dx%d %d", w, h, fr)
 	}
-	a := ltxTask(p, "/in/first.png", "/o.mp4", w, h, fr)
+	a := ltxTask(p, "/in/first.png", "", "/o.mp4", w, h, fr)
 	if a.Argv[0] != venvPython("/r/ltx_2_5/LTX-2") || a.Argv[1] != "-m" || a.Argv[2] != "ltx_pipelines.distilled" || a.Dir != "/r/ltx_2_5/LTX-2" {
 		t.Fatalf("program: %v in %s", a.Argv[:3], a.Dir)
 	}
@@ -74,7 +74,7 @@ func TestLTXArgv(t *testing.T) {
 	}
 	t.Setenv("LTX_ARGS", "--offload disk")
 	t.Setenv("LTX_TRANSFORMER_PATH", "/fp8.safetensors")
-	a = ltxTask(p, "/in/first.png", "/o.mp4", w, h, fr)
+	a = ltxTask(p, "/in/first.png", "", "/o.mp4", w, h, fr)
 	if slices.Contains(a.Argv, "fp8-cast") || argOf(a.Argv, "--offload") != "disk" || argOf(a.Argv, "--transformer-path") != "/fp8.safetensors" {
 		t.Fatalf("overrides: %v", a.Argv)
 	}
@@ -83,7 +83,7 @@ func TestLTXArgv(t *testing.T) {
 		t.Fatalf("frames from 16 fps: %d", fr)
 	}
 	p.Kind = "i2v"
-	if a = ltxTask(p, "/in/first.png", "/o.mp4", w, h, fr); argOf(a.Argv, "--image") != "/in/first.png" || a.Argv[slices.Index(a.Argv, "--image")+2] != "0" {
+	if a = ltxTask(p, "/in/first.png", "", "/o.mp4", w, h, fr); argOf(a.Argv, "--image") != "/in/first.png" || a.Argv[slices.Index(a.Argv, "--image")+2] != "0" {
 		t.Fatalf("i2v must condition frame 0 on the first frame: %v", a.Argv)
 	}
 	if err := ltxCheck(familyJob(nil), videoParams{Kind: "i2v", DurationSeconds: 5}); kindOf(err) != jobs.KindInvalidInput {
@@ -128,10 +128,12 @@ func TestKandinskyArgv(t *testing.T) {
 
 func TestH3CanvasArgvAndChecks(t *testing.T) {
 	for _, c := range []struct{ w, h, ww, wh int }{
-		{1920, 1080, 1344, 768}, {1280, 720, 1344, 768}, {1080, 1920, 768, 1344}, {1024, 1024, 768, 768}, {1280, 704, 1376, 768},
+		{1920, 1080, 1344, 768}, {1080, 1920, 768, 1344}, {1024, 1024, 768, 768},
+		// a smaller frame (production's 480p / 720p tiers) is kept, rounded down to the 32 grid and at least 256
+		{832, 480, 832, 480}, {1248, 704, 1248, 704}, {1280, 720, 1280, 704}, {400, 224, 384, 256},
 	} {
 		if w, h := h3Frame(videoParams{Width: c.w, Height: c.h}); w != c.ww || h != c.wh || w*h > h3MaxPixels+32*768 {
-			t.Errorf("%dx%d → %dx%d, want %dx%d (768 short edge, area cap, /32)", c.w, c.h, w, h, c.ww, c.wh)
+			t.Errorf("%dx%d → %dx%d, want %dx%d (768 short edge, area cap, /32; smaller kept)", c.w, c.h, w, h, c.ww, c.wh)
 		}
 	}
 	t.Setenv("ACT3_RENDER_HOME", t.TempDir())
@@ -140,7 +142,7 @@ func TestH3CanvasArgvAndChecks(t *testing.T) {
 	out := filepath.Join(run, "out", "output.mp4")
 	sixteen := 81
 	p := videoParams{Model: H3Model, Kind: "i2v", Prompt: "integrated_multimodal_description: [Shot 1] a boat", Width: 1280, Height: 720, Frames: &sixteen, FPS: 16}
-	tk, err := h3Task(snap, Env{}, p, "/in/first.png", out, 1344, 768)
+	tk, err := h3Task(snap, Env{}, p, map[string]string{"first_frame": "/in/first.png", "prompt_0": "/in/p.txt"}, out, 1344, 768)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +155,7 @@ func TestH3CanvasArgvAndChecks(t *testing.T) {
 		t.Fatalf("the prompt travels in a file: %q", b)
 	}
 	p.Kind = "t2v"
-	if tk, _ = h3Task(snap, Env{}, p, "/in/first.png", out, 1344, 768); argOf(tk.Argv, "--image") != "" {
+	if tk, _ = h3Task(snap, Env{}, p, map[string]string{"first_frame": "/in/first.png"}, out, 1344, 768); argOf(tk.Argv, "--image") != "" {
 		t.Fatalf("t2v sends no first frame: %v", tk.Argv)
 	}
 	internal := func(v videoParams) videoParams { v.Model, v.Delivery = H3Model, "internal"; return v }
@@ -183,6 +185,50 @@ func TestH3CanvasArgvAndChecks(t *testing.T) {
 	t.Setenv("APS_FAKE_MODELS", "1")
 	if err := h3Check(familyJob(nil), Env{}, internal(videoParams{Kind: "t2v", DurationSeconds: 5})); err != nil {
 		t.Fatalf("an internal t2v job passes: %v", err)
+	}
+}
+
+func TestLTXAnchoredLastFrame(t *testing.T) {
+	p := videoParams{Kind: "i2v", Width: 1280, Height: 704, DurationSeconds: 5, Prompt: "a boat"}
+	w, h, fr := ltxFrame(p)
+	a := ltxTask(p, "/in/first.png", "/in/last.png", "/o.mp4", w, h, fr).Argv
+	i := slices.Index(a, "/in/last.png")
+	if i < 0 || a[i-1] != "--image" || a[i+1] != fmt.Sprint(fr-1) || a[i+2] != "1.0" {
+		t.Fatalf("the last frame guides the clip's final frame: %v", a)
+	}
+	if lastFrameOf(map[string]string{"first_frame": "/f", "last_frame_2": "/l"}) != "/l" || lastFrameOf(map[string]string{}) != "" {
+		t.Fatal("lastFrameOf")
+	}
+}
+
+func TestH3SeedanceReferences(t *testing.T) {
+	in := map[string]string{"prompt_0": "/w/p.txt", "reference_image_10": "/w/c.png", "reference_image_2": "/w/a.png",
+		"reference_image_3": "/w/b.png", "audio_11": "/w/v.mp3", "first_frame": "/w/f.png"}
+	got := strings.Join(h3InputArgs("t2v", in), " ")
+	if got != "--ref-image /w/a.png --ref-image /w/b.png --ref-image /w/c.png --ref-audio /w/v.mp3" {
+		t.Fatalf("references in manifest order (by index, not by name): %s", got)
+	}
+	frames := map[string]string{"first_frame": "/w/f.png", "last_frame_2": "/w/l.png"}
+	if got := strings.Join(h3InputArgs("i2v", frames), " "); got != "--image /w/f.png --last-frame /w/l.png" {
+		t.Fatalf("FL2VA: %s", got)
+	}
+	job := func(names ...string) *jobs.Job { return familyJob(nil, names...) }
+	internal := videoParams{Model: H3Model, Kind: "t2v", DurationSeconds: 5, Delivery: "internal"}
+	if err := h3Check(job("audio_1"), Env{}, internal); kindOf(err) != jobs.KindInvalidInput || !strings.Contains(fmt.Sprint(err), "only reference") {
+		t.Fatalf("audio alone: %v", err)
+	}
+	var many []string
+	for i := range 10 {
+		many = append(many, fmt.Sprintf("reference_image_%d", i+1))
+	}
+	if err := h3Check(job(many...), Env{}, internal); kindOf(err) != jobs.KindInvalidInput {
+		t.Fatalf("10 images: %v", err)
+	}
+	t.Setenv("APS_FAKE_MODELS", "1")
+	i2v := internal
+	i2v.Kind = "i2v"
+	if err := h3Check(job("reference_image_1", "audio_2"), Env{}, i2v); err != nil {
+		t.Fatalf("a Ref2VA request needs no first_frame input: %v", err)
 	}
 }
 
@@ -220,6 +266,17 @@ func TestH3InstallNeedsGenerationFilesOnly(t *testing.T) {
 	}
 	if why := h3InstallProblem(); why != "" {
 		t.Fatalf("generation needs no refiner files: %q", why)
+	}
+	// a Seedance-fed job (references) needs the Ref2VA base too; a first-frame job does not
+	if why := h3InstallProblemFor(familyJob(nil, "first_frame")); why != "" {
+		t.Fatalf("FL2VA job: %q", why)
+	}
+	if why := h3InstallProblemFor(familyJob(nil, "reference_image_1")); !strings.Contains(why, "ref2va") {
+		t.Fatalf("Ref2VA job without its base: %q", why)
+	}
+	touch(comfyPath(regenHome(), h3Ref2VABase), 19_000_000_000)
+	if why := h3InstallProblemFor(familyJob(nil, "reference_image_1", "audio_2")); why != "" {
+		t.Fatalf("Ref2VA installed: %q", why)
 	}
 }
 

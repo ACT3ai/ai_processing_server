@@ -6,7 +6,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
@@ -139,7 +141,7 @@ func (OSSVideo) Check(_ context.Context, job *jobs.Job, env Env) error {
 		if err := h3Check(job, env, p); err != nil {
 			return err
 		}
-		installProblem = h3InstallProblem
+		installProblem = func() string { return h3InstallProblemFor(job) }
 	default:
 		if err := wanCheck(job, p); err != nil {
 			return err
@@ -200,11 +202,11 @@ func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (
 		}
 		switch {
 		case p.Model == LTXModel:
-			return ltxTask(p, inputs["first_frame"], out, w, h, frames), nil
+			return ltxTask(p, inputs["first_frame"], lastFrameOf(inputs), out, w, h, frames), nil
 		case kandinskyQuality(p.Model) != "":
 			return kandinskyTask(snap, env, p, inputs["first_frame"], out, w, h, frames), nil
 		case p.Model == H3Model:
-			return h3Task(snap, env, p, inputs["first_frame"], out, w, h)
+			return h3Task(snap, env, p, inputs, out, w, h)
 		}
 		return wanTask(snap, p, inputs["first_frame"], out, w, h, frames), nil
 	})
@@ -312,6 +314,48 @@ func hasInput(job *jobs.Job, name string) bool {
 		}
 	}
 	return false
+}
+
+// roleInputs: the inputs film/servers named `<role>_<i>` (the manifest's order), as name → path ordered by i.
+func roleInputs(names []string, role string) []string {
+	type at struct {
+		i    int
+		name string
+	}
+	var got []at
+	for _, n := range names {
+		if rest, ok := strings.CutPrefix(n, role+"_"); ok {
+			if i, err := strconv.Atoi(rest); err == nil {
+				got = append(got, at{i, n})
+			}
+		}
+	}
+	slices.SortFunc(got, func(a, b at) int { return a.i - b.i })
+	out := make([]string, len(got))
+	for k, g := range got {
+		out[k] = g.name
+	}
+	return out
+}
+
+// lastFrameOf: the anchored last frame film/servers sent (`last_frame_<i>`), else "".
+func lastFrameOf(inputs map[string]string) string {
+	names := make([]string, 0, len(inputs))
+	for n := range inputs {
+		names = append(names, n)
+	}
+	if l := roleInputs(names, "last_frame"); len(l) > 0 {
+		return inputs[l[0]]
+	}
+	return ""
+}
+
+func inputNames(job *jobs.Job) []string {
+	out := make([]string, 0, len(job.Payload.Inputs))
+	for _, in := range job.Payload.Inputs {
+		out = append(out, in.Name)
+	}
+	return out
 }
 
 // floorTo rounds n down to a multiple of m, at least m.

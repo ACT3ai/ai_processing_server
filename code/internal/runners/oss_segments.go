@@ -158,7 +158,7 @@ func segmentedSteps(ffmpeg, ffprobe, src, out string, segSeconds float64, batch 
 			Output: cut, Weight: 0.03})
 		t := one(cut, up)
 		steps = append(steps, taskhost.Step{Name: fmt.Sprintf("upscale %d/%d", i+1, len(plan)), Argv: t.Argv, Dir: t.Dir,
-			Env: t.Env, Output: up, Weight: float64(r[1]-r[0]) / float64(vf.Frames) * float64(len(plan))})
+			Env: t.Env, Phases: t.Phases, Output: up, Weight: float64(r[1]-r[0]) / float64(vf.Frames) * float64(len(plan))})
 		fmt.Fprintf(&list, "file '%s'\n", strings.ReplaceAll(up, "'", `'\''`))
 	}
 	listPath := filepath.Join(dir, "join.txt")

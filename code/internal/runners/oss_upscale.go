@@ -10,6 +10,7 @@ import (
 
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
+	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 )
 
 // OSSUpscale is the runner behind act3.upscale_open_source: video upscaling with SeedVR2 on our own GPUs (the Mac
@@ -193,7 +194,8 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 	if (accel == "mps" && short >= 1080) || (accel == "cuda" && short >= nvidiaHighRes) {
 		argv = append(argv, "--vae_encode_tiled")
 	}
-	if (accel == "mps" && short >= 1080) || short >= nvidiaHighRes {
+	// untiled, a 21-frame 1080p decode outgrows a 32 GB card (Windows spills it to shared memory, ~3 min a batch)
+	if short >= 1080 {
 		argv = append(argv, "--vae_decode_tiled")
 	}
 	argv = append(argv, strings.Fields(os.Getenv("SEEDVR2_EXTRA_ARGS"))...)
@@ -201,7 +203,10 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 	if accel == "mps" {
 		env = append(env, "PYTORCH_ENABLE_MPS_FALLBACK=1")
 	}
-	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out}
+	// each pass prints its own "batch k/n"; at 4K decoding takes as long as upscaling
+	phases := []taskhost.Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45},
+		{Match: `(?i)decod`, Weight: 0.47}, {Match: `(?i)post-process`, Weight: 0.03}}
+	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out, Phases: phases}
 }
 
 // seedvr2Batch is the --batch_size (frames per temporal batch, 4n+1) for this job on this accelerator.

@@ -90,7 +90,7 @@ func ltxFrame(p videoParams) (w, h, frames int) {
 	return
 }
 
-func ltxTask(p videoParams, image, out string, w, h, frames int) detachedTask {
+func ltxTask(p videoParams, image, last, out string, w, h, frames int) detachedTask {
 	home := ltxHome()
 	repo := filepath.Join(home, "LTX-2")
 	seed := int64(42)
@@ -112,6 +112,9 @@ func ltxTask(p videoParams, image, out string, w, h, frames int) detachedTask {
 	}
 	if p.Kind == "i2v" && image != "" {
 		argv = append(argv, "--image", image, "0", "1.0") // frame 0 at full strength: the clip starts on the shot's frame
+		if last != "" {
+			argv = append(argv, "--image", last, fmt.Sprint(frames-1), "1.0") // an anchored last frame guides the end
+		}
 	}
 	extra := os.Getenv("LTX_ARGS")
 	if extra == "" && accelerator() == "cuda" {

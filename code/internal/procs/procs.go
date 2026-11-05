@@ -51,6 +51,7 @@ func Run(ctx context.Context, s Spec) error {
 		defer wg.Done()
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		sc.Split(scanLinesOrCR)
 		for sc.Scan() {
 			if fn != nil {
 				fn(sc.Text())
@@ -121,4 +122,27 @@ func cleanEnv(s Spec) []string {
 	// Python's UTF-8 mode: on Windows a piped stdout is cp1252, and a printed emoji (SeedVR2's) kills the run
 	env = append(env, "PYTHONUTF8=1")
 	return append(env, s.Env...)
+}
+
+// scanLinesOrCR is bufio.ScanLines that also ends a line at a lone '\r': a tqdm bar redraws itself with '\r', and
+// read as one line its progress only arrived when the bar closed. "\r\n" is one line break.
+func scanLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for i, b := range data {
+		switch b {
+		case '\n':
+			return i + 1, data[:i], nil
+		case '\r':
+			if i+1 == len(data) && !atEOF {
+				return 0, nil, nil // is it "\r\n"? wait for the next byte
+			}
+			if i+1 < len(data) && data[i+1] == '\n' {
+				return i + 2, data[:i], nil
+			}
+			return i + 1, data[:i], nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
