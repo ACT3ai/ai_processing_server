@@ -401,15 +401,21 @@ func TestWatchSurvivesOneUnreadableHeartbeat(t *testing.T) {
 
 // SeedVR2 counts each pass from 1: weighted phases make one bar that only rises.
 func TestPhasesWeightOnePass(t *testing.T) {
-	p := newPhaseOf([]Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45}, {Match: `(?i)decod`, Weight: 0.5}})
+	p := newPhaseOf([]Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45},
+		{Match: `(?i)decod`, Weight: 0.47}, {Match: `(?i)post-process`, Weight: 0.03}})
 	var got []float64
 	for _, c := range []struct {
 		line string
 		frac float64
-	}{{"Encoding batch 41/41", 1}, {"Upscaling batch 1/41", 0}, {"Upscaling batch 41/41", 1}, {"EulerSampler: 100%|", 1}, {"Decoding batch 10/41", 10.0 / 41}, {"Decoding batch 41/41", 1}} {
-		got = append(got, p.fraction(c.line, c.frac))
+	}{{"Encoding batch 41/41", 1}, {"Upscaling batch 1/41", 0}, {"Upscaling batch 41/41", 1}, {"EulerSampler: 100%|", 1},
+		{"Decoding batch 10/41", 10.0 / 41}, {"Decoding batch 41/41", 1}, {"Post-processing batch 1/41", 1.0 / 41}} {
+		f, ok := p.fraction(c.line, c.frac)
+		if !ok {
+			f = -1 // not the bar's
+		}
+		got = append(got, f)
 	}
-	want := []float64{0.05, 0.05, 0.5, 0.5, 0.5 + 0.5*10/41, 1}
+	want := []float64{0.05, 0.05, 0.5, -1, 0.5 + 0.47*10/41, 0.97, 0.97 + 0.03/41}
 	for i := range want {
 		if d := got[i] - want[i]; d > 1e-9 || d < -1e-9 {
 			t.Fatalf("bar = %v, want %v", got, want)

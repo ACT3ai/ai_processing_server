@@ -3,7 +3,6 @@ package runners
 import (
 	"context"
 	"fmt"
-	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
+	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 )
 
 // OSSUpscale is the runner behind act3.upscale_open_source: video upscaling with SeedVR2 on our own GPUs (the Mac
@@ -204,7 +204,8 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 		env = append(env, "PYTORCH_ENABLE_MPS_FALLBACK=1")
 	}
 	// each pass prints its own "batch k/n"; at 4K decoding takes as long as upscaling
-	phases := []taskhost.Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45}, {Match: `(?i)decod`, Weight: 0.5}}
+	phases := []taskhost.Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45},
+		{Match: `(?i)decod`, Weight: 0.47}, {Match: `(?i)post-process`, Weight: 0.03}}
 	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out, Phases: phases}
 }
 

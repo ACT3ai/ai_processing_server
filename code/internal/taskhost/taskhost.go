@@ -100,8 +100,9 @@ type Task struct {
 	Steps []Step `json:"steps,omitempty"`
 	// MinFreeRAMGB is the low-memory guard's floor (limits.ram_floor_gb); 0 = 5% of the machine's RAM, at least 4 GB.
 	MinFreeRAMGB float64 `json:"min_free_ram_gb,omitempty"`
-	// Phases, for a tool that runs several counted passes in one process (SeedVR2: encode, upscale, decode, each its
-	// own "batch k/n"): a line matching a phase moves the bar into it, and the pass's own count fills only its share.
+	// Phases, for a tool that runs several counted passes in one process (SeedVR2: encode, upscale, decode,
+	// post-process, each its own "batch k/n"): a line matching a phase moves the bar into it, and the pass's own count
+	// fills only its share. A one-step task's; Steps carry their own.
 	Phases []Phase `json:"phases,omitempty"`
 }
 
@@ -141,15 +142,16 @@ func newPhaseOf(phases []Phase) *phaseOf {
 	return p
 }
 
-// fraction is frac of the line's phase, as a fraction of the whole bar (a line naming no phase stays in the current).
-func (p *phaseOf) fraction(line string, frac float64) float64 {
-	for i := len(p.res) - 1; i > p.cur; i-- {
+// fraction is frac of the line's phase, as a fraction of the whole bar. A line naming no phase is not the bar's (a
+// sampler's own per-batch bar would pull it back and forth inside the phase): ok is false.
+func (p *phaseOf) fraction(line string, frac float64) (float64, bool) {
+	for i := len(p.res) - 1; i >= 0; i-- {
 		if p.res[i].MatchString(line) {
-			p.cur = i
-			break
+			p.cur = max(p.cur, i)
+			return p.start[p.cur] + p.share[p.cur]*frac, true
 		}
 	}
-	return p.start[p.cur] + p.share[p.cur]*frac
+	return 0, false
 }
 
 // ramFloor is the free RAM under which the guard stops the task.
@@ -168,6 +170,7 @@ type Step struct {
 	Env    []string `json:"env,omitempty"`
 	Output string   `json:"output"` // the file this step must write; its size is the checkpoint
 	Weight float64  `json:"weight,omitempty"`
+	Phases []Phase  `json:"phases,omitempty"` // as Task.Phases, for this step's process
 }
 
 // steps returns the task as a list: Steps, or one step made of Argv.
@@ -175,7 +178,7 @@ func (t Task) steps() []Step {
 	if len(t.Steps) > 0 {
 		return t.Steps
 	}
-	return []Step{{Name: "task", Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output}}
+	return []Step{{Name: "task", Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output, Phases: t.Phases}}
 }
 
 // checkpoint is checkpoint/<n>.done: step n finished and wrote Bytes to its output, with this SHA-256. The output is
@@ -369,7 +372,7 @@ func host(dir string) error {
 	}
 	var before float64 // weight of the steps already done, for the overall progress fraction
 	cur := 0
-	phases := newPhaseOf(t.Phases)
+	var phases *phaseOf // the running step's
 
 	tail := newTail(200) // verbose tools (SeedVR2) log a cleanup section and a banner after the error
 	var logMu sync.Mutex
@@ -391,10 +394,13 @@ func host(dir string) error {
 		} else if p, ok := ParseProgress(s); ok {
 			// a loading bar (checkpoint shards, a download) reaching 100% is not the render reaching 100%
 			if !thirdPartyMuted && (own || !reLoading.MatchString(s)) {
+				ok := true
 				if phases != nil {
-					p = phases.fraction(s, p)
+					p, ok = phases.fraction(s, p)
 				}
-				ev.progress((before+weights[cur]*p)/total, s)
+				if ok {
+					ev.progress((before+weights[cur]*p)/total, s)
+				}
 			}
 		} else if strings.HasPrefix(s, "ACT3_NOTE ") {
 			ev.add(Event{Type: "note", Note: strings.TrimPrefix(s, "ACT3_NOTE ")})
@@ -434,6 +440,7 @@ func host(dir string) error {
 		cur = n
 		logMu.Lock()
 		ownsProgress = false // each step is its own process: it earns (or not) the right to mute tqdm afresh
+		phases = newPhaseOf(st.Phases)
 		logMu.Unlock()
 		if stepDone(dir, n, st, true) {
 			fmt.Fprintf(logf, "# step %d/%d %s: already done (checkpoint), skipped\n", n+1, len(steps), st.Name)
