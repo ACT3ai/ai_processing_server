@@ -100,6 +100,56 @@ type Task struct {
 	Steps []Step `json:"steps,omitempty"`
 	// MinFreeRAMGB is the low-memory guard's floor (limits.ram_floor_gb); 0 = 5% of the machine's RAM, at least 4 GB.
 	MinFreeRAMGB float64 `json:"min_free_ram_gb,omitempty"`
+	// Phases, for a tool that runs several counted passes in one process (SeedVR2: encode, upscale, decode, each its
+	// own "batch k/n"): a line matching a phase moves the bar into it, and the pass's own count fills only its share.
+	Phases []Phase `json:"phases,omitempty"`
+}
+
+// Phase is one counted pass of a task: Match is a regular expression, Weight its share of the bar.
+type Phase struct {
+	Match  string  `json:"match"`
+	Weight float64 `json:"weight"`
+}
+
+// phaseOf maps a pass's own fraction onto the whole bar once a line has said which phase it is in.
+type phaseOf struct {
+	res   []*regexp.Regexp
+	start []float64 // each phase's start, as a fraction of the bar
+	share []float64
+	cur   int
+}
+
+func newPhaseOf(phases []Phase) *phaseOf {
+	var total float64
+	for _, ph := range phases {
+		total += max(0, ph.Weight)
+	}
+	if total <= 0 {
+		return nil
+	}
+	p := &phaseOf{}
+	var at float64
+	for _, ph := range phases {
+		re, err := regexp.Compile(ph.Match)
+		if err != nil {
+			return nil
+		}
+		w := max(0, ph.Weight) / total
+		p.res, p.start, p.share = append(p.res, re), append(p.start, at), append(p.share, w)
+		at += w
+	}
+	return p
+}
+
+// fraction is frac of the line's phase, as a fraction of the whole bar (a line naming no phase stays in the current).
+func (p *phaseOf) fraction(line string, frac float64) float64 {
+	for i := len(p.res) - 1; i > p.cur; i-- {
+		if p.res[i].MatchString(line) {
+			p.cur = i
+			break
+		}
+	}
+	return p.start[p.cur] + p.share[p.cur]*frac
 }
 
 // ramFloor is the free RAM under which the guard stops the task.
@@ -319,6 +369,7 @@ func host(dir string) error {
 	}
 	var before float64 // weight of the steps already done, for the overall progress fraction
 	cur := 0
+	phases := newPhaseOf(t.Phases)
 
 	tail := newTail(200) // verbose tools (SeedVR2) log a cleanup section and a banner after the error
 	var logMu sync.Mutex
@@ -340,6 +391,9 @@ func host(dir string) error {
 		} else if p, ok := ParseProgress(s); ok {
 			// a loading bar (checkpoint shards, a download) reaching 100% is not the render reaching 100%
 			if !thirdPartyMuted && (own || !reLoading.MatchString(s)) {
+				if phases != nil {
+					p = phases.fraction(s, p)
+				}
 				ev.progress((before+weights[cur]*p)/total, s)
 			}
 		} else if strings.HasPrefix(s, "ACT3_NOTE ") {

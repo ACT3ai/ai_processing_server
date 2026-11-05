@@ -3,6 +3,7 @@ package runners
 import (
 	"context"
 	"fmt"
+	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -202,7 +203,9 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 	if accel == "mps" {
 		env = append(env, "PYTORCH_ENABLE_MPS_FALLBACK=1")
 	}
-	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out}
+	// each pass prints its own "batch k/n"; at 4K decoding takes as long as upscaling
+	phases := []taskhost.Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45}, {Match: `(?i)decod`, Weight: 0.5}}
+	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out, Phases: phases}
 }
 
 // seedvr2Batch is the --batch_size (frames per temporal batch, 4n+1) for this job on this accelerator.
