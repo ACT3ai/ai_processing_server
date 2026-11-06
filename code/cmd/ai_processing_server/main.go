@@ -872,32 +872,23 @@ func cmdService(p paths, args []string) error {
 		} else if sub == "install" {
 			fmt.Println("warning: nats-server is not on PATH (just broker-install): only the server is installed")
 		}
-		// The act3-nats container (just broker-docker) is this machine's broker and Docker restarts it; a native
-		// nats-server service beside it only crash-loops on port 4222.
-		if spec.NATSServer != "" && exec.Command("docker", "inspect", "act3-nats").Run() == nil {
-			all, uerr := service.Units(runtime.GOOS, spec)
-			if uerr != nil {
-				return uerr
-			}
-			for _, u := range all {
-				if u.Name == service.BrokerName {
-					nativeBroker = append(nativeBroker, u)
-				}
-			}
-			spec.NATSServer, spec.BrokerConf = "", ""
-		}
 	}
 	units, err := service.Units(runtime.GOOS, spec)
 	if err != nil {
 		return err
 	}
-	if sub == "install" && len(nativeBroker) > 0 {
-		if service.Installed(nativeBroker)[service.BrokerName] {
-			for _, d := range service.Uninstall(nativeBroker) {
-				fmt.Println(d)
+	// The act3-nats container (just broker-docker) is this machine's broker and Docker restarts it; a native
+	// nats-server service beside it only crash-loops on port 4222.
+	if spec.NATSServer != "" && exec.Command("docker", "inspect", "act3-nats").Run() == nil {
+		var rest []service.Unit
+		for _, u := range units {
+			if u.Name == service.BrokerName {
+				nativeBroker = append(nativeBroker, u)
+			} else {
+				rest = append(rest, u)
 			}
 		}
-		fmt.Println("broker: the act3-nats container (restarts with Docker); no nats-server service")
+		units = rest
 	}
 	switch sub {
 	case "print":
@@ -908,6 +899,14 @@ func cmdService(p paths, args []string) error {
 	case "install":
 		if ts.Server.Dev && !p.Force {
 			return fmt.Errorf("%s is a dev machine (server.dev: true), not a render server: it is not installed as a service. Use `just run` to debug here (--force overrides)", ts.Server.Key)
+		}
+		if len(nativeBroker) > 0 {
+			if service.Installed(nativeBroker)[service.BrokerName] {
+				for _, d := range service.Uninstall(nativeBroker) {
+					fmt.Println(d)
+				}
+			}
+			fmt.Println("broker: the act3-nats container (restarts with Docker); no nats-server service")
 		}
 		did, err := service.Install(units, spec.LogDir)
 		for _, d := range did {
@@ -924,7 +923,7 @@ func cmdService(p paths, args []string) error {
 		}
 		return err
 	case "uninstall":
-		for _, d := range service.Uninstall(units) {
+		for _, d := range service.Uninstall(append(nativeBroker, units...)) {
 			fmt.Println(d)
 		}
 		return nil
