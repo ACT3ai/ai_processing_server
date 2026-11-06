@@ -296,12 +296,14 @@ def upscale(pipe, frames, a, p0, p1):
     return out
 
 
-def tile_side(scale):
-    """The input tile edge whose output fits this GPU, or None for one pass (MPS: unified memory). The activations grow
-    with the output area: 2560x1536 ran out of a 32 GB RTX 5090, so a tile's output is kept near (cap - 6) / 10 Mpx;
-    FLASHVSR_TILE_MPX overrides."""
+def tile_side(scale, n):
+    """The input tile edge whose output fits this GPU. The activations grow with the output area: 2560x1536 ran out of
+    a 32 GB RTX 5090, so a tile's output is kept near (cap - 6) / 10 Mpx; FLASHVSR_TILE_MPX overrides. MPS has the
+    memory but refuses a tensor over INT_MAX elements, and the whole-clip input and output are 3 x frames x H x W
+    (15 s of 480p to 1080p is 2.6e9), so a tile's padded output is kept under 2^30 / (3 x frames)."""
     if DEVICE != "cuda":
-        return None
+        edge = int(math.sqrt(2**30 / (3 * (n + 12)))) // BLOCK * BLOCK
+        return max(64, int(edge / scale) // 16 * 16)
     mpx = float(os.environ.get("FLASHVSR_TILE_MPX") or 0)
     if mpx <= 0:
         cap = 0.95 * torch.cuda.get_device_properties(0).total_memory / 2**30
@@ -377,8 +379,8 @@ def main():
     pipe = init_pipeline()
     progress(10, "models loaded")
     sW, sH = 2 * round(w0 * a.scale / 2), 2 * round(h0 * a.scale / 2)
-    side = tile_side(a.scale)
-    if side is None or (w0 <= side and h0 <= side):
+    side = tile_side(a.scale, n)
+    if w0 <= side and h0 <= side:
         out = upscale(pipe, frames, a, 10, 90)
     else:
         out = upscale_tiled(pipe, frames, a, side, sW, sH)
