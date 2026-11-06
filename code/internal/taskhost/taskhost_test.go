@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ import (
 // The test binary doubles as the task host: Launch starts it again with APS_TASKHOST_TEST=1.
 func TestMain(m *testing.M) {
 	if os.Getenv("APS_TASKHOST_TEST") == "1" {
-		HeartbeatEvery, CancelPoll = 200*time.Millisecond, 100*time.Millisecond
+		HeartbeatEvery, CancelPoll, MemoryPoll = 200*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond
 		os.Exit(Main(os.Args[1:]))
 	}
 	os.Setenv("APS_TASKHOST_TEST", "1")
@@ -134,6 +135,33 @@ func TestCancelStopsTheTree(t *testing.T) {
 	}
 	if _, err := os.Stat(tk.Output); err == nil {
 		t.Fatal("a cancelled task wrote its output")
+	}
+}
+
+// A floor above this machine's RAM trips the real guard: the render is killed at once (no grace) and the exit says
+// out of memory as infra, so the controller fails it as "limit" and production re-plans it.
+func TestLowMemoryStopsTheRender(t *testing.T) {
+	dir := t.TempDir()
+	tk := shTask(dir, "5")
+	tk.MinFreeRAMGB = 1 << 20
+	start := time.Now()
+	if err := Launch(selfHost(), dir, tk); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	x, err := Watch(ctx, dir, nil)
+	if err != nil || x.Code != 1 || x.Cancelled || !strings.Contains(x.Error, "out of memory") || !strings.Contains(x.Tail, "ACT3_ERROR infra: out of memory") {
+		t.Fatalf("%+v %v", x, err)
+	}
+	if d := time.Since(start); d > 8*time.Second {
+		t.Fatalf("killed after %s: the grace period was not skipped", d)
+	}
+	if _, err := os.Stat(tk.Output); err == nil {
+		t.Fatal("a stopped task wrote its output")
+	}
+	if f := ramFloor(0, 128); f != 6.4 || ramFloor(0, 16) != 4 || ramFloor(10, 128) != 10 {
+		t.Fatalf("floors: %g", f)
 	}
 }
 
@@ -344,5 +372,56 @@ func TestRecordDeathCountsEachHostOnce(t *testing.T) {
 	dir2 := t.TempDir()
 	if err := CarryDeaths(dir2, Deaths(dir)); err != nil || len(Deaths(dir2)) != 2 {
 		t.Fatalf("deaths not carried: %v %v", Deaths(dir2), err)
+	}
+}
+
+// A heartbeat caught mid-replace (Windows refuses the read during the rename) is one bad look, not a death.
+func TestWatchSurvivesOneUnreadableHeartbeat(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, TaskFile), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hb := filepath.Join(dir, HeartbeatFile)
+	if err := os.WriteFile(hb, []byte("{half a fi"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(WatchPoll + WatchPoll/2)
+		_ = writeJSONAtomic(hb, Heartbeat{PID: os.Getpid(), Boot: BootID(), StartedAt: time.Now(), At: time.Now()})
+		time.Sleep(3 * WatchPoll)
+		_ = writeJSONAtomic(filepath.Join(dir, ExitFile), Exit{Code: 0})
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ex, err := Watch(ctx, dir, nil)
+	if err != nil || ex.Code != 0 {
+		t.Fatalf("Watch = %+v, %v; want the exit record", ex, err)
+	}
+}
+
+// SeedVR2 counts each pass from 1: weighted phases make one bar that only rises.
+func TestPhasesWeightOnePass(t *testing.T) {
+	p := newPhaseOf([]Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45},
+		{Match: `(?i)decod`, Weight: 0.47}, {Match: `(?i)post-process`, Weight: 0.03}})
+	var got []float64
+	for _, c := range []struct {
+		line string
+		frac float64
+	}{{"Encoding batch 41/41", 1}, {"Upscaling batch 1/41", 0}, {"Upscaling batch 41/41", 1}, {"EulerSampler: 100%|", 1},
+		{"Decoding batch 10/41", 10.0 / 41}, {"Decoding batch 41/41", 1}, {"Post-processing batch 1/41", 1.0 / 41}} {
+		f, ok := p.fraction(c.line, c.frac)
+		if !ok {
+			f = -1 // not the bar's
+		}
+		got = append(got, f)
+	}
+	want := []float64{0.05, 0.05, 0.5, -1, 0.5 + 0.47*10/41, 0.97, 0.97 + 0.03/41}
+	for i := range want {
+		if d := got[i] - want[i]; d > 1e-9 || d < -1e-9 {
+			t.Fatalf("bar = %v, want %v", got, want)
+		}
+	}
+	if newPhaseOf(nil) != nil {
+		t.Fatal("no phases: the step's own fraction")
 	}
 }

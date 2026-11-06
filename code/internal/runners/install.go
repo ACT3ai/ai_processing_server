@@ -3,6 +3,7 @@ package runners
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 )
 
 // InstallProblems names, per runner, why its model is not installed on this machine ("" or absent = ready).
@@ -14,22 +15,33 @@ func InstallProblems() map[string]string {
 	if FakeModels() {
 		return m
 	}
-	if p := wanInstallProblem(); p != "" {
+	// A runner with several models is offered when any of them is installed: film/servers verifies each model on its
+	// own, and a job naming one that is missing fails its Check with "not installed".
+	if p := firstProblem(wanInstallProblem(wanMachineModel()), ltxInstallProblem(), kandinskyInstallProblem("lite"), kandinskyInstallProblem("pro"), h3InstallProblem()); p != "" {
 		m[OSSVideo{}.Name()] = p
 	}
-	if p := seedvr2InstallProblem(seedvr2Qualities["standard"].dit); p != "" {
+	if p := firstProblem(seedvr2InstallProblem(seedvr2Qualities["standard"].dit), flashvsrInstallProblem()); p != "" {
 		m[OSSUpscale{}.Name()] = p
 	}
-	if p := regenInstallProblem(Env{}); p != "" {
+	if p := regenInstallProblem(); p != "" {
 		m[OSSRegenerate{}.Name()] = p
 	}
 	return m
 }
 
-// wanInstallProblem checks what every Wan 2.2 job needs: the venv and the T2V diffusers weights.
-func wanInstallProblem() string {
+// wanInstallProblem checks what every job of one Wan 2.2 model needs: the venv and that model's diffusers weights,
+// image-to-video included (shots almost always carry a first frame).
+func wanInstallProblem(model string) string {
+	m, ok := wanModels[model]
+	if !ok {
+		return fmt.Sprintf("Wan model %q (ACT3_WAN_MODEL) is not one this server renders: %s", model, strings.Join(wanModelIDs(), ", "))
+	}
 	home := wanHome()
-	for _, f := range []string{venvPython(home), filepath.Join(home, "models", "Wan2.2-T2V-A14B-Diffusers", "model_index.json")} {
+	need := []string{venvPython(home), filepath.Join(home, "models", m.dir, "model_index.json")}
+	if m.i2vDir != "" {
+		need = append(need, filepath.Join(home, "models", m.i2vDir, "model_index.json"))
+	}
+	for _, f := range need {
 		if !fileAtLeast(f, 1) {
 			return fmt.Sprintf("Wan 2.2 is not installed on this server: missing %s (install guide: ~/BGit/all/app/smartc/film/servers/bms/oss_video/wan_2_2/)", f)
 		}
@@ -53,4 +65,14 @@ func seedvr2InstallProblem(dit string) string {
 		}
 	}
 	return ""
+}
+
+// firstProblem is "" when any check passed (that model is installed), else the first check's problem.
+func firstProblem(problems ...string) string {
+	for _, p := range problems {
+		if p == "" {
+			return ""
+		}
+	}
+	return problems[0]
 }

@@ -14,6 +14,12 @@ requires:
   min_vram_gb: 24
   min_unified_memory_gb: 96
 resources_per_job: { cpu_cores: 4, ram_gb: 64, vram_gb: 24 }
+# The model this machine renders: $ACT3_WAN_MODEL (unset = wan2.2-a14b, the numbers above). TI2V-5B is for GPUs that
+# cannot hold A14B: render_wan.py offloads it layer by layer when even one 10 GB component does not fit.
+model_env: ACT3_WAN_MODEL
+models:
+  wan2.2-a14b: {}
+  wan2.2-ti2v-5b: { min_vram_gb: 6, min_unified_memory_gb: 48, resources_per_job: { ram_gb: 48, vram_gb: 6 } }
 max_parallel_default: 1
 # Measured worst case: Wan 2.2 at 1280x720, 81 frames, 20 steps without Lightning on the Mac Studio (MPS).
 timeouts: { stage_inputs: 30m, run: 180m, upload: 20m }

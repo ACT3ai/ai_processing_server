@@ -284,8 +284,13 @@ func TestRegenerateMemoryGuards(t *testing.T) {
 		return m
 	}
 	pl, err := plan(t, wide, h3Draft, vram(rtx5090))
-	if err != nil || pl.Target != "2k" || pl.Fwd != "standard" || pl.VAE != "fast" || pl.Ladder || pl.Backend != "comfyui" {
-		t.Fatalf("2K/5 s on a 5090: %+v %v", pl, err)
+	if err != nil || pl.Target != "2k" || pl.Fwd != "standard" || pl.VAE != "standard" || pl.Ladder || pl.Backend != "comfyui" {
+		t.Fatalf("2K/5 s on a 5090 (the Olm nodes decode with the released VAE): %+v %v", pl, err)
+	}
+	long := draftInfo{Width: 1344, Height: 768, FPS: 24, Seconds: 15, HasAudio: true}
+	if pl, err := plan(t, wide, long, vram(rtx5090)); err != nil || pl.Target != "2k" || pl.Envelope != "measured" || pl.WindowFrames != 360 ||
+		!slices.ContainsFunc(pl.Warnings, func(w string) bool { return strings.Contains(w, "windows of 5 s") }) {
+		t.Errorf("2K/15 s on a 5090 runs in 5 s windows, the measured 2K/5 s working set: %+v %v", pl, err)
 	}
 	if pl, _ = plan(t, with("target", "4K"), h3Draft, vram(rtx5090)); pl.Target != "2k" {
 		t.Errorf("4K on 32 GB steps down to 2K: %s", pl.Target)
@@ -379,16 +384,11 @@ func TestRegenerateLoraSeedLicense(t *testing.T) {
 	if _, err := plan(t, map[string]any{"lora": "DrakenZA conversion"}, h3Draft, vram(rtx5090)); errCode(err) != "lora_unverified" {
 		t.Errorf("DrakenZA must be refused: %v", err)
 	}
-	b200cli := map[string]any{"lora": "r128", "backend": "cli", "shot": map[string]any{"has_cast": false}}
-	if pl, _ := plan(t, b200cli, h3Draft, vram(180)); pl.Lora != "r576" {
-		t.Errorf("the CLI only takes r576: %s", pl.Lora)
-	}
-	if pl, _ := plan(t, map[string]any{"lora": 128}, h3Draft, vram(rtx5090)); pl.Lora != "r128" {
-		t.Errorf("a numeric 128 is the father558 LoRA on ComfyUI: %s", pl.Lora)
-	}
-	if pl, _ := plan(t, map[string]any{"lora": "mystery-lora"}, h3Draft, vram(rtx5090)); pl.Lora != "r576" ||
-		!slices.ContainsFunc(pl.Warnings, func(w string) bool { return strings.Contains(w, "unknown") }) {
-		t.Errorf("an unknown LoRA falls back to r576 with a warning (TS does too): %+v", pl)
+	for _, l := range []any{128, "father558 r128", "kijai r384", "mystery-lora"} {
+		if pl, _ := plan(t, map[string]any{"lora": l}, h3Draft, vram(rtx5090)); pl.Lora != "r576" ||
+			!slices.ContainsFunc(pl.Warnings, func(w string) bool { return strings.Contains(w, "r576 only") }) {
+			t.Errorf("LoRA %v: both refiners load r576, with a warning (TS does too): %+v", l, pl)
+		}
 	}
 	for in, want := range map[any]uint32{"42": 42, 42.9: 42, -1.0: 4294967295, "abc": h3rDefaultSeed, 1e20: h3rDefaultSeed, "1,766,580,932": 1766580932} {
 		if pl, _ := plan(t, map[string]any{"seed": in}, h3Draft, vram(rtx5090)); pl.Seed != want {
@@ -467,7 +467,7 @@ func TestRegenerateTaskSteps(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompt := "integrated_multimodal_description: [Shot 1] a man says \"finish\" ; $(rm -rf /) — the man was killed\n\noverall_soundscape: N/A"
-	tk, err := regenTask(snap, pl, "/run/inputs/draft_video.mp4", prompt, out, comfyCfg{})
+	tk, err := regenTask(snap, Env{}, pl, "/run/inputs/draft_video.mp4", prompt, out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,18 +495,18 @@ func TestRegenerateTaskSteps(t *testing.T) {
 	if argOf(b, "--out") != out || argOf(b, "--remux") != "on" || argOf(b, "--output-seconds") != "5.000" || tk.ExpectFrames != 120 {
 		t.Fatalf("finish argv: %v expect %d", b, tk.ExpectFrames)
 	}
-	// ComfyUI: no model venv needed (the script is stdlib only); crop and truncate consent travel to the script
+	// ComfyUI: the venv that runs ComfyUI runs the script; crop and truncate consent travel to the script
 	pl2, err := plan(t, map[string]any{"delivery": "internal", "allow_crop": true, "allow_truncate": true}, draftInfo{Width: 768, Height: 1344, FPS: 24, Seconds: 20, HasAudio: true}, vram(180))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tk, err = regenTask(snap, pl2, "/d.mp4", "p", out, comfyCfg{"http://127.0.0.1:8188", "/wf.json", "/comfy/input"})
+	tk, err = regenTask(snap, Env{}, pl2, "/d.mp4", "p", out)
 	if err != nil {
 		t.Fatal(err)
 	}
 	a = tk.Steps[0].Argv
-	if argOf(a, "--comfy-url") != "http://127.0.0.1:8188" || argOf(a, "--window-frames") != "360" || !slices.Contains(a, "--allow-crop") ||
-		!slices.Contains(a, "--allow-truncate") || a[0] != "python3" {
+	if argOf(a, "--backend") != "comfyui" || argOf(a, "--vae") != "standard" || argOf(a, "--window-frames") != "360" || !slices.Contains(a, "--allow-crop") ||
+		!slices.Contains(a, "--allow-truncate") || a[0] != "/r/open_h3_regenerate_2k/.venv/bin/python" {
 		t.Fatalf("comfy argv: %v", a)
 	}
 }

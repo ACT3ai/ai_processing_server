@@ -168,6 +168,10 @@ type Limits struct {
 	MaxParallelJobs int     `yaml:"max_parallel_jobs" json:"max_parallel_jobs"`
 	CPUReservePct   int     `yaml:"cpu_reserve_pct" json:"cpu_reserve_pct"`
 	RAMReserveGB    float64 `yaml:"ram_reserve_gb" json:"ram_reserve_gb"`
+	// RAMFloorGB: a running task is stopped when the machine's free RAM stays under this (0 = 5% of RAM, at least
+	// 4 GB). RAMReserveGB only decides which jobs start; this keeps a render that outgrows its booking from freezing
+	// the machine.
+	RAMFloorGB float64 `yaml:"ram_floor_gb" json:"ram_floor_gb"`
 	VRAMHeadroomGB  float64 `yaml:"vram_headroom_gb" json:"vram_headroom_gb"`
 	DiskMinFreeGB   float64 `yaml:"disk_min_free_gb" json:"disk_min_free_gb"`
 	GPUTempMaxC     int     `yaml:"gpu_temp_max_c" json:"gpu_temp_max_c"`
@@ -238,6 +242,17 @@ type ServiceDef struct {
 	Timeouts           ServiceTimeouts `yaml:"timeouts" json:"timeouts"`
 	Retry              RetryPolicy     `yaml:"retry" json:"retry"`
 	PlatformJobTypes   []string        `yaml:"platform_job_types" json:"platform_job_types,omitempty"`
+	// ModelEnv names the environment variable that picks which of Models this machine renders; that model's
+	// requirements replace the defaults above (a smaller model offered on a smaller GPU).
+	ModelEnv string               `yaml:"model_env" json:"model_env,omitempty"`
+	Models   map[string]ModelNeed `yaml:"models" json:"models,omitempty"`
+}
+
+// ModelNeed is what one model of a multi-model service needs, where it differs from the service's defaults.
+type ModelNeed struct {
+	MinVRAMGB       float64   `yaml:"min_vram_gb" json:"min_vram_gb,omitempty"`
+	MinUnifiedMemGB float64   `yaml:"min_unified_memory_gb" json:"min_unified_memory_gb,omitempty"`
+	ResourcesPerJob Resources `yaml:"resources_per_job" json:"resources_per_job"`
 }
 
 type Requires struct {

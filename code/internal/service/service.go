@@ -14,6 +14,7 @@
 package service
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf16"
 )
 
 // Names of the two services.
@@ -47,8 +49,8 @@ type Unit struct {
 	Name  string
 	Label string // launchd label (macOS only)
 	Path  string // where it goes; "" on Windows
-	Body string
-	Argv []string // the command it runs
+	Body  string
+	Argv  []string // the command it runs
 }
 
 // Units returns the service definitions for goos.
@@ -81,7 +83,7 @@ func Units(goos string, s Spec) ([]Unit, error) {
 			u.Path = filepath.Join(home, ".config", "systemd", "user", v.name+".service")
 			u.Body = systemdUnit(v.name, v.argv, s.Root)
 		case "windows":
-			u.Body = strings.Join(quoteAll(v.argv), " ")
+			u.Body = taskXML(v.name, v.argv, s.Root, windowsUser())
 		default:
 			return nil, fmt.Errorf("service: %s is not supported", goos)
 		}
@@ -180,8 +182,22 @@ func Install(units []Unit, logDir string) ([]string, error) {
 				return did, err
 			}
 		case "windows":
+			// From XML: the schtasks command line cannot set a restart on failure, and leaves Windows' default
+			// 72 h execution limit, which would stop the server after three days.
+			f, err := os.CreateTemp("", "act3-task-*.xml")
+			if err != nil {
+				return did, err
+			}
+			_, werr := f.Write(utf16LE(u.Body))
+			_ = f.Close()
+			if werr != nil {
+				_ = os.Remove(f.Name())
+				return did, werr
+			}
 			_ = run("schtasks", "/Delete", "/F", "/TN", u.Name)
-			if err := run("schtasks", "/Create", "/F", "/SC", "ONLOGON", "/RL", "LIMITED", "/TN", u.Name, "/TR", u.Body); err != nil {
+			err = run("schtasks", "/Create", "/F", "/TN", u.Name, "/XML", f.Name())
+			_ = os.Remove(f.Name())
+			if err != nil {
 				return did, err
 			}
 		}
@@ -222,6 +238,48 @@ func Installed(units []Unit) map[string]bool {
 		out[u.Name] = err == nil
 	}
 	return out
+}
+
+// taskXML is a Task Scheduler task that starts at the user's logon, restarts on a crash (a clean exit 0 is not
+// a failure, so `just stop` still holds) and never hits an execution time limit.
+func taskXML(name string, argv []string, dir, user string) string {
+	userID := ""
+	if user != "" {
+		userID = "<UserId>" + xmlEsc(user) + "</UserId>"
+	}
+	return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>` + xmlEsc(name) + `: written by ai_processing_server service install.</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled>` + userID + `</LogonTrigger></Triggers>
+  <Principals><Principal id="Author">` + userID + `<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>` + xmlEsc(argv[0]) + `</Command><Arguments>` + xmlEsc(strings.Join(quoteAll(argv[1:]), " ")) + `</Arguments><WorkingDirectory>` + xmlEsc(dir) + `</WorkingDirectory></Exec></Actions>
+</Task>
+`
+}
+
+// windowsUser is the account the task runs as and starts for: the bare user name, which Task Scheduler resolves
+// on the machine (USERDOMAIN reads WORKGROUP in an SSH session, which is no account).
+func windowsUser() string {
+	return os.Getenv("USERNAME")
+}
+
+// utf16LE is s as UTF-16 little endian with a byte-order mark: what `schtasks /Create /XML` requires.
+func utf16LE(s string) []byte {
+	units := utf16.Encode([]rune(s))
+	b := make([]byte, 2+2*len(units))
+	b[0], b[1] = 0xFF, 0xFE
+	for i, u := range units {
+		binary.LittleEndian.PutUint16(b[2+2*i:], u)
+	}
+	return b
 }
 
 func writeUnit(u Unit) error {

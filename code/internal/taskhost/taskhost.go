@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/ACT3ai/ai_processing_server/internal/fsx"
+	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/procs"
 )
 
@@ -62,7 +63,9 @@ var (
 	StaleAfter     = 30 * time.Second // no heartbeat for this long and no exit.json: the task host is gone
 	CancelPoll     = 2 * time.Second
 	WatchPoll      = 1 * time.Second
-	StartGrace     = 20 * time.Second // a fresh launch gets this long to write its first heartbeat
+	// DeadPolls: consecutive Watch polls a task host must look dead before it is taken for gone
+	DeadPolls  = 3
+	StartGrace = 20 * time.Second // a fresh launch gets this long to write its first heartbeat
 	// StaleHard: a task host whose process is still alive (same boot, same pid) but whose heartbeat stopped is only
 	// declared dead after this long. A disk stall or a swap storm can pause the heartbeat for more than StaleAfter;
 	// declaring such a host dead started a second one on the same run directory while the first still rendered.
@@ -70,6 +73,12 @@ var (
 	// MaxDeaths: after this many task hosts for one job died on this machine without finishing (a reboot or a
 	// crash each time, typically a step that takes the machine down), the controller stops starting it here.
 	MaxDeaths = 3
+	// MemoryPoll and MemoryStrikes: the low-memory guard reads the machine's free RAM this often and stops the task
+	// after this many readings in a row under the floor (one dip while weights load is not a reason).
+	MemoryPoll    = time.Second
+	MemoryStrikes = 2
+	// freeRAM is hardware.FreeRAM; tests replace it.
+	freeRAM = hardware.FreeRAM
 )
 
 // Task is task.json: everything the task host needs. Paths are absolute.
@@ -89,6 +98,68 @@ type Task struct {
 	// Steps, when set, replace Argv/Dir/Env: they run in order and each one is a checkpoint. The last step writes
 	// Output. Older controllers that do not know Steps only ever read this file, so RunVersion stays 1.
 	Steps []Step `json:"steps,omitempty"`
+	// MinFreeRAMGB is the low-memory guard's floor (limits.ram_floor_gb); 0 = 5% of the machine's RAM, at least 4 GB.
+	MinFreeRAMGB float64 `json:"min_free_ram_gb,omitempty"`
+	// Phases, for a tool that runs several counted passes in one process (SeedVR2: encode, upscale, decode,
+	// post-process, each its own "batch k/n"): a line matching a phase moves the bar into it, and the pass's own count
+	// fills only its share. A one-step task's; Steps carry their own.
+	Phases []Phase `json:"phases,omitempty"`
+}
+
+// Phase is one counted pass of a task: Match is a regular expression, Weight its share of the bar.
+type Phase struct {
+	Match  string  `json:"match"`
+	Weight float64 `json:"weight"`
+}
+
+// phaseOf maps a pass's own fraction onto the whole bar once a line has said which phase it is in.
+type phaseOf struct {
+	res   []*regexp.Regexp
+	start []float64 // each phase's start, as a fraction of the bar
+	share []float64
+	cur   int
+}
+
+func newPhaseOf(phases []Phase) *phaseOf {
+	var total float64
+	for _, ph := range phases {
+		total += max(0, ph.Weight)
+	}
+	if total <= 0 {
+		return nil
+	}
+	p := &phaseOf{}
+	var at float64
+	for _, ph := range phases {
+		re, err := regexp.Compile(ph.Match)
+		if err != nil {
+			return nil
+		}
+		w := max(0, ph.Weight) / total
+		p.res, p.start, p.share = append(p.res, re), append(p.start, at), append(p.share, w)
+		at += w
+	}
+	return p
+}
+
+// fraction is frac of the line's phase, as a fraction of the whole bar. A line naming no phase is not the bar's (a
+// sampler's own per-batch bar would pull it back and forth inside the phase): ok is false.
+func (p *phaseOf) fraction(line string, frac float64) (float64, bool) {
+	for i := len(p.res) - 1; i >= 0; i-- {
+		if p.res[i].MatchString(line) {
+			p.cur = max(p.cur, i)
+			return p.start[p.cur] + p.share[p.cur]*frac, true
+		}
+	}
+	return 0, false
+}
+
+// ramFloor is the free RAM under which the guard stops the task.
+func ramFloor(set, totalGB float64) float64 {
+	if set > 0 {
+		return set
+	}
+	return max(4, totalGB*0.05)
 }
 
 // Step is one checkpointed part of a task. Weight is its share of the progress bar (0 counts as 1).
@@ -99,6 +170,7 @@ type Step struct {
 	Env    []string `json:"env,omitempty"`
 	Output string   `json:"output"` // the file this step must write; its size is the checkpoint
 	Weight float64  `json:"weight,omitempty"`
+	Phases []Phase  `json:"phases,omitempty"` // as Task.Phases, for this step's process
 }
 
 // steps returns the task as a list: Steps, or one step made of Argv.
@@ -106,7 +178,7 @@ func (t Task) steps() []Step {
 	if len(t.Steps) > 0 {
 		return t.Steps
 	}
-	return []Step{{Name: "task", Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output}}
+	return []Step{{Name: "task", Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output, Phases: t.Phases}}
 }
 
 // checkpoint is checkpoint/<n>.done: step n finished and wrote Bytes to its output, with this SHA-256. The output is
@@ -300,8 +372,9 @@ func host(dir string) error {
 	}
 	var before float64 // weight of the steps already done, for the overall progress fraction
 	cur := 0
+	var phases *phaseOf // the running step's
 
-	tail := newTail(40)
+	tail := newTail(200) // verbose tools (SeedVR2) log a cleanup section and a banner after the error
 	var logMu sync.Mutex
 	// A runner that speaks our grammar (ACT3_STAGE / ACT3_PROGRESS) owns its progress: from its first such line on,
 	// tqdm bars it prints (Wan's "Loading checkpoint shards: 100%|") are not job progress. Without this a Wan render
@@ -319,19 +392,55 @@ func host(dir string) error {
 		if st != "" {
 			ev.add(Event{Type: "stage", Stage: st})
 		} else if p, ok := ParseProgress(s); ok {
-			if !thirdPartyMuted {
-				ev.progress((before+weights[cur]*p)/total, s)
+			// a loading bar (checkpoint shards, a download) reaching 100% is not the render reaching 100%
+			if !thirdPartyMuted && (own || !reLoading.MatchString(s)) {
+				ok := true
+				if phases != nil {
+					p, ok = phases.fraction(s, p)
+				}
+				if ok {
+					ev.progress((before+weights[cur]*p)/total, s)
+				}
 			}
 		} else if strings.HasPrefix(s, "ACT3_NOTE ") {
 			ev.add(Event{Type: "note", Note: strings.TrimPrefix(s, "ACT3_NOTE ")})
 		}
 	}
+	var lowMemory string // the guard's verdict, set before it cancels
+	go func() {
+		// A render that eats the machine's RAM freezes it until a reboot: stop the render first.
+		tick := time.NewTicker(MemoryPoll)
+		defer tick.Stop()
+		strikes := 0
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+			}
+			free, total, ok := freeRAM()
+			floor := ramFloor(t.MinFreeRAMGB, total)
+			if !ok || free >= floor {
+				strikes = 0
+				continue
+			}
+			if strikes++; strikes < MemoryStrikes {
+				continue
+			}
+			lowMemory = fmt.Sprintf("out of memory: the machine had %.1f GB of RAM free, under the %.1f GB floor "+
+				"(limits.ram_floor_gb), so the render was stopped to keep the machine up", free, floor)
+			line("ACT3_ERROR infra: " + lowMemory)
+			cancel(fmt.Errorf("%w: %s", procs.ErrKillNow, lowMemory))
+			return
+		}
+	}()
 	fmt.Fprintf(logf, "# %s taskhost pid %d, snapshot %s, %d step(s)\n", started.Format(time.RFC3339), os.Getpid(), t.Snapshot, len(steps))
 	var runErr error
 	for n, st := range steps {
 		cur = n
 		logMu.Lock()
 		ownsProgress = false // each step is its own process: it earns (or not) the right to mute tqdm afresh
+		phases = newPhaseOf(st.Phases)
 		logMu.Unlock()
 		if stepDone(dir, n, st, true) {
 			fmt.Fprintf(logf, "# step %d/%d %s: already done (checkpoint), skipped\n", n+1, len(steps), st.Name)
@@ -372,6 +481,8 @@ func host(dir string) error {
 		x.Code, x.Cancelled, x.Error = -1, true, "cancelled"
 	case errors.Is(cause, errTimedOut):
 		x.Code, x.TimedOut, x.Error = -1, true, fmt.Sprintf("timed out after %d s", t.TimeoutSeconds)
+	case errors.Is(cause, procs.ErrKillNow):
+		x.Code, x.Error = 1, lowMemory
 	case runErr != nil:
 		x.Code, x.Error = exitCode(runErr), runErr.Error()
 	}
@@ -475,6 +586,8 @@ var (
 	rePct   = regexp.MustCompile(`(\d{1,3}(?:\.\d+)?)\s*%\s*\|`)
 	reRatio = regexp.MustCompile(`(?i)\b(?:step|steps|batch|frames?|chunk|segment)\b[^0-9]{0,12}(\d+)\s*(?:/|of)\s*(\d+)`)
 	reStage = regexp.MustCompile(`ACT3_STAGE\s+(\S+)`)
+	// third-party bars that measure loading, not rendering
+	reLoading = regexp.MustCompile(`(?i)\b(?:loading|load|shards?|fetching|downloading)\b`)
 )
 
 // ParseProgress reads a 0..1 fraction from one output line.
@@ -576,7 +689,7 @@ func Alive(dir string) State {
 		return Missing
 	}
 	var hb Heartbeat
-	if err := readJSON(filepath.Join(dir, HeartbeatFile), &hb); err != nil {
+	if err := readHeartbeat(filepath.Join(dir, HeartbeatFile), &hb); err != nil {
 		return Dead
 	}
 	if cur := BootID(); hb.Boot != "" && cur != "" && hb.Boot != cur {
@@ -704,6 +817,7 @@ func Watch(ctx context.Context, dir string, onEvent func(Event)) (Exit, error) {
 	}
 	t := time.NewTicker(WatchPoll)
 	defer t.Stop()
+	dead := 0
 	for {
 		flush()
 		switch Alive(dir) {
@@ -711,7 +825,13 @@ func Watch(ctx context.Context, dir string, onEvent func(Event)) (Exit, error) {
 			flush()
 			return ReadExit(dir)
 		case Dead, Missing:
-			return Exit{}, ErrDead
+			// one look can land on a heartbeat being replaced (Windows refuses the read mid-rename): the task host
+			// is gone only when it looks gone DeadPolls times in a row
+			if dead++; dead >= DeadPolls {
+				return Exit{}, ErrDead
+			}
+		default:
+			dead = 0
 		}
 		select {
 		case <-ctx.Done():
@@ -722,6 +842,20 @@ func Watch(ctx context.Context, dir string, onEvent func(Event)) (Exit, error) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+
+// readHeartbeat reads a heartbeat, looking again briefly when it cannot: on Windows the file is unreadable for an
+// instant while the task host renames a new one over it, and one unlucky look must not start a second host.
+func readHeartbeat(path string, hb *Heartbeat) (err error) {
+	for try := 0; try < 3; try++ {
+		if try > 0 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err = readJSON(path, hb); err == nil {
+			return nil
+		}
+	}
+	return err
+}
 
 func readJSON(path string, v any) error {
 	b, err := os.ReadFile(path)

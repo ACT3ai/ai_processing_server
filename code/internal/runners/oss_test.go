@@ -73,6 +73,55 @@ func TestWanArgv(t *testing.T) {
 	}
 }
 
+// TI2V-5B: its own folder (image-to-video from the same weights), 24 fps, sides of 32, no Lightning, full steps.
+func TestWan5BArgv(t *testing.T) {
+	t.Setenv("ACT3_RENDER_HOME", "/r")
+	p := videoParams{Model: "wan2.2-ti2v-5b", Kind: "i2v", Prompt: "a boat", Width: 1920, Height: 1080, DurationSeconds: 5}
+	w, h, fr := wanFrame(p)
+	if w != 1248 || h != 704 || fr != 121 {
+		t.Fatalf("frame: %dx%d %d", w, h, fr)
+	}
+	a := wanTask(snapshot.Snapshot{Key: "k", Dir: "/snap/k"}, p, "/in.png", "/o.mp4", w, h, fr).Argv
+	if argOf(a, "--model") != "/r/wan_2_2/models/Wan2.2-TI2V-5B-Diffusers" || argOf(a, "--i2v-model") != argOf(a, "--model") {
+		t.Fatalf("model dirs: %v", a)
+	}
+	if argOf(a, "--fps") != "24" || argOf(a, "--lightning") != "" || argOf(a, "--steps-full") != "" || argOf(a, "--steps") == "4" {
+		t.Fatalf("5B flags: %v", a)
+	}
+	n := 81 // production counts 5 s at 16 fps; the 5B keeps the 5 s at its 24
+	if _, _, fr := wanFrame(videoParams{Model: "wan2.2-ti2v-5b", Width: 1280, Height: 720, Frames: &n, FPS: 16}); fr != 121 {
+		t.Fatalf("frames at 24 fps: %d", fr)
+	}
+	if _, _, fr := wanFrame(videoParams{Width: 1280, Height: 720, Frames: &n, FPS: 16}); fr != 81 {
+		t.Fatalf("A14B frames: %d", fr)
+	}
+	t.Setenv("ACT3_WAN_MODEL", "wan2.2-ti2v-5b")
+	q := videoParams{Prompt: "x"}
+	q.defaults()
+	if q.Model != "wan2.2-ti2v-5b" {
+		t.Fatalf("machine model not the default: %q", q.Model)
+	}
+	if why := wanInstallProblem("wan2.2-nope"); !strings.Contains(why, "wan2.2-ti2v-5b") {
+		t.Fatalf("unknown model: %q", why)
+	}
+	// A14B is installed only with its I2V weights; the 5B renders image-to-video from its own folder
+	home := t.TempDir()
+	t.Setenv("ACT3_RENDER_HOME", home)
+	touch(t, venvPython(filepath.Join(home, "wan_2_2")), 1)
+	touch(t, filepath.Join(home, "wan_2_2", "models", "Wan2.2-T2V-A14B-Diffusers", "model_index.json"), 1)
+	touch(t, filepath.Join(home, "wan_2_2", "models", "Wan2.2-TI2V-5B-Diffusers", "model_index.json"), 1)
+	if why := wanInstallProblem(WanModel); !strings.Contains(why, "Wan2.2-I2V-A14B-Diffusers") {
+		t.Fatalf("A14B without I2V: %q", why)
+	}
+	if why := wanInstallProblem("wan2.2-ti2v-5b"); why != "" {
+		t.Fatalf("5B: %q", why)
+	}
+	touch(t, filepath.Join(home, "wan_2_2", "models", "Wan2.2-I2V-A14B-Diffusers", "model_index.json"), 1)
+	if why := wanInstallProblem(WanModel); why != "" {
+		t.Fatalf("A14B with I2V: %q", why)
+	}
+}
+
 // seedvr2-cli.ts seedvr2Argv for the Mac Studio and the 5090.
 func TestSeedVR2Argv(t *testing.T) {
 	t.Setenv("ACT3_RENDER_HOME", "/r")
@@ -86,8 +135,18 @@ func TestSeedVR2Argv(t *testing.T) {
 	}
 	a = seedvr2Task(upscaleParams{Quality: "best", Width: 3840, Height: 2160}, "/in.mp4", "/out.mp4", "cuda").Argv
 	if argOf(a, "--batch_size") != "5" || argOf(a, "--blocks_to_swap") != "24" || argOf(a, "--dit_model") != "seedvr2_ema_7b_fp16.safetensors" ||
-		slices.Contains(a, "--vae_encode_tiled") || !slices.Contains(a, "--vae_decode_tiled") {
+		!slices.Contains(a, "--vae_encode_tiled") || !slices.Contains(a, "--vae_decode_tiled") {
 		t.Fatalf("5090 7B 4K: %v", a)
+	}
+	// 3B at 4K: 21 frames per batch runs a 32 GB card out of memory; 9 fits. 1080p keeps 21.
+	a = seedvr2Task(upscaleParams{Quality: "standard", Width: 3840, Height: 2160}, "/in.mp4", "/out.mp4", "cuda").Argv
+	if argOf(a, "--batch_size") != "9" || slices.Contains(a, "--blocks_to_swap") || !slices.Contains(a, "--vae_encode_tiled") {
+		t.Fatalf("5090 3B 4K: %v", a)
+	}
+	// 3B at 1080p keeps 21 frames, but an untiled decode of them outgrows the card
+	a = seedvr2Task(upscaleParams{Quality: "standard", Width: 1920, Height: 1080}, "/in.mp4", "/out.mp4", "cuda").Argv
+	if argOf(a, "--batch_size") != "21" || !slices.Contains(a, "--vae_decode_tiled") || slices.Contains(a, "--vae_encode_tiled") {
+		t.Fatalf("5090 3B 1080p: %v", a)
 	}
 }
 
@@ -425,5 +484,27 @@ func TestDiskFullIsInfra(t *testing.T) {
 	}
 	if k := failureKind("ValueError: bad prompt"); k != jobs.KindInternal {
 		t.Errorf("plain failure: %s", k)
+	}
+}
+
+// The error a script prints on stderr can be read before its last stdout progress line.
+func TestLastLineSkipsOurGrammar(t *testing.T) {
+	tail := "ACT3_STAGE rendering\nRuntimeError: CUDA out of memory\nACT3_PROGRESS 100.0\n"
+	if l := lastLine(tail); l != "RuntimeError: CUDA out of memory" {
+		t.Errorf("got %q", l)
+	}
+	if l := lastLine("ACT3_PROGRESS 10.0\n"); l != "no output" {
+		t.Errorf("only progress: got %q", l)
+	}
+	// SeedVR2's output: the error, then a cleanup section and its sponsor banner
+	seedvr2 := "torch.OutOfMemoryError: Allocation on device 0 would exceed allowed memory. (out of memory)\n" +
+		"[08:39:12.928] Process 2816552 terminating - VRAM will be automatically freed\n" +
+		"[08:39:12.928] Questions? Updates? Watch, star & sponsor if you can!\n" +
+		"[08:39:12.928] https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler\n"
+	if l := lastLine(seedvr2); !strings.HasPrefix(l, "torch.OutOfMemoryError") {
+		t.Errorf("banner after the error: got %q", l)
+	}
+	if l := lastLine("loading\nall done, but no file\n"); l != "all done, but no file" {
+		t.Errorf("no error line: got %q", l)
 	}
 }

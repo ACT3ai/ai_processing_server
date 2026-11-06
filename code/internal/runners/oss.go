@@ -89,9 +89,10 @@ type detachedTask struct {
 	Argv         []string
 	Dir          string
 	Env          []string
-	Output       string          // inside the run directory
-	Steps        []taskhost.Step // instead of Argv: checkpointed steps, the last one writes Output (R8)
-	ExpectFrames int             // the output must have about this many frames (0: any number above zero)
+	Output       string           // inside the run directory
+	Steps        []taskhost.Step  // instead of Argv: checkpointed steps, the last one writes Output (R8)
+	ExpectFrames int              // the output must have about this many frames (0: any number above zero)
+	Phases       []taskhost.Phase // one process's counted passes, weighted into one bar (SeedVR2)
 }
 
 // buildFunc builds the task. snap is the frozen code; inputs maps input name → its copy inside the run directory;
@@ -311,8 +312,8 @@ func launch(job *jobs.Job, env Env, rep Reporter, dir string, build buildFunc) e
 	if timeout <= 0 || timeout > MaxTaskSeconds {
 		timeout = MaxTaskSeconds
 	}
-	task := taskhost.Task{JobID: job.ID, Snapshot: snap.Key, Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output,
-		GPU: env.Slot.GPU, TimeoutSeconds: timeout, Steps: t.Steps, ExpectFrames: t.ExpectFrames}
+	task := taskhost.Task{JobID: job.ID, Snapshot: snap.Key, Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output, Phases: t.Phases,
+		GPU: env.Slot.GPU, TimeoutSeconds: timeout, Steps: t.Steps, ExpectFrames: t.ExpectFrames, MinFreeRAMGB: env.MinFreeRAMGB}
 	if err := os.MkdirAll(filepath.Dir(t.Output), 0o700); err != nil {
 		return jobs.Wrap(jobs.KindInfra, err, "create the output dir")
 	}
@@ -357,14 +358,34 @@ func validateVideo(ffprobe, path string, expect int) error {
 	return nil
 }
 
+// reGrammar: our own stage, progress and note lines never explain a failure. stdout and stderr are read
+// separately, so the error a script prints on stderr can land before its last progress line.
+var reGrammar = regexp.MustCompile(`^ACT3_(STAGE|PROGRESS|NOTE)\b`)
+
+// reErrorLine: a line that reports the failure. Verbose tools print a cleanup section and a banner after it (SeedVR2
+// ends every run with its sponsor links), so the last line is often not the reason.
+var reErrorLine = regexp.MustCompile(`(?i)\b\w*(error|exception)\b|out of memory|traceback|killed|no such file|not found|failed`)
+
+// lastLine names the failure: the last line that reports an error, else the last line of output.
 func lastLine(tail string) string {
 	lines := strings.Split(strings.TrimSpace(tail), "\n")
+	last := ""
 	for i := len(lines) - 1; i >= 0; i-- {
-		if l := strings.TrimSpace(lines[i]); l != "" {
+		l := strings.TrimSpace(lines[i])
+		if l == "" || reGrammar.MatchString(l) {
+			continue
+		}
+		if reErrorLine.MatchString(l) && !strings.HasPrefix(l, "Traceback") {
 			return truncate(l, 400)
 		}
+		if last == "" {
+			last = l
+		}
 	}
-	return "no output"
+	if last == "" {
+		return "no output"
+	}
+	return truncate(last, 400)
 }
 
 func truncate(s string, n int) string {

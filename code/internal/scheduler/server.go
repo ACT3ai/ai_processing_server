@@ -224,7 +224,8 @@ func (s *Server) recover() {
 			j.LastErr = fmt.Sprintf("server restarted during %s", stage)
 			j.LastFailedAt, j.FinishedAt = &now, &now
 			j.Slot = nil
-			if j.Claim != nil { // a queued job: its claim goes back to the queue once the broker answers
+			claimed := j.Claim != nil
+			if claimed { // a queued job: its claim goes back to the queue once the broker answers
 				s.reclaim = append(s.reclaim, *j.Claim)
 				j.Claim = nil
 			}
@@ -234,7 +235,11 @@ func (s *Server) recover() {
 				s.log.Error("journal save failed", "job_id", j.ID, "error", err)
 				elog.Error("saving the job journal at boot", err, "job_id", j.ID)
 			}
-			s.log.Error("job failed at boot", "job_id", j.ID, "service", j.Type, "reason", j.LastErr)
+			if claimed { // not a failure yet: the reclaim re-adopts it or puts it back in the queue
+				s.log.Info("job interrupted by a restart; its claim is reclaimed", "job_id", j.ID, "service", j.Type, "stage", stage)
+			} else {
+				s.log.Error("job failed at boot", "job_id", j.ID, "service", j.Type, "reason", j.LastErr)
+			}
 		}
 		s.jobs[j.ID] = j
 	}

@@ -76,6 +76,10 @@ func InitKey(dir string) (InitResult, error) {
 		if err := os.Chmod(dir, 0o700); err != nil { // the key dir is ours alone, even if it existed before
 			return InitResult{}, err
 		}
+		// NTFS, exFAT and FAT mounts accept the chmod and keep 0777: a key made there could never be loaded.
+		if st, err := os.Stat(dir); err == nil && st.Mode().Perm()&0o077 != 0 {
+			return InitResult{}, fmt.Errorf("%s cannot be made private (mode %o after chmod 700): %s", dir, st.Mode().Perm(), noUnixPermissions)
+		}
 	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -126,6 +130,8 @@ func ParsePrivatePEM(b []byte, name string) (*Key, error) {
 	return &Key{Private: priv, Public: pub, KID: Thumbprint(pub), Path: name}, nil
 }
 
+const noUnixPermissions = "the disk has no Unix permissions (NTFS, exFAT): set security.key_dir in this_server.yaml to a directory on one that does"
+
 // CheckPermissions refuses a key file readable by group or others (the OpenSSH rule). Windows ACLs are checked by
 // the owner for now (security.mdx §4.2 lists the ACL check as to do).
 func CheckPermissions(path string) error {
@@ -134,7 +140,7 @@ func CheckPermissions(path string) error {
 		return err
 	}
 	if runtime.GOOS != "windows" && st.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("%s is readable by other users (mode %o); run chmod 600 on it", path, st.Mode().Perm())
+		return fmt.Errorf("%s is readable by other users (mode %o); run chmod 600 on it, and if the mode does not change, %s", path, st.Mode().Perm(), noUnixPermissions)
 	}
 	return nil
 }

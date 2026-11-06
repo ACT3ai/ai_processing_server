@@ -65,6 +65,9 @@ func LoadCatalog(dataDir string) (*Catalog, error) {
 		if s.Requires.GPU == "" {
 			s.Requires.GPU = "none"
 		}
+		if err := s.pickModel(os.Getenv(s.ModelEnv)); err != nil {
+			return nil, fmt.Errorf("%s: %w", f, err)
+		}
 		if s.ResourcesPerJob.CPUCores <= 0 {
 			s.ResourcesPerJob.CPUCores = 1
 		}
@@ -217,4 +220,38 @@ func ExpandHome(p string) string {
 		return filepath.Join(home, p[1:])
 	}
 	return p
+}
+
+// pickModel applies the needs of the model $ModelEnv names. Empty = the service's defaults; an unknown name is an
+// error, so a typo never offers a big model on a machine sized for a small one.
+func (s *ServiceDef) pickModel(name string) error {
+	if s.ModelEnv == "" || name == "" {
+		return nil
+	}
+	m, ok := s.Models[name]
+	if !ok {
+		known := make([]string, 0, len(s.Models))
+		for k := range s.Models {
+			known = append(known, k)
+		}
+		sort.Strings(known)
+		return fmt.Errorf("%s=%s is not one of this service's models (%s)", s.ModelEnv, name, strings.Join(known, ", "))
+	}
+	if m.MinVRAMGB > 0 {
+		s.Requires.MinVRAMGB = m.MinVRAMGB
+	}
+	if m.MinUnifiedMemGB > 0 {
+		s.Requires.MinUnifiedMemGB = m.MinUnifiedMemGB
+	}
+	r := m.ResourcesPerJob
+	if r.CPUCores > 0 {
+		s.ResourcesPerJob.CPUCores = r.CPUCores
+	}
+	if r.RAMGB > 0 {
+		s.ResourcesPerJob.RAMGB = r.RAMGB
+	}
+	if r.VRAMGB > 0 {
+		s.ResourcesPerJob.VRAMGB = r.VRAMGB
+	}
+	return nil
 }

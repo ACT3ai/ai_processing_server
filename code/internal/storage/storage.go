@@ -10,8 +10,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -30,7 +33,7 @@ func Fetch(ctx context.Context, in jobs.Input, dir string, allowLocal bool) (str
 	if in.Name == "" || strings.ContainsAny(in.Name, `/\`) || in.Name == "." || in.Name == ".." {
 		return "", 0, "", jobs.Errf(jobs.KindInvalidInput, "input name %q must be a plain file name", in.Name)
 	}
-	dst := filepath.Join(dir, in.Name)
+	dst := filepath.Join(dir, in.Name+sourceExt(in))
 	var size int64
 	var sum string
 	var err error
@@ -62,6 +65,26 @@ func Fetch(ctx context.Context, in jobs.Input, dir string, allowLocal bool) (str
 		return "", 0, "", jobs.Errf(jobs.KindInvalidInput, "input %s size mismatch: expected %d bytes, got %d", in.Name, in.Bytes, size)
 	}
 	return dst, size, sum, nil
+}
+
+var reExt = regexp.MustCompile(`^\.[A-Za-z0-9]{1,8}$`)
+
+// sourceExt keeps the source's extension when the input's name has none: tools decide by it (SeedVR2's CLI refused
+// "in/source_video" as "Unsupported input type").
+func sourceExt(in jobs.Input) string {
+	if filepath.Ext(in.Name) != "" {
+		return ""
+	}
+	ext := filepath.Ext(in.Path)
+	if ext == "" && in.URL != "" {
+		if u, err := url.Parse(in.URL); err == nil {
+			ext = path.Ext(u.Path)
+		}
+	}
+	if !reExt.MatchString(ext) {
+		return ""
+	}
+	return strings.ToLower(ext)
 }
 
 func download(ctx context.Context, url, dst string) (int64, string, error) {

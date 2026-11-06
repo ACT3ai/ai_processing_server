@@ -18,5 +18,11 @@ copy() { # copy <source relative to ALL> <dest relative to HERE> [runner that ru
 	echo "synced $2"
 }
 copy film/code/subp/video_gen_ai/wan/v2_2_a14b/local/render_wan.py video_gen/wan22/render_wan.py
+copy film/code/subp/video_gen_ai/kandinsky/video_pro_6_0/local/render_kandinsky.py video_gen/kandinsky6/render_kandinsky.py \
+	"the oss_video runner for Kandinsky 6.0 (code/internal/runners/oss_kandinsky.go)"
+copy app/smartc/film/servers/bms/oss_video/flashvsr/code/run_flashvsr.py upscale/flashvsr/run_flashvsr.py \
+	"the oss_upscale runner for FlashVSR (code/internal/runners/oss_flashvsr.go)"
 copy film/code/subp/video_gen_ai/nvidia/h3_regenerate_2k/render_h3_regenerate.py video_gen/h3_regenerate/render_h3_regenerate.py \
 	"the oss_regenerate runner (code/internal/runners/oss_regenerate.go)"
+copy film/code/subp/video_gen_ai/nvidia/h3_regenerate_2k/render_h3_generate.py video_gen/h3_regenerate/render_h3_generate.py \
+	"the oss_video runner for MiniMax H3 (code/internal/runners/oss_h3.go); it imports render_h3_regenerate.py beside it"

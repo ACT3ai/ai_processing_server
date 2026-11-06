@@ -6,6 +6,7 @@ package procs
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,6 +23,9 @@ var elog = errlog.For("procs")
 
 // GraceBeforeKill is how long a cancelled process gets after the interrupt before the tree is killed.
 var GraceBeforeKill = 10 * time.Second
+
+// ErrKillNow as a context cause skips that grace: the tree is killed at once (the machine is running out of memory).
+var ErrKillNow = errors.New("killed at once")
 
 // Spec is one command to run.
 type Spec struct {
@@ -47,6 +51,7 @@ func Run(ctx context.Context, s Spec) error {
 		defer wg.Done()
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		sc.Split(scanLinesOrCR)
 		for sc.Scan() {
 			if fn != nil {
 				fn(sc.Text())
@@ -70,6 +75,7 @@ func Run(ctx context.Context, s Spec) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", s.Name, err)
 	}
+	lowerPriority(cmd)
 	wg.Add(2)
 	go pipe(stdout, s.Stdout)
 	go pipe(stderr, s.Stderr)
@@ -81,6 +87,11 @@ func Run(ctx context.Context, s Spec) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		if errors.Is(context.Cause(ctx), ErrKillNow) {
+			killGroup(cmd)
+			<-done
+			return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
+		}
 		interruptGroup(cmd)
 		select {
 		case <-done:
@@ -108,5 +119,30 @@ func cleanEnv(s Spec) []string {
 	if s.GPU != nil {
 		env = append(env, "CUDA_VISIBLE_DEVICES="+strconv.Itoa(*s.GPU))
 	}
+	// Python's UTF-8 mode: on Windows a piped stdout is cp1252, and a printed emoji (SeedVR2's) kills the run
+	env = append(env, "PYTHONUTF8=1")
 	return append(env, s.Env...)
+}
+
+// scanLinesOrCR is bufio.ScanLines that also ends a line at a lone '\r': a tqdm bar redraws itself with '\r', and
+// read as one line its progress only arrived when the bar closed. "\r\n" is one line break.
+func scanLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for i, b := range data {
+		switch b {
+		case '\n':
+			return i + 1, data[:i], nil
+		case '\r':
+			if i+1 == len(data) && !atEOF {
+				return 0, nil, nil // is it "\r\n"? wait for the next byte
+			}
+			if i+1 < len(data) && data[i+1] == '\n' {
+				return i + 2, data[:i], nil
+			}
+			return i + 1, data[:i], nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }

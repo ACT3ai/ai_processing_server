@@ -6,15 +6,20 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
 )
 
-// OSSVideo is the runner behind act3.video_gen_open_source: open-source video generation on our own GPUs.
-// Model "wan2.2-a14b" (the default): Wan 2.2 A14B text-to-video, or image-to-video from input "first_frame" when the
-// I2V weights are installed, on CUDA (B5090) or Metal (the Mac Studio). It runs code/scripts/video_gen/wan22/
+// OSSVideo is the runner behind act3.video_gen_open_source: open-source video generation on our own GPUs. The job's
+// model picks the family: Wan 2.2 (below), LTX-2.5 (oss_ltx.go), Kandinsky 6.0 Lite/Pro (oss_kandinsky.go), MiniMax H3
+// (oss_h3.go).
+// Model "wan2.2-a14b" (the default): Wan 2.2 A14B image-to-video from input "first_frame" (the I2V weights are
+// required: shots almost always carry one), or text-to-video, on CUDA (B5090) or Metal (the Mac Studio). It runs code/scripts/video_gen/wan22/
 // render_wan.py from the job's snapshot with the install at ~/act3_render/wan_2_2/ (models are not code, R5).
 //
 // The argv rules are a port of the internal web app's plugin, which stays the reference for limits and flags:
@@ -26,15 +31,39 @@ import (
 // internal web app's camelCase durationSeconds and negativePrompt are accepted too (its processing/tasks.ts).
 type OSSVideo struct{}
 
-// WanModel is the model id this runner renders (task_queue.mdx §11.2 models.allow patterns match it).
+// WanModel is the default model id this runner renders (task_queue.mdx §11.2 models.allow patterns match it).
+// $ACT3_WAN_MODEL picks another of wanModels for this machine (the service catalog sizes its offer from the same
+// variable); a job naming a model this machine has not installed fails with "not installed".
 const WanModel = "wan2.2-a14b"
 
-const (
-	wanFPS       = 16
-	wanMaxFrames = 81
-	wanMaxW      = 1280
-	wanMaxH      = 720
-)
+// wanSpec is one Wan 2.2 checkpoint's limits, a port of the plugin's WAN_MODELS (wan-local.ts).
+type wanSpec struct {
+	dir                    string // under <home>/models; image-to-video uses the same folder when i2vDir is ""
+	i2vDir                 string
+	fps, maxFrames         int
+	maxW, maxH, multipleOf int
+	lightning              bool // the 4-step Lightning LoRAs exist for it
+}
+
+var wanModels = map[string]wanSpec{
+	WanModel:         {dir: "Wan2.2-T2V-A14B-Diffusers", i2vDir: "Wan2.2-I2V-A14B-Diffusers", fps: 16, maxFrames: 81, maxW: 1280, maxH: 720, multipleOf: 16, lightning: true},
+	"wan2.2-ti2v-5b": {dir: "Wan2.2-TI2V-5B-Diffusers", fps: 24, maxFrames: 121, maxW: 1280, maxH: 704, multipleOf: 32},
+}
+
+// wanMachineModel is the model this machine renders: $ACT3_WAN_MODEL, else WanModel.
+func wanMachineModel() string {
+	if m := os.Getenv("ACT3_WAN_MODEL"); m != "" {
+		return m
+	}
+	return WanModel
+}
+
+func wanSpecFor(model string) wanSpec {
+	if m, ok := wanModels[model]; ok {
+		return m
+	}
+	return wanModels[WanModel]
+}
 
 type videoParams struct {
 	Model           string  `json:"model"`
@@ -43,10 +72,12 @@ type videoParams struct {
 	Height          int     `json:"height"`
 	DurationSeconds float64 `json:"duration_seconds"`
 	Frames          *int    `json:"frames"`
+	FPS             int     `json:"fps"` // the rate Frames was counted at; another model's fps keeps the duration
 	Steps           *int    `json:"steps"`
 	Seed            *int64  `json:"seed"`
 	Prompt          string  `json:"prompt"`
 	NegativePrompt  string  `json:"negative_prompt"`
+	Delivery        any     `json:"delivery"` // minimax-h3: internal|customer (deliveryOf)
 
 	// The internal web app spreads its LocalJob params as they are (camelCase): accepted as aliases.
 	DurationSecondsAlt float64 `json:"durationSeconds"`
@@ -64,7 +95,7 @@ func (p *videoParams) defaults() {
 		p.NegativePrompt = p.NegativePromptAlt
 	}
 	if p.Model == "" {
-		p.Model = WanModel
+		p.Model = wanMachineModel()
 	}
 	if p.Kind == "" {
 		p.Kind = "t2v"
@@ -88,31 +119,64 @@ func (OSSVideo) Check(_ context.Context, job *jobs.Job, env Env) error {
 		return err
 	}
 	p.defaults()
-	if p.Model != WanModel {
-		return jobs.Errf(jobs.KindInvalidInput, "model %q is not built on this server yet (built: %s)", p.Model, WanModel)
-	}
-	if p.Kind != "t2v" && p.Kind != "i2v" {
-		return jobs.Errf(jobs.KindInvalidInput, "Wan 2.2 makes video from a prompt (t2v) or a first frame (i2v), not %q", p.Kind)
-	}
-	if p.DurationSeconds <= 0 || p.DurationSeconds > float64(wanMaxFrames)/wanFPS+0.01 {
-		return jobs.Errf(jobs.KindInvalidInput, "Wan 2.2 makes at most %.2f s per clip", float64(wanMaxFrames)/wanFPS)
-	}
 	if p.Width < 16 || p.Height < 16 || p.Width > 4096 || p.Height > 4096 {
 		return jobs.Errf(jobs.KindInvalidInput, "width and height must be 16..4096")
 	}
 	if strings.TrimSpace(p.Prompt) == "" {
 		return jobs.Errf(jobs.KindInvalidInput, "prompt is required")
 	}
-	if p.Kind == "i2v" && !hasInput(job, "first_frame") {
-		return jobs.Errf(jobs.KindInvalidInput, "an i2v job needs the input \"first_frame\"")
+	var installProblem func() string
+	switch q := kandinskyQuality(p.Model); {
+	case p.Model == LTXModel:
+		if err := ltxCheck(job, p); err != nil {
+			return err
+		}
+		installProblem = ltxInstallProblem
+	case q != "":
+		if err := kandinskyCheck(job, p); err != nil {
+			return err
+		}
+		installProblem = func() string { return kandinskyInstallProblem(q) }
+	case p.Model == H3Model:
+		if err := h3Check(job, env, p); err != nil {
+			return err
+		}
+		installProblem = func() string { return h3InstallProblemFor(job) }
+	default:
+		if err := wanCheck(job, p); err != nil {
+			return err
+		}
+		installProblem = func() string { return wanInstallProblem(p.Model) }
 	}
 	if FakeModels() {
 		return nil
 	}
-	if why := wanInstallProblem(); why != "" {
+	if why := installProblem(); why != "" {
 		return jobs.Errf(jobs.KindInfra, "%s", why)
 	}
 	return nil
+}
+
+func wanCheck(job *jobs.Job, p videoParams) error {
+	m, ok := wanModels[p.Model]
+	if !ok {
+		return jobs.Errf(jobs.KindInvalidInput, "model %q is not built on this server (built: %s)", p.Model, strings.Join(videoModelIDs(), ", "))
+	}
+	if p.Kind != "t2v" && p.Kind != "i2v" {
+		return jobs.Errf(jobs.KindInvalidInput, "Wan 2.2 makes video from a prompt (t2v) or a first frame (i2v), not %q", p.Kind)
+	}
+	if p.DurationSeconds <= 0 || p.DurationSeconds > float64(m.maxFrames)/float64(m.fps)+0.01 {
+		return jobs.Errf(jobs.KindInvalidInput, "Wan 2.2 makes at most %.2f s per clip", float64(m.maxFrames)/float64(m.fps))
+	}
+	if p.Kind == "i2v" && !hasInput(job, "first_frame") {
+		return jobs.Errf(jobs.KindInvalidInput, "an i2v job needs the input \"first_frame\"")
+	}
+	return nil
+}
+
+// videoModelIDs: every model this runner renders, for "not built" answers.
+func videoModelIDs() []string {
+	return append(wanModelIDs(), LTXModel, "kandinsky-6.0-lite", "kandinsky-6.0-pro", H3Model)
 }
 
 func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (*Result, error) {
@@ -121,37 +185,68 @@ func (OSSVideo) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (
 		return nil, err
 	}
 	p.defaults()
-	return runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
-		w, h, frames := wanFrame(p)
+	res, err := runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
+		var w, h, frames int
+		switch {
+		case p.Model == LTXModel:
+			w, h, frames = ltxFrame(p)
+		case kandinskyQuality(p.Model) != "":
+			w, h, frames = kandinskyFrame(p)
+		case p.Model == H3Model:
+			w, h = h3Frame(p)
+		default:
+			w, h, frames = wanFrame(p)
+		}
 		if FakeModels() {
 			return fakeTask(snap, out, "", p.Prompt, w, h)
 		}
+		switch {
+		case p.Model == LTXModel:
+			return ltxTask(p, inputs["first_frame"], lastFrameOf(inputs), out, w, h, frames), nil
+		case kandinskyQuality(p.Model) != "":
+			return kandinskyTask(snap, env, p, inputs["first_frame"], out, w, h, frames), nil
+		case p.Model == H3Model:
+			return h3Task(snap, env, p, inputs, out, w, h)
+		}
 		return wanTask(snap, p, inputs["first_frame"], out, w, h, frames), nil
 	})
+	if err == nil && res != nil && p.Model == H3Model {
+		for i := range res.Outputs {
+			res.Outputs[i].Meta = map[string]any{"license_cleared": H3RegenerateLicenseCleared, "delivery": deliveryOf(p.Delivery)}
+		}
+	}
+	return res, err
 }
 
-// wanFrame applies the model's limits: scale to fit 1280×720 (or 720×1280), sides down to a multiple of 16, frames
-// 4n+1 up to 81 at 16 fps.
+func wanModelIDs() []string {
+	ids := make([]string, 0, len(wanModels))
+	for id := range wanModels {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// wanFrame applies the model's limits: scale to fit its largest frame (A14B 1280×720, TI2V-5B 1280×704, either way
+// round), sides down to its multiple (16, 32), frames 4n+1 up to its maximum at its fps (81 at 16, 121 at 24).
 func wanFrame(p videoParams) (w, h, frames int) {
+	m := wanSpecFor(p.Model)
 	landscape := p.Width >= p.Height
-	maxW, maxH := float64(wanMaxW), float64(wanMaxH)
+	maxW, maxH := float64(m.maxW), float64(m.maxH)
 	if !landscape {
-		maxW, maxH = wanMaxH, wanMaxW
+		maxW, maxH = maxH, maxW
 	}
 	scale := math.Min(1, math.Min(maxW/float64(max(1, p.Width)), maxH/float64(max(1, p.Height))))
-	w = floorTo(int(float64(p.Width)*scale), 16)
-	h = floorTo(int(float64(p.Height)*scale), 16)
-	if p.Frames != nil && *p.Frames > 0 {
-		frames = framesKn1(*p.Frames, 4, wanMaxFrames)
-	} else {
-		frames = framesKn1(int(math.Round(p.DurationSeconds*wanFPS))+1, 4, wanMaxFrames)
-	}
+	w = floorTo(int(float64(p.Width)*scale), m.multipleOf)
+	h = floorTo(int(float64(p.Height)*scale), m.multipleOf)
+	frames = framesKn1(framesWanted(p, m.fps), 4, m.maxFrames)
 	return
 }
 
 func wanTask(snap snapshot.Snapshot, p videoParams, image, out string, w, h, frames int) detachedTask {
 	home := wanHome()
 	accel := accelerator()
+	m := wanSpecFor(p.Model)
 	lightning := os.Getenv("WAN_LIGHTNING_DIR")
 	if lightning == "" {
 		lightning = filepath.Join(home, "models", "Wan2.2-Lightning", "Wan2.2-T2V-A14B-4steps-lora-250928")
@@ -160,25 +255,29 @@ func wanTask(snap snapshot.Snapshot, p videoParams, image, out string, w, h, fra
 	if lightningI2V == "" {
 		lightningI2V = filepath.Join(home, "models", "Wan2.2-Lightning", "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1")
 	}
-	off := os.Getenv("WAN_LIGHTNING") == "off"
+	off := os.Getenv("WAN_LIGHTNING") == "off" || !m.lightning
 	seed := int64(42)
 	if p.Seed != nil {
 		seed = *p.Seed
 	}
 	argv := []string{
 		venvPython(home), snap.Path("code/scripts/video_gen/wan22/render_wan.py"),
-		"--model", filepath.Join(home, "models", "Wan2.2-T2V-A14B-Diffusers"),
+		"--model", filepath.Join(home, "models", m.dir),
 		"--out", out,
 		"--prompt", truncate(strings.TrimSpace(p.Prompt), 500),
 		"--width", fmt.Sprint(w), "--height", fmt.Sprint(h),
-		"--frames", fmt.Sprint(frames), "--fps", fmt.Sprint(wanFPS),
+		"--frames", fmt.Sprint(frames), "--fps", fmt.Sprint(m.fps),
 		"--seed", fmt.Sprint(seed), "--device", accel,
 	}
 	if p.NegativePrompt != "" {
 		argv = append(argv, "--negative", truncate(p.NegativePrompt, 500))
 	}
 	if p.Kind == "i2v" && image != "" {
-		argv = append(argv, "--image", image, "--i2v-model", filepath.Join(home, "models", "Wan2.2-I2V-A14B-Diffusers"))
+		i2v := m.i2vDir
+		if i2v == "" {
+			i2v = m.dir
+		}
+		argv = append(argv, "--image", image, "--i2v-model", filepath.Join(home, "models", i2v))
 		if !off {
 			argv = append(argv, "--lightning-i2v", lightningI2V)
 		}
@@ -215,6 +314,48 @@ func hasInput(job *jobs.Job, name string) bool {
 		}
 	}
 	return false
+}
+
+// roleInputs: the inputs film/servers named `<role>_<i>` (the manifest's order), as name → path ordered by i.
+func roleInputs(names []string, role string) []string {
+	type at struct {
+		i    int
+		name string
+	}
+	var got []at
+	for _, n := range names {
+		if rest, ok := strings.CutPrefix(n, role+"_"); ok {
+			if i, err := strconv.Atoi(rest); err == nil {
+				got = append(got, at{i, n})
+			}
+		}
+	}
+	slices.SortFunc(got, func(a, b at) int { return a.i - b.i })
+	out := make([]string, len(got))
+	for k, g := range got {
+		out[k] = g.name
+	}
+	return out
+}
+
+// lastFrameOf: the anchored last frame film/servers sent (`last_frame_<i>`), else "".
+func lastFrameOf(inputs map[string]string) string {
+	names := make([]string, 0, len(inputs))
+	for n := range inputs {
+		names = append(names, n)
+	}
+	if l := roleInputs(names, "last_frame"); len(l) > 0 {
+		return inputs[l[0]]
+	}
+	return ""
+}
+
+func inputNames(job *jobs.Job) []string {
+	out := make([]string, 0, len(job.Payload.Inputs))
+	for _, in := range job.Payload.Inputs {
+		out = append(out, in.Name)
+	}
+	return out
 }
 
 // floorTo rounds n down to a multiple of m, at least m.

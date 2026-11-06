@@ -46,7 +46,8 @@ platforms:                            # superseded by queue + callers below (tas
 limits:
   max_parallel_jobs: 4                # whole machine
   cpu_reserve_pct: 20                 # never offered to jobs
-  ram_reserve_gb: 16
+  ram_reserve_gb: 16                  # never booked by jobs
+  ram_floor_gb: 0                     # a running render is stopped when free RAM stays under this; 0 = 5% of RAM, >= 4 GB
   vram_headroom_gb: 1.5               # per GPU
   disk_min_free_gb: 20                # below this, no new jobs that write locally
   gpu_temp_max_c: 85

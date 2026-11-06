@@ -10,6 +10,7 @@ import (
 
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
+	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 )
 
 // OSSUpscale is the runner behind act3.upscale_open_source: video upscaling with SeedVR2 on our own GPUs (the Mac
@@ -35,6 +36,7 @@ type upscaleParams struct {
 	DurationSeconds float64 `json:"duration_seconds"`
 	// SegmentSeconds: source seconds per checkpointed segment (R8); 0 = never segment; absent = the default.
 	SegmentSeconds *float64 `json:"segment_seconds"`
+	Factor         float64  `json:"factor"` // FlashVSR: the scale; 0 = target width over the source's
 
 	DurationSecondsAlt float64 `json:"durationSeconds"` // the internal web app's camelCase
 }
@@ -78,8 +80,20 @@ func (OSSUpscale) Check(_ context.Context, job *jobs.Job, env Env) error {
 		return err
 	}
 	p.defaults()
+	if isFlashVSR(p.Model) {
+		if err := flashvsrCheck(job, p); err != nil {
+			return err
+		}
+		if FakeModels() {
+			return nil
+		}
+		if why := flashvsrInstallProblem(); why != "" {
+			return jobs.Errf(jobs.KindInfra, "%s", why)
+		}
+		return nil
+	}
 	if p.Model != "seedvr2" {
-		return jobs.Errf(jobs.KindInvalidInput, "upscaler %q is not built on this server yet (built: seedvr2)", p.Model)
+		return jobs.Errf(jobs.KindInvalidInput, "upscaler %q is not built on this server (built: seedvr2, %s)", p.Model, FlashVSRModel)
 	}
 	q, ok := seedvr2Qualities[p.Quality]
 	if !ok {
@@ -113,6 +127,17 @@ func (OSSUpscale) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter)
 	}
 	p.defaults()
 	accel := accelerator()
+	if isFlashVSR(p.Model) {
+		return runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
+			src := inputs["source_video"]
+			if FakeModels() {
+				return fakeTask(snap, out, src, "", p.Width, p.Height)
+			}
+			scale := flashvsrScale(p, enginePath(env, "ffprobe"), src)
+			rep.Log(fmt.Sprintf("FlashVSR x%g", scale))
+			return flashvsrTask(snap, env, scale, src, out), nil
+		})
+	}
 	return runDetached(ctx, job, env, rep, "video", func(snap snapshot.Snapshot, inputs map[string]string, out string) (detachedTask, error) {
 		src := inputs["source_video"]
 		one := func(in, o string) detachedTask { return seedvr2Task(p, in, o, accel) }
@@ -166,10 +191,11 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 			argv = append(argv, "--dit_offload_device", "cpu", "--blocks_to_swap", fmt.Sprint(swap))
 		}
 	}
-	if accel == "mps" && short >= 1080 {
+	if (accel == "mps" && short >= 1080) || (accel == "cuda" && short >= nvidiaHighRes) {
 		argv = append(argv, "--vae_encode_tiled")
 	}
-	if (accel == "mps" && short >= 1080) || short >= nvidiaHighRes {
+	// untiled, a 21-frame 1080p decode outgrows a 32 GB card (Windows spills it to shared memory, ~3 min a batch)
+	if short >= 1080 {
 		argv = append(argv, "--vae_decode_tiled")
 	}
 	argv = append(argv, strings.Fields(os.Getenv("SEEDVR2_EXTRA_ARGS"))...)
@@ -177,7 +203,10 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 	if accel == "mps" {
 		env = append(env, "PYTORCH_ENABLE_MPS_FALLBACK=1")
 	}
-	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out}
+	// each pass prints its own "batch k/n"; at 4K decoding takes as long as upscaling
+	phases := []taskhost.Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45},
+		{Match: `(?i)decod`, Weight: 0.47}, {Match: `(?i)post-process`, Weight: 0.03}}
+	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out, Phases: phases}
 }
 
 // seedvr2Batch is the --batch_size (frames per temporal batch, 4n+1) for this job on this accelerator.
@@ -197,6 +226,8 @@ const nvidiaHighRes = 1440
 
 func nvidiaBatch(size string, short int) int {
 	switch {
+	case size == "3b" && short >= nvidiaHighRes:
+		return 9 // 21 at 4K runs a 32 GB card out of memory; 9 peaks at ~27 GB
 	case size == "3b":
 		return 21
 	case short >= nvidiaHighRes:

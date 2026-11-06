@@ -18,9 +18,18 @@ The Lightning pair (lightx2v/Wan2.2-Lightning) is one LoRA per expert: high_nois
 `transformer`, low_noise_model.safetensors into `transformer_2` (diffusers >= 0.35 `load_into_transformer_2`).
 T2V and I2V have their own pair (--lightning, --lightning-i2v). When no pair is loaded and the plugin passed
 --steps-full, that step count is used instead of the 4-step Lightning count.
+
+Wan2.2-TI2V-5B (ACT3_WAN_MODEL=wan2.2-ti2v-5b, for GPUs that cannot hold A14B) runs through the same script: its
+model_index.json has one transformer (no boundary_ratio) and expand_timesteps, so it takes one guidance scale, a
+float32 VAE (its model card), no Lightning, and image-to-video from the same folder (--i2v-model = --model).
+On CUDA PyTorch is capped at 95% of the card, so an overflow fails here instead of spilling into system RAM (the
+Windows driver's Sysmem Fallback froze the 5090). It offloads whole components (model offload) when the largest one
+fits under that cap with 4 GiB to spare, and layer by layer (sequential offload, slower) when it does not or when a
+render still runs out of GPU memory, so A14B renders on a 32 GB card and the 5B on an 8 GB one.
 """
 import argparse
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -92,6 +101,28 @@ def lora_pair(folder):
     return (high, low) if os.path.exists(high) and os.path.exists(low) else None
 
 
+def model_config(folder):
+    try:
+        with open(os.path.join(folder, "model_index.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+# PyTorch's share of the GPU on CUDA: the rest is the driver's, and an allocation past it fails instead of spilling
+VRAM_FRACTION = 0.95
+
+
+def largest_part_gib(p):
+    """The biggest component's weights: model offload moves one component at a time onto the GPU."""
+    sizes = [
+        sum(t.numel() * t.element_size() for t in m.parameters())
+        for m in p.components.values()
+        if isinstance(m, torch.nn.Module)
+    ]
+    return max(sizes, default=0) / 2**30
+
+
 def first_frame(path, width, height):
     """The first frame cropped to the target aspect (centre) and sized to width x height."""
     from PIL import Image
@@ -126,7 +157,11 @@ if x.image:
             flush=True,
         )
 
-pair_found = lora_pair(x.lightning_i2v if i2v else x.lightning)
+cfg = model_config(x.i2v_model if i2v else x.model)
+# A14B: two experts switched at boundary_ratio. TI2V-5B: one transformer, boundary_ratio null. No readable config:
+# the A14B behaviour this script always had.
+two_experts = cfg.get("boundary_ratio") is not None if cfg else True
+pair_found = lora_pair(x.lightning_i2v if i2v else x.lightning) if two_experts else None
 # Fail in a second, before loading two 14B experts, when the venv lacks what this run needs. A job on 2026-10-27
 # loaded both experts, then died at load_lora_weights because peft was missing (~/to/1_22.txt).
 missing = [m for m in (["peft"] if pair_found else []) + ["imageio"] if importlib.util.find_spec(m) is None]
@@ -157,16 +192,27 @@ if pair_found:
 
 t0 = time.time()
 stage("loading")
+# Read each shard and let it go: with mmap, Windows keeps every fp32 shard of an expert mapped while its bf16 copy is
+# built, and loading A14B's second expert nearly exhausted a 128 GB machine's RAM.
+extra_load = {"disable_mmap": True}
+if cfg.get("expand_timesteps"):
+    from diffusers import AutoencoderKLWan
+
+    extra_load["vae"] = AutoencoderKLWan.from_pretrained(
+        x.i2v_model if i2v else x.model, subfolder="vae", torch_dtype=torch.float32
+    )
 if i2v:
     from diffusers import WanImageToVideoPipeline
 
-    pipe = WanImageToVideoPipeline.from_pretrained(x.i2v_model, torch_dtype=torch.bfloat16)
+    pipe = WanImageToVideoPipeline.from_pretrained(x.i2v_model, torch_dtype=torch.bfloat16, **extra_load)
     guidance, guidance_2 = 3.5, 3.5
 else:
     from diffusers import WanPipeline
 
-    pipe = WanPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16)
+    pipe = WanPipeline.from_pretrained(x.model, torch_dtype=torch.bfloat16, **extra_load)
     guidance, guidance_2 = 4.0, 3.0
+if not two_experts:
+    guidance, guidance_2 = 5.0, None  # diffusers refuses guidance_scale_2 without a boundary_ratio
 pair = pair_found
 steps = x.steps
 if pair:
@@ -176,8 +222,28 @@ if pair:
     print("lightning LoRAs loaded", flush=True)
 elif x.steps_full:
     steps = x.steps_full
+
+layer_by_layer = False
+
+
+def offload_layer_by_layer(why):
+    global layer_by_layer
+    print(f"ACT3_NOTE {why}: offloading layer by layer", flush=True)
+    pipe.enable_sequential_cpu_offload()
+    pipe.vae.enable_tiling()
+    layer_by_layer = True
+
+
 if x.device == "cuda":
-    pipe.enable_model_cpu_offload()  # two 14B experts do not both fit 32 GB
+    # Windows' driver puts a CUDA allocation that does not fit the card into system RAM instead of failing (Sysmem
+    # Fallback), which can freeze the machine: capped, an overflow is an out-of-memory error here instead.
+    torch.cuda.set_per_process_memory_fraction(VRAM_FRACTION)
+    cap_gib = VRAM_FRACTION * torch.cuda.get_device_properties(0).total_memory / 2**30
+    part_gib = largest_part_gib(pipe)
+    if part_gib + 4 <= cap_gib:
+        pipe.enable_model_cpu_offload()  # one part on the GPU at a time, with room for its activations
+    else:
+        offload_layer_by_layer(f"largest part {part_gib:.1f} GiB, GPU cap {cap_gib:.1f} GiB")
 else:
     pipe.to("mps")
 print(f"loaded {'i2v' if i2v else 't2v'} in {time.time() - t0:.0f} s, {steps} steps", flush=True)
@@ -188,22 +254,33 @@ def on_step(_pipe, i, _t, kwargs):
     return kwargs
 
 
+def render():
+    return pipe(
+        prompt=x.prompt,
+        negative_prompt=x.negative or None,
+        width=x.width,
+        height=x.height,
+        num_frames=x.frames,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        guidance_scale_2=guidance_2,
+        generator=torch.Generator(device="cpu").manual_seed(x.seed),
+        callback_on_step_end=on_step,
+        **extra,
+    ).frames[0]
+
+
 stage("rendering")
-gen = torch.Generator(device="cpu").manual_seed(x.seed)
 extra = {"image": first_frame(x.image, x.width, x.height)} if i2v else {}
-frames = pipe(
-    prompt=x.prompt,
-    negative_prompt=x.negative or None,
-    width=x.width,
-    height=x.height,
-    num_frames=x.frames,
-    num_inference_steps=steps,
-    guidance_scale=guidance,
-    guidance_scale_2=guidance_2,
-    generator=gen,
-    callback_on_step_end=on_step,
-    **extra,
-).frames[0]
+try:
+    frames = render()
+except torch.cuda.OutOfMemoryError:
+    if x.device != "cuda" or layer_by_layer:
+        raise
+    pipe.remove_all_hooks()
+    torch.cuda.empty_cache()
+    offload_layer_by_layer("out of GPU memory with whole parts on the GPU")
+    frames = render()
 stage("encoding")
 os.makedirs(os.path.dirname(os.path.abspath(x.out)), exist_ok=True)
 n = write_mp4(frames, x.out, x.fps)

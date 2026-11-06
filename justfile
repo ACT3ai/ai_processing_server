@@ -134,7 +134,7 @@ stop mode="": _binary
 # Health, services and running jobs of the server on this machine
 status: _binary
     @./{{bin}} status
-    @echo
+    @echo ""
     @./{{bin}} jobs
 
 # The task queue: `just queue` lists what waits or runs; `just queue show <id>` is one job's states, events and log
@@ -304,12 +304,21 @@ disable +items: _binary
     ./{{bin}} disable {{items}}
 
 # Is this machine ready to render Wan 2.2 and SeedVR2? Broker, config, and each model service's offer + reason
+[unix]
 render-check: _binary
     -./{{bin}} broker status
-    @echo
+    @echo ""
     -./{{bin}} validate
-    @echo
+    @echo ""
     @./{{bin}} status 2>/dev/null | grep -E "SERVICE|open_source|local API" || echo "server not running: just run"
+
+[windows]
+render-check: _binary
+    -./{{bin}} broker status
+    @echo ""
+    -./{{bin}} validate
+    @echo ""
+    @$o = ./{{bin}} status 2>$null; if ($LASTEXITCODE -eq 0) { $o | Select-String -Pattern 'SERVICE|open_source|local API' } else { Write-Output 'server not running: just run' }
 
 # One real job through the queue on this machine's installed models: wan, upscale, or all (Wan, then upscale its clip)
 render-test what="all": _binary
@@ -321,7 +330,7 @@ render-setup: build
     ./{{bin}} validate
     -./{{bin}} stop
     just run
-    @echo
+    @echo ""
     just render-check
 
 # ---- start at boot (pm/task_authoring.mdx §8 G4: a real power cycle recovers unattended) ----
@@ -351,6 +360,11 @@ check-secrets:
     if [ -n "$hits" ]; then echo "PRIVATE KEY material in tracked files (revoke that key, then remove it):"; echo "$hits"; exit 1; fi
     echo "check-secrets: no private keys in tracked files"
 
+# \x22 instead of a double quote: Windows PowerShell 5.1 strips double quotes from a native command's arguments
+[windows]
+check-secrets:
+    $hits = @(git grep -l -E '^-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' -- . ':!*_test.go') + @(git grep -l -P '\x22d\x22[[:space:]]*:' -- '*.json' '*.jwk'); if ($hits.Count) { Write-Output 'PRIVATE KEY material in tracked files (revoke that key, then remove it):'; $hits; exit 1 }; Write-Output 'check-secrets: no private keys in tracked files'
+
 # Go unit tests next to the code
 test-go:
     go vet -C code ./...
@@ -358,9 +372,10 @@ test-go:
 
 # Black-box suite: starts its own servers on free ports and calls the API (see tests/README.md)
 test-suite: build
-    cd tests && just
+    just --justfile tests/justfile --working-directory tests
 
 # Cross-compile check for every fleet target (never committed)
+[unix]
 cross:
     cd code && GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/ai_processing_server
     cd code && GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/ai_processing_server
@@ -368,4 +383,4 @@ cross:
     cd code && GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/ai_processing_server
 
 _binary:
-    @{{ if path_exists(bin) == "true" { "true" } else { "echo 'no binary yet: run `just build` first' && exit 1" } }}
+    @{{ if path_exists(bin) == "true" { "exit 0" } else { "echo 'no binary yet: run just build first'; exit 1" } }}

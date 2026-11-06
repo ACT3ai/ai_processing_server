@@ -403,10 +403,38 @@ snapshot, re-attach to the live one, or collect what it finished while the contr
 timeout it stops the task; on a controller shutdown it leaves it running. Implemented in code:
 `~/BGit/act3/ai_processing_server/code/internal/runners/oss.go` — `runDetached`, `stopsTheTask` (the `Reattacher` hook is in runner.go)
 
-Wan 2.2 A14B (t2v, i2v; Lightning when installed) for act3.video_gen_open_source is implemented in code:
+Wan 2.2 A14B (i2v and t2v; Lightning when installed) for act3.video_gen_open_source is implemented in code. Its I2V
+weights are part of the install, not an extra: shots almost always carry a first frame (2026-11-04).
 `~/BGit/act3/ai_processing_server/code/internal/runners/oss_video.go` — `OSSVideo.Check`, `OSSVideo.Run`, `wanTask`
 and the script it runs, a synced copy of the ACT3 original (`code/scripts/sync_from_all.sh`):
 `~/BGit/act3/ai_processing_server/code/scripts/video_gen/wan22/render_wan.py`
+
+Which Wan model a machine renders (2026-11-04): `ACT3_WAN_MODEL` in the server's own environment, `wan2.2-a14b`
+when unset, or `wan2.2-ti2v-5b` on a GPU that cannot hold A14B. The service catalog's `model_env` / `models:`
+(`data/services/act3.video_gen_open_source.yaml`) sizes the offer from it (5B: 6 GB VRAM, 48 GB RAM per job), and an
+unknown name stops the server at load. The runner keeps each model's folder, fps and limits (`wanModels`), and a job's
+frame count made at another fps keeps its duration (production counts 81 at 16 fps; the 5B renders 121 at 24).
+render_wan.py offloads layer by layer when the model's largest part does not fit the GPU. The internal web app reads
+the same variable (`wan-local.ts` `WAN_MODELS`) to pick the model id it sends: set it for both processes.
+`~/BGit/act3/ai_processing_server/code/internal/config/load.go` — `ServiceDef.pickModel`
+
+LTX-2.5 and Kandinsky 6.0 (2026-11-04) run on the same service, picked by the job's model. LTX-2.5 (`ltx-2.5`) runs
+`python -m ltx_pipelines.distilled` from the pinned Lightricks/LTX-2 checkout's venv (the repo is the model's code, not
+snapshotted), image-to-video from the first frame (`--image <first_frame> 0 1.0`) or text-to-video, with audio; on CUDA with `--quantization fp8-cast --offload cpu` so the 22B transformer
+fits 32 GB (`LTX_ARGS` replaces them). Kandinsky (`kandinsky-6.0-lite`, `kandinsky-6.0-pro`) runs the snapshot's
+render_kandinsky.py; Pro is CUDA only and offloads layer by layer when it does not fit, and the pipeline's audio is
+muxed with the server's ffmpeg. The service is offered when any of its models is installed; a job for a missing one
+fails its Check as infra "not installed".
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss_ltx.go` — `ltxCheck`, `ltxFrame`, `ltxTask`
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss_kandinsky.go` — `kandinskyCheck`, `kandinskyFrame`, `kandinskyTask`
+
+FlashVSR v1.1 (`flashvsr-1.1`, 2026-11-04) runs on act3.upscale_open_source through the snapshot's run_flashvsr.py,
+the ACT3 port that replaces upstream's CUDA-only Block-Sparse-Attention with the same block mask in plain torch, so it
+runs on MPS and CUDA without a kernel build. Scale: the job's `factor`, else target width over the source's.
+`~/BGit/act3/ai_processing_server/code/internal/runners/oss_flashvsr.go` — `flashvsrCheck`, `flashvsrScale`, `flashvsrTask`
+
+Every model's install (macOS, Windows, Linux) is the BMS smart-contract child's recipes, run by `just build` in
+`~/BGit/all/app/code/film/servers`: `~/BGit/all/app/smartc/film/servers/bms/oss_video/common/setup.mjs`.
 
 SeedVR2 upscaling for act3.upscale_open_source (Mac Studio profile on Metal, RTX 5090 profile on CUDA) is
 implemented in code:
