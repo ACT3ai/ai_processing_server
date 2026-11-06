@@ -29,6 +29,16 @@ func TestUnitsPerOS(t *testing.T) {
 	if len(win) != 1 || win[0].Name != ServerName {
 		t.Fatalf("no broker → only the server: %+v", win)
 	}
+	for _, want := range []string{"<LogonTrigger>", "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", "<RestartOnFailure>",
+		"<Command>/r/ai_processing_server</Command>", "<Arguments>run</Arguments>", "<WorkingDirectory>/r</WorkingDirectory>",
+		"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"} {
+		if !strings.Contains(win[0].Body, want) {
+			t.Fatalf("task XML lacks %s:\n%s", want, win[0].Body)
+		}
+	}
+	if b := utf16LE("A<"); len(b) != 6 || b[0] != 0xFF || b[1] != 0xFE || b[2] != 'A' || b[3] != 0 || b[4] != '<' {
+		t.Fatalf("utf16LE: % x", b)
+	}
 	if _, err := Units("plan9", spec); err == nil {
 		t.Fatal("plan9 accepted")
 	}
