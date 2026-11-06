@@ -861,6 +861,7 @@ func cmdService(p paths, args []string) error {
 		return err
 	}
 	spec := service.Spec{Root: p.Root, Binary: filepath.Join(p.Root, filepath.Base(bin)), LogDir: filepath.Join(p.State, "logs")}
+	var nativeBroker []service.Unit
 	if ts.Queue.Enabled {
 		if nats, lerr := exec.LookPath("nats-server"); lerr == nil {
 			conf, cerr := brokerctl.WriteConfig(ts, p.Data)
@@ -871,10 +872,32 @@ func cmdService(p paths, args []string) error {
 		} else if sub == "install" {
 			fmt.Println("warning: nats-server is not on PATH (just broker-install): only the server is installed")
 		}
+		// The act3-nats container (just broker-docker) is this machine's broker and Docker restarts it; a native
+		// nats-server service beside it only crash-loops on port 4222.
+		if spec.NATSServer != "" && exec.Command("docker", "inspect", "act3-nats").Run() == nil {
+			all, uerr := service.Units(runtime.GOOS, spec)
+			if uerr != nil {
+				return uerr
+			}
+			for _, u := range all {
+				if u.Name == service.BrokerName {
+					nativeBroker = append(nativeBroker, u)
+				}
+			}
+			spec.NATSServer, spec.BrokerConf = "", ""
+		}
 	}
 	units, err := service.Units(runtime.GOOS, spec)
 	if err != nil {
 		return err
+	}
+	if sub == "install" && len(nativeBroker) > 0 {
+		if service.Installed(nativeBroker)[service.BrokerName] {
+			for _, d := range service.Uninstall(nativeBroker) {
+				fmt.Println(d)
+			}
+		}
+		fmt.Println("broker: the act3-nats container (restarts with Docker); no nats-server service")
 	}
 	switch sub {
 	case "print":
