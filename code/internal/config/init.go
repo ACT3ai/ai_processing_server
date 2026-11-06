@@ -73,9 +73,13 @@ func InitThisServer(o InitOptions) (InitResult, error) {
 			}
 		}
 		res.Verdict = fmt.Sprintf("this_server.yaml OK: %s, %d services on (left untouched)", ts.Server.Key, on)
-		if w := newerThanFile(o.Path, o.Catalog); len(w) > 0 {
-			res.Warnings = append(res.Warnings, w...)
-			res.Next = append(res.Next, "just reinit writes this_server.yaml.new and shows the diff; merge what you want by hand")
+		for _, w := range newerThanFile(o.Path, o.Catalog) {
+			res.Warnings = append(res.Warnings, w)
+			if strings.HasPrefix(w, "new service") {
+				res.Next = append(res.Next, "`just enable <id>` turns it on; `just disable <id>` lists it as off. Either ends this warning")
+			} else {
+				res.Next = append(res.Next, "`just reinit` writes this_server.yaml.new and shows the diff; merge what you want by hand")
+			}
 		}
 		return res, nil
 	}

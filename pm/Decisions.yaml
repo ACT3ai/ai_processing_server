@@ -300,3 +300,23 @@
     (BootID); code/internal/runners/oss.go (runDetached, validateVideo, failureKind); code/internal/runners/oss_segments.go
     (segmentedSteps); code/internal/snapshot/snapshot.go (Ensure, verify, Prune); code/internal/hardware/monitor.go
     (SampleLoad); data/queue/nats/standalone.conf.tmpl, worker.conf.tmpl.
+
+- id: D-027
+  title: "Render servers are NPL1-3, B5090, BPC, BMS and BMTR (a second Mac tower); the laptop BLAP is a dev machine like BMT; task types say which servers they may use"
+  status: decided
+  date: 2026-11-06
+  decision: >
+    The render servers are the three Nepal machines (NPL1-3), Bryan's RTX 5090 PC (B5090, reserved for Gen AI video
+    and other work that needs the 5090: no ffmpeg/CPU tasks, no NSFW scanner), Bryan's other PC (BPC, two GPUs, lots
+    of CPU and RAM: everything that is not Gen AI video), Bryan's Mac Studio (BMS: non-NVIDIA Gen AI video,
+    upscalers, big local models) and a second Mac tower, the Mac Tower render server (BMTR), which is a different and
+    older machine from Bryan's M2 Ultra dev tower (BMT). BMT and Bryan's MacBook Pro laptop (BLAP) are development
+    machines, never render servers: both presets carry dev: true. Which servers a task type may run on is data, one
+    YAML per task type (~/BGit/all/film/pm/subp/render_queue/render_task/task_types/), with one YAML per machine
+    beside it (servers/); the first CPU task type, the Post-Topaz finish (act3.upscale_finish), may run on BPC, BMTR
+    and NPL1-3 and is listed in services_off on B5090 and BMS.
+  why: "Bryan, 2026-11-06 (~/BGit/all/CLAUDE.md 'Render Servers'): the laptop is definitely not a render server; the 5090
+    and the Mac Studio are kept for the work that needs them; a 4K ffmpeg finish pegged the production EC2 box."
+  code: >
+    data/servers/known_servers.yaml (BLAP dev, BMTR, services_off on B5090 and BMS);
+    ~/BGit/all/film/pm/subp/render_queue/render_task/render_task.mdx §8, post_topaz_render_task.mdx §8.

@@ -70,7 +70,7 @@ func setupKey(p paths, ts *config.ThisServer) error {
 		targets = append(targets, filepath.Join(pub, keys.PublicFile))
 	}
 	var lines []string
-	quiet := !res.Created && pub != "" // the usual rebuild: same key, already published -> one line
+	quiet := !res.Created // the usual rebuild: same key, already published -> one line
 	for i, path := range targets {
 		msg, err := publish(path, k, ts.Server.Key)
 		if err != nil {
@@ -85,7 +85,11 @@ func setupKey(p paths, ts *config.ThisServer) error {
 		lines = append(lines, fmt.Sprintf("  public key %s: %s", rel(p, path), msg))
 	}
 	if quiet {
-		fmt.Printf("server identity key OK: %s, public key published (private key stays in %s)\n", k.Fingerprint(), filepath.Dir(k.Path))
+		where := "public key published"
+		if pub == "" {
+			where = "not enrolled yet (no servers/" + ts.Server.Key + "/; one-time code, pm/security.mdx §5.2)"
+		}
+		fmt.Printf("server identity key OK: %s, %s\n", k.Fingerprint(), where)
 		return nil
 	}
 	verb := "existing"

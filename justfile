@@ -19,17 +19,43 @@ default:
 
 # this_server.yaml is created once and never overwritten (pm/ai_processing_server.mdx §6.1).
 # Compile, install nats-server if missing, create this_server.yaml if missing, write the broker config
+# Every step's output is kept; the last lines say BUILD OK, BUILD OK with N warning(s) (repeated there), or BUILD FAILED.
 [unix]
 build:
-    @just _warn-tools
-    @echo "building {{bin}} {{version}} (git {{git_sha}}) with `go version | cut -d' ' -f3`"
-    @cd code && go build -trimpath -ldflags "{{ldflags}}" -o ../{{bin}} ./cmd/ai_processing_server
-    @echo "built ./{{bin}}"
-    -@git config core.hooksPath .githooks
-    @just _broker-ensure
-    @./{{bin}} init
-    @./{{bin}} broker config >/dev/null 2>&1 && echo "broker config: `./{{bin}} broker config`" || echo "broker config: skipped until this_server.yaml loads"
-    @just _service-ensure
+    #!/usr/bin/env bash
+    set -uo pipefail
+    out=$(mktemp); trap 'rm -f "$out"' EXIT
+    failed=()
+    # step NAME CMD...: run it, show and keep its output, remember a failure (later steps still run)
+    step() { local name=$1; shift; "$@" 2>&1 | tee -a "$out"; local rc=${PIPESTATUS[0]}; [ "$rc" -eq 0 ] || failed+=("$name (exit $rc)"); return "$rc"; }
+    step tools just _warn-tools
+    echo "building {{bin}} {{version}} (git {{git_sha}}) with $(go version 2>/dev/null | cut -d' ' -f3)"
+    if ! step compile bash -c 'cd code && go build -trimpath -ldflags "{{ldflags}}" -o ../{{bin}} ./cmd/ai_processing_server'; then
+      echo; echo "==== BUILD FAILED: the Go compile failed (above); ./{{bin}} was not updated"; exit 1
+    fi
+    echo "built ./{{bin}}"
+    git config core.hooksPath .githooks 2>/dev/null || true
+    step broker just _broker-ensure
+    step init ./{{bin}} init
+    if conf=$(./{{bin}} broker config 2>&1); then echo "broker config: $conf"
+    else echo "warning: broker config not written: $conf" | tee -a "$out"; fi
+    step service just _service-ensure
+    echo
+    # warnings and errors, each with the "next:" hints printed under it
+    problems=$(grep -E '^[[:space:]]*(warning|WARNING|error|ERROR|next)[: ]|NOT UPDATED' "$out" | sed -E 's/^[[:space:]]+//; s/^next:/  next:/')
+    count=$(echo "$problems" | grep -cvE '^(  next:|$)')
+    if [ ${#failed[@]} -gt 0 ]; then
+      echo "==== BUILD FAILED in: ${failed[*]}"
+      [ -n "$problems" ] && echo "$problems" | sed 's/^/  /'
+      echo "./{{bin}} was compiled, but this machine is not ready: fix the above, then just build again"
+      exit 1
+    fi
+    if [ "$count" -gt 0 ]; then
+      echo "==== BUILD OK with $count warning(s); the server runs, but look at:"
+      echo "$problems" | sed 's/^/  /'
+    else
+      echo "==== BUILD OK: no warnings. Start it with just run"
+    fi
 
 # Compile, install nats-server if missing, create this_server.yaml if missing, write the broker config
 [windows]
@@ -41,8 +67,9 @@ build:
     -@git config core.hooksPath .githooks
     @just _broker-ensure
     @./{{bin}} init
-    @$c = ./{{bin}} broker config 2>$null; if ($LASTEXITCODE -eq 0) { Write-Output "broker config: $c" } else { Write-Output "broker config: skipped until this_server.yaml loads" }
+    @$c = ./{{bin}} broker config 2>&1; if ($LASTEXITCODE -eq 0) { Write-Output "broker config: $c" } else { Write-Output "warning: broker config not written: $c" }
     @just _service-ensure
+    @Write-Output ""; Write-Output "==== BUILD OK (any warning: lines above still need a look)"
 
 # Start the server in the background and print where its API and logs are
 [unix]
@@ -194,7 +221,7 @@ broker-install:
 _broker-ensure:
     #!/usr/bin/env bash
     if docker inspect act3-nats >/dev/null 2>&1; then just broker-docker; exit 0; fi
-    if command -v nats-server >/dev/null; then echo "nats-server present: $(nats-server --version)"; exit 0; fi
+    if command -v nats-server >/dev/null; then echo "broker: nats-server $(nats-server --version | sed 's/^nats-server: //') installed"; exit 0; fi
     if (exec 3<>/dev/tcp/127.0.0.1/4222) 2>/dev/null; then echo "nats: port 4222 already answers: keeping it"; exit 0; fi
     if command -v docker >/dev/null && docker info >/dev/null 2>&1 && just broker-docker; then exit 0; fi
     if just broker-install; then exit 0; fi
@@ -256,7 +283,7 @@ _service-ensure:
     #!/usr/bin/env bash
     if [ -n "${APS_NO_SERVICE:-}" ]; then echo "service: skipped (APS_NO_SERVICE set)"; exit 0; fi
     if [ "$(uname)" != "Darwin" ]; then echo "service: not automated on $(uname) yet (systemd unit: pm/TO_DO.md)"; exit 0; fi
-    ./{{bin}} service install || echo "service: not installed (see above; a dev machine refuses by design, D-024); the server still runs with just run"
+    ./{{bin}} service ensure || { echo "warning: service: the OS services were not installed (error above); the server still runs with just run"; }
 
 [windows]
 _service-ensure:

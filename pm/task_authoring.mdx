@@ -73,7 +73,9 @@ the params schema, and the caller code that submits it and reads its result.
 | `B5090` | Bryan's RTX 5090 PC (32 GB VRAM, CUDA) | `bryan_office` | Windows | video upscale, Wan video, image gen: the main GPU box |
 | `BMS` | Bryan's Mac Studio (Apple GPU, large unified memory) | `bryan_office` | macOS | Metal-capable work, transcription, CPU work; shared with OpenClaw (parent spec §15.3 `bms` profile) |
 | `NPL1`, `NPL2`, `NPL3` (decided, D-020) | the three Nepal machines | `nepal_office` | to be detected | GPU and CPU work; behind NAT, outbound connections only |
-| `BPC`, `BLAP` | Bryan's two-GPU PC, laptop | `bryan_office` | Windows / macOS | also in the fleet per bryan_servers.mdx; not named in this dictation |
+| `BPC` | Bryan's two-GPU PC (not the 5090) | `bryan_office` | Windows | render server: everything that is not Gen AI video (D-027) |
+| `BMTR` | Bryan's Mac Tower render server (an older tower, not BMT) | `bryan_office` | macOS | render server: CPU work such as the Post-Topaz finish (D-027); hardware to be detected |
+| ~~`BLAP`~~ | Bryan's MacBook Pro laptop | `bryan_office` | macOS | **not a render server**: dev machine, `dev: true` (D-027) |
 | ~~`BMT`~~ | Bryan's Mac Tower (Mac Pro 2024) | `bryan_office` | macOS | **not a render server**: Bryan's dev machine for development and debugging (D-024). Preset `dev: true`: only local jobs, never a worker, never an OS service |
 
 Every one of them:

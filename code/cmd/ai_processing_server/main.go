@@ -171,7 +171,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage: ai_processing_server <command> [flags]
 commands: init [--write-new] · keys [init|show] · run · detect · validate · status · jobs [state] · drain · resume · stop [--force]
           queue ls · queue show <id> [--lines N] · cancel [--prefix P] [--no-wait] <id>...
-          broker status|config · enable|disable <service-id|queue>... · service install|uninstall|status|print · version
+          broker status|config · enable|disable <service-id|queue>... · service install|ensure|uninstall|status|print · version
 flags: --root --state-dir --config --log-dir --error-dir --listen --json (flags go before ids)
 `)
 }
@@ -366,6 +366,9 @@ func cmdInit(p paths) error {
 	}
 	if res.Created {
 		fmt.Println("  check server.key, the services list and limits, then `just run`")
+	}
+	if len(res.Errors) > 0 { // the server refuses to start on this file: say so with the exit code, not only in text
+		return fmt.Errorf("%s has %d error(s) (listed above); fix them, then `just validate`", p.Config, len(res.Errors))
 	}
 	return nil
 }
@@ -882,6 +885,14 @@ func cmdService(p paths, args []string) error {
 			fmt.Printf("==== %s %s\n%s\n", u.Name, u.Path, u.Body)
 		}
 		return nil
+	case "ensure": // `just build`: install on a render server; on a dev machine say so in one line and succeed
+		if ts.Server.Dev && !p.Force {
+			fmt.Printf("service: not installed: %s is a dev machine (server.dev: true, D-024); use `just run` here\n", ts.Server.Key)
+			return nil
+		}
+		sub = "install"
+	}
+	switch sub {
 	case "install":
 		if ts.Server.Dev && !p.Force {
 			return fmt.Errorf("%s is a dev machine (server.dev: true), not a render server: it is not installed as a service. Use `just run` to debug here (--force overrides)", ts.Server.Key)
@@ -911,7 +922,7 @@ func cmdService(p paths, args []string) error {
 		}
 		return nil
 	}
-	return errors.New("usage: ai_processing_server service install|uninstall|status|print [--force]")
+	return errors.New("usage: ai_processing_server service install|ensure|uninstall|status|print [--force]")
 }
 
 func errString(err error) string {

@@ -101,19 +101,18 @@ func setService(text string, def ServiceDef, on bool) (string, string, error) {
 		lines = append(lines[:i+1], append([]string{fmt.Sprintf("%senabled: %t", ind, on)}, lines[i+1:]...)...)
 		return strings.Join(lines, "\n"), fmt.Sprintf("%s: enabled: %t (line added)", def.ID, on), nil
 	}
-	if !on {
-		return text, def.ID + " is not listed, which already means off", nil
-	}
+	// Not listed yet. Off is already the effect, but listing it records the owner's choice and ends the
+	// "new service(s) not listed" warning from init.
 	head := lines[s]
 	if strings.TrimSpace(strings.SplitN(head, "#", 2)[0]) == "services: []" {
 		head = "services:"
 	}
-	add := []string{head, "  - id: " + def.ID, "    enabled: true"}
+	add := []string{head, "  - id: " + def.ID, fmt.Sprintf("    enabled: %t", on)}
 	if def.Title != "" {
 		add = append(add, "    # "+def.Title)
 	}
 	lines = append(lines[:s], append(add, lines[s+1:]...)...)
-	return strings.Join(lines, "\n"), def.ID + ": added to services, enabled: true", nil
+	return strings.Join(lines, "\n"), fmt.Sprintf("%s: added to services, enabled: %t", def.ID, on), nil
 }
 
 func setQueue(text, template string, on bool) (string, string, error) {

@@ -5,14 +5,17 @@
 # share on the GPU render boxes, idle_only on dedicated office and cloud machines.
 schema_version: 1
 servers:
+  # Bryan's MacBook Pro laptop is NOT a render server (Bryan, 2026-11-06, ~/BGit/all/CLAUDE.md "Render Servers"; D-027).
+  # Like BMT it is a development machine: dev: true, so it never pulls platform jobs and never becomes a worker.
   - key: BLAP
-    display_name: "Bryan Laptop"
+    display_name: "Bryan Laptop (dev machine)"
     servers_dir: Bryan_Laptop
     match: { hostname: ["Bry-MacBook-Pro-2025b", "Bry-MacBook-Pro-2025b.local"] }   # detected 2026-10-27
     profile: generic
     family: bryan
     site: bryan_office
     local_mode: first
+    dev: true
   - key: B5090
     display_name: "Bryan 5090"
     servers_dir: Bryan_5090
@@ -21,6 +24,8 @@ servers:
     family: bryan
     site: bryan_office
     local_mode: share
+    # Reserved for Gen AI video and work that needs the 5090 (Bryan, 2026-11-06): CPU/ffmpeg tasks never run here.
+    services_off: [act3.upscale_finish, act3.transcode, act3.video_merge]
   - key: BPC
     display_name: "Bryan PC"
     match: { hostname: ["BRYAN-PC"], gpu_count_min: 2 }          # guess
@@ -28,7 +33,9 @@ servers:
     family: bryan
     site: bryan_office
     local_mode: share
-  # Bryan's Mac Tower (Mac Pro 2024) is his DEVELOPMENT machine, not a render server (Bryan, 2026-10-28). The server
+  # Bryan's Mac Tower is his DEVELOPMENT machine, not a render server (Bryan, 2026-10-28; 2026-11-06). Detected hardware:
+  # Mac Pro (2023), Apple M2 Ultra 24-core CPU (16P + 8E), 60-core GPU, 192 GB, ComputerName "Bryan's Mac Pro 2024".
+  # It is NOT the Mac Tower render server (BMTR below), which is a different, older tower. The server
   # runs there only for debugging: dev: true makes init write act3/wtc off, and the server never pulls platform jobs,
   # never joins the fleet as a worker and never installs itself as an OS service there.
   - key: BMT
@@ -39,6 +46,18 @@ servers:
     site: bryan_office
     local_mode: first
     dev: true
+  # Bryan's Mac Tower RENDER SERVER (Bryan, 2026-11-06, ~/BGit/all/CLAUDE.md "Render Servers"; D-027): a second Mac tower,
+  # older than his M2 Ultra dev tower and with different specs. Hardware not detected yet: run `init` on it and fix the
+  # hostname here by pull request (the placeholders below match nothing real). It takes CPU work such as the Post-Topaz
+  # finish (act3.upscale_finish); allowed task types: ~/BGit/all/film/pm/subp/render_queue/render_task/task_types/.
+  - key: BMTR
+    display_name: "Bryan Mac Tower (render server)"
+    match: { hostname: ["BMTR", "Bryan-Mac-Tower-Render"] }      # placeholder until init runs there
+    profile: generic
+    family: bryan
+    site: bryan_office
+    local_mode: share
+    services_on: [act3.upscale_finish]
   - key: BMS
     display_name: "Bryan Mac Studio"
     servers_dir: Bryan_Mac_Studio
@@ -51,6 +70,8 @@ servers:
     # services on; on any other machine they stay off until the owner installs the weights and runs `just enable`.
     # The bms profile yields to OpenClaw when it is busy.
     services_on: [act3.video_gen_open_source, act3.upscale_open_source]
+    # Reserved for OpenClaw, non-NVIDIA Gen AI video, upscalers and big local models (Bryan, 2026-11-06): no CPU finish here.
+    services_off: [act3.upscale_finish]
   # The three Nepal office machines (task_authoring.mdx §2, §10 Q1, D-020). Hostnames are placeholders until `init`
   # runs on each; the hardware is detected there, never guessed here. Customer data is allowed for site nepal_office
   # once the machine's disk encryption and server key are verified at enrollment (security.mdx, D-020).

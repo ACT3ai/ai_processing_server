@@ -169,7 +169,7 @@ Still planned under `data/`: `models/`, `sites/sites.yaml` and `schemas/`.
 | Machine | File | Data | Role and notes |
 | --- | --- | --- | --- |
 | Bryan's RTX 5090 PC | [servers/Bryan_5090/server.yaml](servers/Bryan_5090/server.yaml) | guessed | The only CUDA node (32 GB GDDR7). It is the main node for local image and video generation. One heavy GPU job at a time. |
-| Bryan's MacBook Pro (M4 Max, 128 GB) | [servers/Bryan_Laptop/server.yaml](servers/Bryan_Laptop/server.yaml) | detected | Development workstation. Long jobs only on AC power. Low parallelism. |
+| Bryan's MacBook Pro (M4 Max, 128 GB) | [servers/Bryan_Laptop/server.yaml](servers/Bryan_Laptop/server.yaml) | detected | Development workstation, **not a render server** (`dev: true`, D-027). |
 | Bryan's Mac Studio ("CLAW") | [servers/Bryan_Mac_Studio/server.yaml](servers/Bryan_Mac_Studio/server.yaml) | guessed | Always on. Shares the machine with OpenClaw agents and voice-memo transcription. |
 
 Values marked `guess` must be replaced by running hardware detection on each machine. The spec also names `BPC`
