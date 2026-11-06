@@ -872,7 +872,7 @@ func cmdService(p paths, args []string) error {
 				return cerr
 			}
 			spec.NATSServer, spec.BrokerConf = nats, conf
-		} else if sub == "install" {
+		} else if sub == "install" || (sub == "ensure" && !ts.Server.Dev) {
 			fmt.Println("warning: nats-server is not on PATH (just broker-install): only the server is installed")
 		}
 	}
