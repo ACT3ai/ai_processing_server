@@ -51,8 +51,9 @@ func FakeModels() bool {
 	return v == "on" || v == "1" || v == "true"
 }
 
-// MaxTaskSeconds caps a task host when the job has no timeout of its own.
-const MaxTaskSeconds = 12 * 3600
+// MaxTaskSeconds caps a task host's timeout. 24 h, the upscale engine's ceiling: a 30 s 4K 7B upscale on the Mac
+// Studio takes ~13 h.
+const MaxTaskSeconds = 24 * 3600
 
 func stateDir(env Env) string {
 	if StateDir != "" {

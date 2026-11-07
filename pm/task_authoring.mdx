@@ -175,8 +175,8 @@ the gate (§8); **should** rules are checked in review.
     whole, so its size is a fair checkpoint.
   * SeedVR2 does this today. A source longer than 1.5 segments is cut, upscaled segment by segment, then joined.
     A segment is `params.segment_seconds` (default 30 s; 0 turns it off) rounded to whole SeedVR2 batches, so the model
-    sees the same frame groups it would see uncut. The default shrinks for outputs above 1080p, so a segment never holds
-    more output pixels than 30 s of 1080p (7.5 s at 4K): each segment is assembled in RAM, and a 30 s clip upscaled to
+    sees the same frame groups it would see uncut. The default shrinks for outputs above 1080p, so a segment gets the
+    output-pixel budget of 30 s at 1080p (7.5 s at 4K): each segment is assembled in RAM, and a 30 s clip upscaled to
     4K as one segment ran the 5090 out of memory (2026-11-07). Wan stays one step, because a diffusion pass cannot be split.
   * When a task host dies, resume from its checkpoints on the same snapshot, else start over. Implemented in:
     `~/BGit/act3/ai_processing_server/code/internal/runners/oss.go` — `resume`; `~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `Checkpoints`, `Relaunch`

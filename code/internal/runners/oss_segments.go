@@ -29,8 +29,8 @@ import (
 // overrides. Larger outputs get proportionally shorter segments (segmentSeconds).
 const DefaultSegmentSeconds = 30
 
-// segmentPixels: a segment holds at most as many output pixels as DefaultSegmentSeconds of 1080p. The whole segment
-// is assembled in RAM: a 30 s clip upscaled to 4K as one segment ran the 5090 out of memory (2026-11-07).
+// segmentPixels: a segment gets the output-pixel budget of DefaultSegmentSeconds at 1080p. The whole segment is
+// assembled in RAM: a 30 s clip upscaled to 4K as one segment ran the 5090 out of memory (2026-11-07).
 const segmentPixels = 1920 * 1080
 
 // videoFrames is what segmenting needs from the source.
