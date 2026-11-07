@@ -1492,7 +1492,7 @@ service yet), `just broker-config` (writes `~/.act3_processing/nats/<role>.conf`
 is an OS service), `just broker-status` (`ai_processing_server broker status [--json]`). The local API adds
 `POST /v1/queue/jobs`, `GET /v1/queue/jobs` (what the WORK stream holds, with each job's `job_state`, cancel flag and
 whether this server holds it), `GET /v1/queue/jobs/{id}` (also returns `control`), `POST /v1/queue/jobs/{id}/cancel`
-and `GET /v1/broker`. The other recipes in the table are not built.
+and `GET /v1/broker`. `just update` and `just restart` are built (2026-11-06: stop leaves queued jobs to their task hosts, run re-adopts them). The other recipes in the table are not built.
 
 **Debugging from the shell (2026-10-28):** `ai_processing_server queue ls` (`just queue`) lists waiting and claimed
 jobs; `queue show <id> [--lines N]` prints one job's queue state, cancel flag, event timeline, local record, files and

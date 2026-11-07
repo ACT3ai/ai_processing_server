@@ -131,6 +131,31 @@ stop mode="": _binary
 stop mode="": _binary
     @./{{bin}} stop {{ if mode == "force" { "--force" } else { "" } }}
 
+# Pull (fast-forward only), build, restart the controller; running renders finish on the code they started with (§9.5)
+[unix]
+update:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    git fetch origin "$branch"
+    git merge --ff-only "origin/$branch" || { echo "update refused: $branch cannot fast-forward to origin/$branch (local commits or edits); fix it by hand, never reset"; exit 1; }
+    # a new just process, so the build stamps the pulled commit (git_sha is read when a justfile loads)
+    just build
+    just restart
+
+[windows]
+update:
+    git pull --ff-only
+    @# a running .exe can be renamed but not overwritten: move it aside so the build never fails on it
+    @if (Test-Path ./{{bin}}) { Move-Item -Force ./{{bin}} ./{{bin}}.old }
+    @just build; if ($LASTEXITCODE -ne 0) { if (-not (Test-Path ./{{bin}})) { Move-Item -Force ./{{bin}}.old ./{{bin}} }; exit 1 }
+    just restart
+
+# Restart the controller only: queued jobs in task hosts keep rendering and the new controller re-adopts them (§9.4)
+restart:
+    just stop
+    just run
+
 # Health, services and running jobs of the server on this machine
 status: _binary
     @./{{bin}} status
