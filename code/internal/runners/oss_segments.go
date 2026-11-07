@@ -24,9 +24,14 @@ import (
 // the uncut video and the joins add no seam of their own. The cut is frame-accurate (input seek, re-encode at
 // near-lossless CRF); the join is a stream copy.
 
-// DefaultSegmentSeconds: about this much source video per checkpoint. A segment re-loads the model (tens of
-// seconds), so segments are kept to several minutes of render work each. $APS_UPSCALE_SEGMENT_SECONDS overrides.
+// DefaultSegmentSeconds: about this much source video per checkpoint at a 1080p output. A segment re-loads the model
+// (tens of seconds), so segments are kept to several minutes of render work each. $APS_UPSCALE_SEGMENT_SECONDS
+// overrides. Larger outputs get proportionally shorter segments (segmentSeconds).
 const DefaultSegmentSeconds = 30
+
+// segmentPixels: a segment holds at most as many output pixels as DefaultSegmentSeconds of 1080p. The whole segment
+// is assembled in RAM: a 30 s clip upscaled to 4K as one segment ran the 5090 out of memory (2026-11-07).
+const segmentPixels = 1920 * 1080
 
 // videoFrames is what segmenting needs from the source.
 type videoFrames struct {
@@ -92,16 +97,20 @@ func ratio(s string) float64 {
 	return x / y
 }
 
-// segmentSeconds is the job's segment_seconds, else $APS_UPSCALE_SEGMENT_SECONDS, else the default. <= 0 turns
-// segmenting off.
-func segmentSeconds(param *float64) float64 {
+// segmentSeconds is the job's segment_seconds, else $APS_UPSCALE_SEGMENT_SECONDS, else the default; the last two are
+// scaled down for an output (width x height) above 1080p. <= 0 turns segmenting off.
+func segmentSeconds(param *float64, width, height int) float64 {
 	if param != nil {
 		return *param
 	}
+	sec := float64(DefaultSegmentSeconds)
 	if v, err := strconv.ParseFloat(os.Getenv("APS_UPSCALE_SEGMENT_SECONDS"), 64); err == nil {
-		return v
+		sec = v
 	}
-	return DefaultSegmentSeconds
+	if px := float64(width) * float64(height); px > segmentPixels {
+		sec *= segmentPixels / px
+	}
+	return sec
 }
 
 // planSegments splits frames into [start, end) ranges of segFrames (rounded up to whole batches). A tail shorter

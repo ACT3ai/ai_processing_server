@@ -105,7 +105,8 @@ func (OSSUpscale) Check(_ context.Context, job *jobs.Job, env Env) error {
 	if float64(p.Width)*float64(p.Height) > 8.3e6+1 {
 		return jobs.Errf(jobs.KindInvalidInput, "SeedVR2 outputs at most 8.3 megapixels (4K UHD)")
 	}
-	if accelerator() == "mps" && p.DurationSeconds > 30 {
+	// +0.5 s: a "30 s" clip measures 30.04 s (721 frames at 24 fps)
+	if accelerator() == "mps" && p.DurationSeconds > 30.5 {
 		return jobs.Errf(jobs.KindInvalidInput, "SeedVR2 on this Mac takes clips up to 30 s")
 	}
 	if !hasInput(job, "source_video") {
@@ -145,7 +146,7 @@ func (OSSUpscale) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter)
 			one = func(in, o string) detachedTask { t, _ := fakeTask(snap, o, in, "", p.Width, p.Height); return t }
 		}
 		ff, fp := enginePath(env, "ffmpeg"), enginePath(env, "ffprobe")
-		steps, frames, err := segmentedSteps(ff, fp, src, out, segmentSeconds(p.SegmentSeconds), seedvr2Batch(p, accel), one)
+		steps, frames, err := segmentedSteps(ff, fp, src, out, segmentSeconds(p.SegmentSeconds, p.Width, p.Height), seedvr2Batch(p, accel), one)
 		if err != nil {
 			rep.Log("not segmenting this upscale (" + err.Error() + "); it runs as one step")
 		}

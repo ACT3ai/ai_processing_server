@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -324,6 +325,29 @@ func TestPlanSegments(t *testing.T) {
 		if got := planSegments(c.frames, c.seg, c.batch); !slices.Equal(flat(got), flat(c.want)) {
 			t.Errorf("planSegments(%d, %d, %d) = %v, want %v", c.frames, c.seg, c.batch, got, c.want)
 		}
+	}
+}
+
+func TestSegmentSeconds(t *testing.T) {
+	t.Setenv("APS_UPSCALE_SEGMENT_SECONDS", "")
+	ten := 10.0
+	for _, c := range []struct {
+		param *float64
+		w, h  int
+		want  float64
+	}{
+		{nil, 1920, 1080, 30},
+		{nil, 1280, 720, 30},
+		{nil, 3840, 2160, 7.5}, // a 4K segment holds as many pixels as 30 s of 1080p
+		{&ten, 3840, 2160, 10}, // the job's own segment_seconds is used as given
+	} {
+		if got := segmentSeconds(c.param, c.w, c.h); math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("segmentSeconds(%v, %d, %d) = %v, want %v", c.param, c.w, c.h, got, c.want)
+		}
+	}
+	t.Setenv("APS_UPSCALE_SEGMENT_SECONDS", "60")
+	if got := segmentSeconds(nil, 3840, 2160); got != 15 {
+		t.Errorf("$APS_UPSCALE_SEGMENT_SECONDS=60 at 4K = %v, want 15", got)
 	}
 }
 
