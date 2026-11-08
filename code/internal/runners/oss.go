@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
@@ -81,6 +80,9 @@ func runDirFor(env Env, jobID string) string {
 	return filepath.Join(stateDir(env), "runs", safeID(jobID))
 }
 
+// RunDirName is the run directory's name for a job id (runs/<RunDirName>), for the scheduler's sweep and cancel.
+func RunDirName(id string) string { return safeID(id) }
+
 func safeID(id string) string {
 	return regexp.MustCompile(`[^A-Za-z0-9._-]`).ReplaceAllString(id, "_")
 }
@@ -94,6 +96,7 @@ type detachedTask struct {
 	Steps        []taskhost.Step  // instead of Argv: checkpointed steps, the last one writes Output (R8)
 	ExpectFrames int              // the output must have about this many frames (0: any number above zero)
 	Phases       []taskhost.Phase // one process's counted passes, weighted into one bar (SeedVR2)
+	Cancel       CancelProfile    // how this render type is stopped (cancel.go, pm/cancel.mdx §8)
 }
 
 // buildFunc builds the task. snap is the frozen code; inputs maps input name → its copy inside the run directory;
@@ -199,14 +202,17 @@ func runDetached(ctx context.Context, job *jobs.Job, env Env, rep Reporter, outN
 			rep.Log("controller stopping: the task host keeps rendering and the next controller re-attaches")
 			return nil, cause
 		}
-		elog.Check("cancelling a task host", taskhost.Cancel(dir), "job_id", job.ID)
-		wctx, done := context.WithTimeout(context.Background(), 30*time.Second)
-		if _, werr := taskhost.Watch(wctx, dir, nil); werr != nil && !errors.Is(werr, taskhost.ErrDead) {
-			elog.Warn("waiting for a cancelled task host to stop", werr, "job_id", job.ID, "dir", dir)
-		}
-		done()
-		elog.Ignore("removing a cancelled run directory", os.RemoveAll(dir), "job_id", job.ID) // R9: nothing is uploaded; R10: scratch removed
+		// CANCEL MODE (cancel.go): returns only once the tree is verified gone, the GPU released and the run
+		// directory removed (R9: nothing is uploaded; R10: scratch removed). The slot stays held until then.
+		stopTask(dir, rep)
 		return nil, cause
+	}
+	if x.Cancelled {
+		// stopped by a cancel file this controller did not write (the CLI, a previous controller): verify and clean
+		if r := stopFromExit(dir, x, rep); !r.RunDirKept {
+			elog.Ignore("removing a cancelled run directory", os.RemoveAll(dir), "job_id", job.ID)
+		}
+		return nil, jobs.Errf(jobs.KindCancelled, "cancelled")
 	}
 
 	t, err := taskhost.ReadTask(dir)
@@ -216,9 +222,6 @@ func runDetached(ctx context.Context, job *jobs.Job, env Env, rep Reporter, outN
 	}
 	if x.Code != 0 || x.OutputBytes == 0 {
 		elog.Ignore("removing a failed run directory", os.RemoveAll(dir), "job_id", job.ID) // a retry starts clean
-		if x.Cancelled {
-			return nil, jobs.Errf(jobs.KindCancelled, "cancelled")
-		}
 		if x.TimedOut {
 			return nil, jobs.Errf(jobs.KindTimeout, "%s", x.Error)
 		}
@@ -315,6 +318,9 @@ func launch(job *jobs.Job, env Env, rep Reporter, dir string, build buildFunc) e
 	}
 	task := taskhost.Task{JobID: job.ID, Snapshot: snap.Key, Argv: t.Argv, Dir: t.Dir, Env: t.Env, Output: t.Output, Phases: t.Phases,
 		GPU: env.Slot.GPU, TimeoutSeconds: timeout, Steps: t.Steps, ExpectFrames: t.ExpectFrames, MinFreeRAMGB: env.MinFreeRAMGB}
+	if t.Cancel.Name != "" {
+		task.Cancel = t.Cancel.spec()
+	}
 	if err := os.MkdirAll(filepath.Dir(t.Output), 0o700); err != nil {
 		return jobs.Wrap(jobs.KindInfra, err, "create the output dir")
 	}
@@ -482,5 +488,5 @@ func fakeTask(snap snapshot.Snapshot, out, input, prompt string, w, h int) (deta
 	if input != "" {
 		argv = append(argv, "--input", input)
 	}
-	return detachedTask{Argv: argv, Output: out}, nil
+	return detachedTask{Argv: argv, Output: out, Cancel: ProfileFake}, nil
 }

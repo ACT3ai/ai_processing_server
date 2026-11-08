@@ -182,7 +182,8 @@ the gate (§8); **should** rules are checked in review.
     `~/BGit/act3/ai_processing_server/code/internal/runners/oss.go` — `resume`; `~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `Checkpoints`, `Relaunch`
   * Cutting an upscale into checkpointed segments. Implemented in:
     `~/BGit/act3/ai_processing_server/code/internal/runners/oss_segments.go` — `segmentedSteps`, `planSegments`
-* **R9. Honor cancel. (must)** Check for `runs/<job_id>/cancel` at every checkpoint and at least every 30 s; on cancel,
+* **R9. Honor cancel. (must)** Full contract (environment `ACT3_CANCEL_FILE` / `ACT3_SCRATCH_DIR`, watcher, exit 130,
+  per-type grace): [cancel.mdx](./cancel.mdx) §4.2, §8. Check for `runs/<job_id>/cancel` at every checkpoint and at least every 30 s; on cancel,
   stop, upload nothing, exit with the cancelled code. Child processes (ffmpeg, Python, ComfyUI client) must be in the
   task host's process group so they die with it.
 * **R10. Clean up what it made. (must)** Scratch files under `runs/<job_id>/work/` only, never elsewhere on disk;

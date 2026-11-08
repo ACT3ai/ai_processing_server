@@ -1,6 +1,7 @@
 package procs
 
 import (
+	"os"
 	"os/exec"
 	"strconv"
 	"syscall"
@@ -36,4 +37,24 @@ func taskkill(args ...string) {
 	c := exec.Command("taskkill", args...)
 	c.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow, HideWindow: true}
 	_ = c.Run()
+}
+
+// groupAlive: Windows has no process groups to signal; the tree's root process existing is the test (taskkill /T
+// /F ends the tree by parentage, so a dead root with live children is rare and is caught by the GPU check).
+func groupAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	p, err := os.FindProcess(pid) // opens a handle: fails when no such process exists
+	if err != nil {
+		return false
+	}
+	_ = p.Release()
+	return true
+}
+
+func killGroupID(pid int) {
+	if pid > 0 {
+		taskkill("/T", "/F", "/PID", strconv.Itoa(pid))
+	}
 }

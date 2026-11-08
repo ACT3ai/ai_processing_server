@@ -27,6 +27,15 @@ var GraceBeforeKill = 10 * time.Second
 // ErrKillNow as a context cause skips that grace: the tree is killed at once (the machine is running out of memory).
 var ErrKillNow = errors.New("killed at once")
 
+// ErrForcedKill is wrapped into Run's error when a stopped process did not exit within its grace period and the
+// whole tree was killed (pm/cancel.mdx §5.2: the stop report says "forced", not "graceful").
+var ErrForcedKill = errors.New("did not stop within its grace period; the process tree was killed")
+
+// PipeDrainWait bounds how long Run waits, after killing the tree, for the output pipes to close. A grandchild that
+// left the process group (setsid, a daemonising server) can hold them open forever; Run must still return so the
+// controller can verify, escalate and report (pm/cancel.mdx §5.4).
+var PipeDrainWait = 10 * time.Second
+
 // Spec is one command to run.
 type Spec struct {
 	Name     string
@@ -37,6 +46,13 @@ type Spec struct {
 	Stdout   func(line string)
 	Stderr   func(line string)
 	StdinNil bool
+	// Grace is how long the tree gets after the interrupt before it is killed; 0 means GraceBeforeKill. Each render
+	// type sets its own (runners/cancel.go CancelProfile): ffmpeg stops in a second, a private ComfyUI needs longer.
+	Grace time.Duration
+	// OnStart is called once the process has started, with its pid. On Unix the pid is also its process group id
+	// (Setpgid), so the task host records it in procs.json and the controller can kill the group if the task host
+	// itself is wedged (pm/cancel.mdx §5.3).
+	OnStart func(pid int)
 }
 
 // Run starts the command and waits. Cancelling ctx stops the process tree; the returned error then wraps ctx.Err().
@@ -76,6 +92,9 @@ func Run(ctx context.Context, s Spec) error {
 		return fmt.Errorf("start %s: %w", s.Name, err)
 	}
 	lowerPriority(cmd)
+	if s.OnStart != nil && cmd.Process != nil {
+		s.OnStart(cmd.Process.Pid)
+	}
 	wg.Add(2)
 	go pipe(stdout, s.Stdout)
 	go pipe(stderr, s.Stderr)
@@ -89,19 +108,42 @@ func Run(ctx context.Context, s Spec) error {
 	case <-ctx.Done():
 		if errors.Is(context.Cause(ctx), ErrKillNow) {
 			killGroup(cmd)
-			<-done
+			waitDrained(done, s.Name)
 			return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
+		}
+		grace := s.Grace
+		if grace <= 0 {
+			grace = GraceBeforeKill
 		}
 		interruptGroup(cmd)
 		select {
 		case <-done:
-		case <-time.After(GraceBeforeKill):
+			return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
+		case <-time.After(grace):
 			killGroup(cmd)
-			<-done
+			waitDrained(done, s.Name)
+			return fmt.Errorf("%s stopped: %w: %w", s.Name, ErrForcedKill, context.Cause(ctx))
 		}
-		return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
 	}
 }
+
+// waitDrained waits for the process to be reaped and its pipes to close, at most PipeDrainWait.
+func waitDrained(done <-chan error, name string) {
+	select {
+	case <-done:
+	case <-time.After(PipeDrainWait):
+		elog.Warn("a killed process tree still holds its output pipes open (a child left the process group); "+
+			"returning without them", errors.New(name), "process", name)
+	}
+}
+
+// GroupAlive reports whether any process of the process group pgid still exists (Unix), or the process pid
+// (Windows, where taskkill /T ends the tree by parentage). The controller uses it to VERIFY a stop.
+func GroupAlive(pgid int) bool { return groupAlive(pgid) }
+
+// KillGroup kills the process group pgid (Unix) or the process tree rooted at pgid (Windows) at once. It is the
+// controller's escalation when a task host did not stop its own tree (pm/cancel.mdx §5.3).
+func KillGroup(pgid int) { killGroupID(pgid) }
 
 // cleanEnv passes only PATH, HOME, locale and temp variables, the GPU pin, and the spec's extras.
 // Platform tokens never reach child processes.

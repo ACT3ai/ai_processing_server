@@ -89,6 +89,34 @@ def write_mp4(frames, path, fps):
     return n
 
 
+# ── ACT3 cancel mode (~/BGit/act3/ai_processing_server/pm/cancel.mdx §4.2) ───────────────────────────────────────────
+# The render server's task host writes $ACT3_CANCEL_FILE when the job is cancelled. On Unix it also sends SIGINT, but on
+# Windows a detached process cannot be sent a Ctrl-C, so the script watches the file itself: it prints
+# "ACT3_STAGE cancelled" and raises KeyboardInterrupt in the main thread, which unwinds the finally blocks (free CUDA
+# memory, stop a child server, close an ffmpeg pipe) inside the render type's grace. The task host kills the process
+# tree when the grace runs out, and the controller removes the run directory with everything this script wrote.
+ACT3_CANCEL_FILE = os.environ.get("ACT3_CANCEL_FILE", "")
+
+
+def act3_cancelled():
+    return bool(ACT3_CANCEL_FILE) and os.path.exists(ACT3_CANCEL_FILE)
+
+
+def act3_watch_cancel(poll=1.0):
+    if not ACT3_CANCEL_FILE:
+        return
+    import _thread
+    import threading
+
+    def watch():
+        while not act3_cancelled():
+            time.sleep(poll)
+        print("ACT3_STAGE cancelled", flush=True)
+        _thread.interrupt_main()
+
+    threading.Thread(target=watch, name="act3-cancel", daemon=True).start()
+
+
 def stage(name):
     print(f"ACT3_STAGE {name}", flush=True)
 
@@ -251,6 +279,8 @@ print(f"loaded {'i2v' if i2v else 't2v'} in {time.time() - t0:.0f} s, {steps} st
 
 def on_step(_pipe, i, _t, kwargs):
     print(f"ACT3_PROGRESS {100.0 * (i + 1) / steps:.1f}", flush=True)
+    if act3_cancelled():  # stop between diffusion steps, never mid-kernel
+        raise KeyboardInterrupt("cancelled")
     return kwargs
 
 
@@ -270,6 +300,7 @@ def render():
     ).frames[0]
 
 
+act3_watch_cancel()
 stage("rendering")
 extra = {"image": first_frame(x.image, x.width, x.height)} if i2v else {}
 try:

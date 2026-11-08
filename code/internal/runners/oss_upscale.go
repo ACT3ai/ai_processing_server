@@ -153,7 +153,7 @@ func (OSSUpscale) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter)
 		if len(steps) > 0 {
 			rep.Log(fmt.Sprintf("upscale cut into %d checkpointed segments", (len(steps)-1)/2))
 			// The join must hold every source frame: a lost segment fails validation instead of shipping short.
-			return detachedTask{Steps: steps, Output: out, ExpectFrames: frames}, nil
+			return detachedTask{Steps: steps, Output: out, ExpectFrames: frames, Cancel: one(src, out).Cancel}, nil
 		}
 		return one(src, out), nil
 	})
@@ -207,7 +207,7 @@ func seedvr2Task(p upscaleParams, src, out, accel string) detachedTask {
 	// each pass prints its own "batch k/n"; at 4K decoding takes as long as upscaling
 	phases := []taskhost.Phase{{Match: `(?i)encod`, Weight: 0.05}, {Match: `(?i)upscal`, Weight: 0.45},
 		{Match: `(?i)decod`, Weight: 0.47}, {Match: `(?i)post-process`, Weight: 0.03}}
-	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out, Phases: phases}
+	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out, Phases: phases, Cancel: ProfileSeedVR2}
 }
 
 // seedvr2Batch is the --batch_size (frames per temporal batch, 4n+1) for this job on this accelerator.

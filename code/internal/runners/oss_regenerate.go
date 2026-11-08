@@ -905,6 +905,7 @@ func regenTask(snap snapshot.Snapshot, env Env, pl regenPlan, draft, prompt, out
 		},
 		Output:       out,
 		ExpectFrames: int(math.Round(pl.OutputSeconds * h3rFPS)),
+		Cancel:       ProfileH3Regenerate,
 	}, nil
 }
 

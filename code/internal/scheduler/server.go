@@ -22,6 +22,7 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/queue"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
+	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 )
 
 // Health states (spec §12.4).
@@ -43,7 +44,7 @@ var (
 	ErrFinal          = errors.New("job already finished")
 	ErrInvalid        = errors.New("invalid job")
 
-	errCancelled = errors.New("cancelled by the machine owner")
+	errCancelled = errors.New("cancelled") // wrapped as "cancelled by <who>" (Cancel); "who" is production, staff, the machine owner ...
 	errTimeout   = errors.New("job exceeded its timeout")
 	errShutdown  = errors.New("server shutting down")
 	// errDetach ends a queued job's attempt in THIS controller only: its detached task host keeps rendering and the
@@ -90,22 +91,27 @@ type Server struct {
 	pool      *SlotPool
 	jobs      map[string]*jobs.Job
 	cancels   map[string]context.CancelCauseFunc
-	activeBy  map[string]int
-	active    int
-	pausedSvc map[string]string // service → who paused it
-	paused    bool
-	draining  bool
-	started   bool
-	warnings  []string
-	journal   *jobs.Journal
-	wake      chan struct{}
-	jobsCtx   context.Context
-	stopJobs  context.CancelCauseFunc
-	wg        sync.WaitGroup
-	log       *slog.Logger
-	bootAt    time.Time
-	stats     counters
-	lastSave  map[string]time.Time
+	// cancelAsked: when a cancel reached each job still running (the stop report measures from it, pm/cancel.mdx §6)
+	cancelAsked map[string]time.Time
+	// cancelPending: jobs cancelled before they started here whose task host was already rendering; cancelled
+	// again the moment they start (startLocked), value = who asked
+	cancelPending map[string]string
+	activeBy      map[string]int
+	active        int
+	pausedSvc     map[string]string // service → who paused it
+	paused        bool
+	draining      bool
+	started       bool
+	warnings      []string
+	journal       *jobs.Journal
+	wake          chan struct{}
+	jobsCtx       context.Context
+	stopJobs      context.CancelCauseFunc
+	wg            sync.WaitGroup
+	log           *slog.Logger
+	bootAt        time.Time
+	stats         counters
+	lastSave      map[string]time.Time
 
 	workDir, resultsDir, jobLogDir string
 
@@ -495,6 +501,10 @@ func (s *Server) startLocked(j *jobs.Job, slot jobs.Slot) {
 	s.active++
 	ctx, cancel := context.WithCancelCause(s.jobsCtx)
 	s.cancels[j.ID] = cancel
+	if by, pending := s.cancelPending[j.ID]; pending {
+		delete(s.cancelPending, j.ID)
+		cancel(fmt.Errorf("%w by %s", errCancelled, by)) // the runner re-attaches, then stops and verifies (cancel mode)
+	}
 	s.save(j, true)
 	s.eventLocked(j, "stage", nil)
 	s.log.Info("job start", "job_id", j.ID, "service", j.Type, "platform", j.Queue, "slot", slot.ID,
@@ -546,14 +556,46 @@ func (s *Server) Cancel(id, by string) (*jobs.Job, error) {
 		return j.Redacted(), ErrFinal
 	}
 	if j.State == jobs.Active {
+		if s.cancelAsked == nil {
+			s.cancelAsked = map[string]time.Time{}
+		}
+		if _, asked := s.cancelAsked[id]; !asked {
+			s.cancelAsked[id] = time.Now().UTC()
+		}
 		if c := s.cancels[id]; c != nil {
-			c(fmt.Errorf("%w (%s)", errCancelled, by))
+			c(fmt.Errorf("%w by %s", errCancelled, by))
 		}
 		s.log.Info("job cancel requested", "job_id", id, "by", by)
 		return j.Redacted(), nil
 	}
+	// Not started here yet, but a task host may already be rendering it (a job re-adopted after a restart, waiting
+	// for its slot). Finishing it now would orphan that render: stop the task host through its cancel file at once,
+	// and cancel the job the moment it starts, so its runner re-attaches, verifies the stop and cleans up
+	// (pm/cancel.mdx §5.6).
+	if dir := s.runDirOf(id); dir != "" && taskhost.Alive(dir) != taskhost.Missing {
+		elog.Check("stopping the task host of a job cancelled before it re-attached", taskhost.Cancel(dir), "job_id", id)
+		if s.cancelPending == nil {
+			s.cancelPending = map[string]string{}
+		}
+		if s.cancelAsked == nil {
+			s.cancelAsked = map[string]time.Time{}
+		}
+		s.cancelPending[id] = by
+		s.cancelAsked[id] = time.Now().UTC()
+		s.log.Info("job cancel pending: its task host is told to stop; the runner verifies it when the job starts", "job_id", id, "by", by)
+		s.poke()
+		return j.Redacted(), nil
+	}
 	s.finishLocked(j, jobs.Cancelled, jobs.KindCancelled, j.Stage, "cancelled by "+by+" before it started", nil)
 	return j.Redacted(), nil
+}
+
+// runDirOf is the job's task host run directory, or "" when this server keeps none.
+func (s *Server) runDirOf(id string) string {
+	if s.opt.StateDir == "" {
+		return ""
+	}
+	return filepath.Join(s.opt.StateDir, "runs", runners.RunDirName(id))
 }
 
 // PauseService / ResumeService are the owner's pause (spec §10.4: a local pause wins).

@@ -164,7 +164,7 @@ func segmentedSteps(ffmpeg, ffprobe, src, out string, segSeconds float64, batch 
 			Argv: []string{ffmpeg, "-y", "-v", "error", "-ss", strconv.FormatFloat(ss, 'f', 6, 64), "-i", src,
 				"-frames:v", strconv.Itoa(r[1] - r[0]), "-an", "-c:v", "libx264", "-crf", "8", "-preset", "veryfast",
 				"-pix_fmt", "yuv420p", cut},
-			Output: cut, Weight: 0.03})
+			Output: cut, Weight: 0.03, GraceSeconds: ProfileFFmpeg.Grace.Seconds()})
 		t := one(cut, up)
 		steps = append(steps, taskhost.Step{Name: fmt.Sprintf("upscale %d/%d", i+1, len(plan)), Argv: t.Argv, Dir: t.Dir,
 			Env: t.Env, Phases: t.Phases, Output: up, Weight: float64(r[1]-r[0]) / float64(vf.Frames) * float64(len(plan))})
@@ -174,7 +174,7 @@ func segmentedSteps(ffmpeg, ffprobe, src, out string, segSeconds float64, batch 
 	if err := os.WriteFile(listPath, []byte(list.String()), 0o600); err != nil {
 		return nil, 0, err
 	}
-	steps = append(steps, taskhost.Step{Name: "join", Output: out, Weight: 0.03,
+	steps = append(steps, taskhost.Step{Name: "join", Output: out, Weight: 0.03, GraceSeconds: ProfileFFmpeg.Grace.Seconds(),
 		Argv: []string{ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy",
 			"-movflags", "+faststart", out}})
 	return steps, vf.Frames, nil

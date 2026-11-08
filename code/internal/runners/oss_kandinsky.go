@@ -116,5 +116,5 @@ func kandinskyTask(snap snapshot.Snapshot, env Env, p videoParams, image, out st
 	if accel == "mps" {
 		vars = append(vars, "PYTORCH_ENABLE_MPS_FALLBACK=1")
 	}
-	return detachedTask{Argv: argv, Dir: filepath.Dir(out), Env: vars, Output: out}
+	return detachedTask{Argv: argv, Dir: filepath.Dir(out), Env: vars, Output: out, Cancel: ProfileKandinsky}
 }

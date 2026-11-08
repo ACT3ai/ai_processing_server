@@ -65,6 +65,18 @@ func (s *Server) execute(ctx context.Context, cancel context.CancelCauseFunc, jo
 		env := runners.Env{WorkDir: workDir, OutDir: outDir, Inputs: map[string]string{}, Slot: *job.Slot,
 			Engines: engines, MinFreeRAMGB: s.cfg.Limits.RAMFloorGB, Logger: s.log.With("ctx", "runner."+def.Runner, "job_id", job.ID, "service", job.Type)}
 		rep.Log(fmt.Sprintf("attempt %d of %s on %s (timeout %s)", job.Retried+1, job.Type, job.Slot.ID, timeout))
+		if ctx.Err() != nil {
+			// Cancelled before it started here (a pending cancel, Server.Cancel). A runner that re-attaches may still
+			// have a task host rendering from before a restart: hand it the cancelled context without staging, so
+			// CANCEL MODE stops that render, verifies it and cleans up (pm/cancel.mdx §5.6). Nothing is uploaded.
+			if ra, ok := runner.(runners.Reattacher); ok && ra.Reattachable() {
+				stage = jobs.StageRunning
+				if _, rerr := runner.Run(ctx, job, env, rep); rerr != nil && !errors.Is(rerr, context.Canceled) {
+					rep.Log("cancel mode: " + rerr.Error())
+				}
+			}
+			return context.Cause(ctx)
+		}
 		if err := runner.Check(ctx, job, env); err != nil {
 			return err
 		}
@@ -212,8 +224,13 @@ func (s *Server) finishLocked(j *jobs.Job, st jobs.State, kind jobs.ErrorKind, s
 	case jobs.Cancelled:
 		j.FinishedAt = &now
 		j.ErrorKind, j.ErrorStage, j.LastErr = jobs.KindCancelled, stage, msg
+		if j.Stop == nil { // a runner without a task host (ffmpeg, compute), or a job that never started
+			j.Stop = s.plainStopLocked(j, stage, wasActive, now)
+		}
+		delete(s.cancelAsked, j.ID)
 		j.Move(jobs.Cancelled, jobs.StageCancelled, msg)
 		s.stats.Cancelled[j.Type]++
+		s.log.Info("job cancelled", "job_id", j.ID, "service", j.Type, "stop", j.Stop.Summary())
 	default:
 		j.ErrorKind, j.ErrorStage, j.LastErr, j.LastFailedAt = kind, stage, msg, &now
 		if retryable && j.Retried < j.MaxRetry {
@@ -351,6 +368,37 @@ func (r *reporter) Progress(frac float64, note string) {
 	if note != "" {
 		r.Log(fmt.Sprintf("progress %.3f %s", frac, note))
 	}
+}
+
+// Stopped puts CANCEL MODE's report on the job record (runners.StopRecorder).
+func (r *reporter) Stopped(rep jobs.StopReport) {
+	r.s.mu.Lock()
+	if j, ok := r.s.jobs[r.id]; ok {
+		if at, asked := r.s.cancelAsked[r.id]; asked && (rep.AskedAt.IsZero() || at.Before(rep.AskedAt)) {
+			rep.AskedAt = at // measure from when the cancel reached this server, not when the runner saw it
+			if !rep.StoppedAt.IsZero() {
+				rep.Seconds = rep.StoppedAt.Sub(at).Seconds()
+			}
+		}
+		j.Stop = &rep
+		r.s.save(j, false)
+	}
+	r.s.mu.Unlock()
+}
+
+// plainStopLocked is the stop report of a job without a task host: a waiting job (nothing ran), or an in-process /
+// procs.Run runner, whose processes procs.Run has already interrupted, killed and reaped before Run returned.
+func (s *Server) plainStopLocked(j *jobs.Job, stage jobs.Stage, wasActive bool, now time.Time) *jobs.StopReport {
+	asked, ok := s.cancelAsked[j.ID]
+	if !ok {
+		asked = now
+	}
+	prof := s.cat.Services[j.Type].Runner
+	if prof == "" {
+		prof = j.Type
+	}
+	return &jobs.StopReport{Profile: prof, Stage: string(stage), AskedAt: asked, StoppedAt: now,
+		Seconds: now.Sub(asked).Seconds(), Graceful: wasActive && stage != jobs.StageStaging, TreeVerified: true, GPU: "not_checked"}
 }
 
 func (r *reporter) Log(line string) {

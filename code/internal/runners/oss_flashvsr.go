@@ -83,5 +83,5 @@ func flashvsrTask(snap snapshot.Snapshot, env Env, scale float64, src, out strin
 	if fp := enginePath(env, "ffprobe"); fp != "" {
 		vars = append(vars, "ACT3_FFPROBE="+fp)
 	}
-	return detachedTask{Argv: argv, Dir: home, Env: vars, Output: out}
+	return detachedTask{Argv: argv, Dir: home, Env: vars, Output: out, Cancel: ProfileFlashVSR}
 }

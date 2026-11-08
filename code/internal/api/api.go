@@ -263,11 +263,30 @@ func (h *handler) queueJob(w http.ResponseWriter, r *http.Request) {
 func (h *handler) queueCancel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	if err := h.s.QueueCancel(ctx, r.PathValue("id"), "owner (local API)"); err != nil {
+	if err := h.s.QueueCancel(ctx, r.PathValue("id"), cancelBy(r, "owner (local API)")); err != nil {
 		writeQueueErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "job_id": r.PathValue("id"), "cancel": "requested"})
+}
+
+// cancelBy is who asked for a cancel: the optional JSON body {"by": "..."} (the render-server agent sends
+// "production"; pm/cancel.mdx §4.1), else def. Cleaned to one short line: it is shown to staff and kept in events.
+func cancelBy(r *http.Request, def string) string {
+	var body struct {
+		By string `json:"by"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	}
+	by := strings.Join(strings.Fields(body.By), " ")
+	if by == "" {
+		return def
+	}
+	if len(by) > 120 {
+		by = by[:120]
+	}
+	return by
 }
 
 func writeQueueErr(w http.ResponseWriter, err error) {
@@ -337,7 +356,7 @@ func (h *handler) output(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) cancel(w http.ResponseWriter, r *http.Request) {
-	j, err := h.s.Cancel(r.PathValue("id"), "the machine owner")
+	j, err := h.s.Cancel(r.PathValue("id"), cancelBy(r, "the machine owner"))
 	if err != nil {
 		writeSchedErr(w, err)
 		return
