@@ -22,6 +22,7 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/queue"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
+	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 )
 
 // Health states (spec §12.4).
@@ -43,7 +44,7 @@ var (
 	ErrFinal          = errors.New("job already finished")
 	ErrInvalid        = errors.New("invalid job")
 
-	errCancelled = errors.New("cancelled by the machine owner")
+	errCancelled = errors.New("cancelled") // wrapped as "cancelled by <who>" (Cancel); "who" is production, staff, the machine owner ...
 	errTimeout   = errors.New("job exceeded its timeout")
 	errShutdown  = errors.New("server shutting down")
 	// errDetach ends a queued job's attempt in THIS controller only: its detached task host keeps rendering and the
@@ -90,6 +91,13 @@ type Server struct {
 	pool      *SlotPool
 	jobs      map[string]*jobs.Job
 	cancels   map[string]context.CancelCauseFunc
+	// cancelAsked: when a cancel reached each job still running (the stop report measures from it, pm/cancel.mdx §6)
+	cancelAsked map[string]time.Time
+	// cancelPending: jobs cancelled before they started here whose task host was already rendering; cancelled
+	// again the moment they start (startLocked), value = who asked
+	cancelPending map[string]string
+	// cancelBy: who asked, for the cancelled event's `by` (pm/cancel.mdx §4.1)
+	cancelBy  map[string]string
 	activeBy  map[string]int
 	active    int
 	pausedSvc map[string]string // service → who paused it
@@ -408,6 +416,9 @@ func (s *Server) admit() {
 		if j.State != jobs.Pending && j.State != jobs.Retry {
 			continue
 		}
+		if _, stopping := s.cancelPending[j.ID]; stopping {
+			continue // cancelled; its run directory is being stopped without a slot
+		}
 		if j.NextProcessAt != nil && now.Before(*j.NextProcessAt) {
 			continue
 		}
@@ -534,26 +545,116 @@ func (s *Server) List(f Filter) []*jobs.Job {
 	return out
 }
 
-// Cancel stops a job. Waiting jobs are cancelled at once; running jobs are stopped and upload nothing.
+// Cancel stops a job. Waiting jobs are cancelled at once; running jobs are stopped (CANCEL MODE) and upload nothing.
 func (s *Server) Cancel(id, by string) (*jobs.Job, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	j, ok := s.jobs[id]
+	if !ok {
+		s.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	if j.State.Final() {
+		r := j.Redacted()
+		s.mu.Unlock()
+		return r, ErrFinal
+	}
+	s.noteCancelLocked(id, by)
+	if j.State == jobs.Active {
+		if c := s.cancels[id]; c != nil {
+			c(fmt.Errorf("%w by %s", errCancelled, by))
+		}
+		s.log.Info("job cancel requested", "job_id", id, "by", by)
+		r := j.Redacted()
+		s.mu.Unlock()
+		return r, nil
+	}
+	if _, pending := s.cancelPending[id]; pending {
+		r := j.Redacted()
+		s.mu.Unlock()
+		return r, nil // already stopping
+	}
+	dir := s.runDirOf(id)
+	s.mu.Unlock()
+
+	// Not running here, but a run directory may hold a render: a task host still rendering for a job re-adopted after
+	// a restart that waits for its slot, or a dead one's checkpoints (a job in Retry). Finishing the job now would
+	// orphan that render; starting it to let the runner stop it could relaunch it. So stop the run directory directly,
+	// without a slot (the render already occupies the hardware), and finish the job when it is verified stopped
+	// (pm/cancel.mdx §5.6). File I/O happens outside the lock.
+	if dir != "" && taskhost.Alive(dir) != taskhost.Missing {
+		s.mu.Lock()
+		j, ok = s.jobs[id]
+		if !ok || j.State.Final() || j.State == jobs.Active {
+			s.mu.Unlock()
+			if ok && j.State == jobs.Active {
+				return s.Cancel(id, by) // it started meanwhile: the running path
+			}
+			return nil, ErrFinal
+		}
+		if s.cancelPending == nil {
+			s.cancelPending = map[string]string{}
+		}
+		s.cancelPending[id] = by // admit skips it from now on
+		r := j.Redacted()
+		s.log.Info("job cancel: stopping its run directory without a slot", "job_id", id, "by", by, "dir", dir)
+		s.wg.Add(1)
+		s.mu.Unlock()
+		go func() {
+			defer s.wg.Done()
+			defer elog.Recover("stopping the run directory of a cancelled job", "job_id", id)
+			rep := runners.StopRunDir(dir, func(l string) { s.log.Info(l, "job_id", id) })
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			delete(s.cancelPending, id)
+			if j, ok := s.jobs[id]; ok && !j.State.Final() && j.State != jobs.Active {
+				rep.Stage = string(j.Stage)
+				j.Stop = rep
+				s.finishLocked(j, jobs.Cancelled, jobs.KindCancelled, j.Stage, "cancelled by "+by, nil)
+			}
+		}()
+		return r, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok = s.jobs[id]
 	if !ok {
 		return nil, ErrNotFound
 	}
 	if j.State.Final() {
 		return j.Redacted(), ErrFinal
 	}
-	if j.State == jobs.Active {
+	if j.State == jobs.Active { // started meanwhile
 		if c := s.cancels[id]; c != nil {
-			c(fmt.Errorf("%w (%s)", errCancelled, by))
+			c(fmt.Errorf("%w by %s", errCancelled, by))
 		}
-		s.log.Info("job cancel requested", "job_id", id, "by", by)
 		return j.Redacted(), nil
 	}
 	s.finishLocked(j, jobs.Cancelled, jobs.KindCancelled, j.Stage, "cancelled by "+by+" before it started", nil)
 	return j.Redacted(), nil
+}
+
+// noteCancelLocked remembers when the cancel reached this server and who asked (the stop report and the cancelled
+// event use them); the first ask wins.
+func (s *Server) noteCancelLocked(id, by string) {
+	if s.cancelAsked == nil {
+		s.cancelAsked = map[string]time.Time{}
+	}
+	if s.cancelBy == nil {
+		s.cancelBy = map[string]string{}
+	}
+	if _, asked := s.cancelAsked[id]; !asked {
+		s.cancelAsked[id] = time.Now().UTC()
+		s.cancelBy[id] = by
+	}
+}
+
+// runDirOf is the job's task host run directory, or "" when this server keeps none.
+func (s *Server) runDirOf(id string) string {
+	if s.opt.StateDir == "" {
+		return ""
+	}
+	return filepath.Join(s.opt.StateDir, "runs", runners.RunDirName(id))
 }
 
 // PauseService / ResumeService are the owner's pause (spec §10.4: a local pause wins).

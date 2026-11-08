@@ -1370,6 +1370,10 @@ second job.
 
 ### 16.5 Cancellation
 
+**2026-11-08: the full cancel behaviour — cancel mode (verified stop, escalation, GPU release, cleanup, stop report),
+missed-cancel recovery, per-render-type profiles — is specified in [cancel.mdx](./cancel.mdx).** This section keeps
+the transport facts.
+
 The caller sets `job_control.<job_id>.cancel = true` (or `DELETE /v1/jobs/{job_id}`). A queued job is removed by the
 hub and acked with event `cancelled`.
 **As built (2026-10-28):** `POST /v1/queue/jobs/{id}/cancel` on a job no server holds (`job_state` QUEUED) sets the

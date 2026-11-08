@@ -16,6 +16,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/queue"
 )
 
@@ -82,6 +83,7 @@ type queueRow struct {
 }
 
 type queueJobView struct {
+	Stop  *jobs.StopReport `json:"stop"` // CANCEL MODE's report (pm/cancel.mdx §6)
 	State struct {
 		State     string    `json:"state"`
 		Caller    string    `json:"caller"`
@@ -109,14 +111,15 @@ type queueJobView struct {
 }
 
 type localJob struct {
-	ID       string  `json:"id"`
-	Type     string  `json:"type"`
-	State    string  `json:"state"`
-	Stage    string  `json:"stage"`
-	Step     string  `json:"step"`
-	Progress float64 `json:"progress"`
-	Note     string  `json:"note"`
-	LastErr  string  `json:"last_err"`
+	Stop     *jobs.StopReport `json:"stop"`
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	State    string           `json:"state"`
+	Stage    string           `json:"stage"`
+	Step     string           `json:"step"`
+	Progress float64          `json:"progress"`
+	Note     string           `json:"note"`
+	LastErr  string           `json:"last_err"`
 }
 
 // localFinal: the local job table's Asynq-style states that end a job.
@@ -196,6 +199,7 @@ func queueShow(c *client, p paths, id string) error {
 		if qj.Control.Cancel {
 			fmt.Printf("  cancel     asked by %s\n", orDash(qj.Control.By))
 		}
+		printStop(qj.Stop)
 	} else {
 		fmt.Printf("  queue      %v\n", qerr)
 	}
@@ -355,12 +359,15 @@ func cancelOne(c *client, p paths, id string) error {
 	}
 	t0 := time.Now()
 	last := ""
-	for time.Since(t0) < 90*time.Second {
+	// CANCEL MODE may take a render type's grace (up to 45 s) plus a margin, or ~4 min 45 s when the controller has
+	// to kill a wedged task host (pm/cancel.mdx §5): wait past that.
+	for time.Since(t0) < cancelWait {
 		if route == "queue" {
 			if c.call("GET", "/v1/queue/jobs/"+esc, &qj) == nil {
 				last = qj.State.State
 				if queue.FinalState(last) {
 					fmt.Printf("%s: %s after %s (queue)\n", id, last, time.Since(t0).Round(100*time.Millisecond))
+					printStop(qj.Stop)
 					return nil
 				}
 			}
@@ -370,14 +377,31 @@ func cancelOne(c *client, p paths, id string) error {
 				last = lj.State
 				if localFinal(last) {
 					fmt.Printf("%s: %s after %s (local)\n", id, last, time.Since(t0).Round(100*time.Millisecond))
+					printStop(lj.Stop)
 					return nil
 				}
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("cancel asked, but still %s after 90 s: the task host may still be stopping its processes "+
-		"(see: ai_processing_server queue show %s)", orDash(last), id)
+	return fmt.Errorf("cancel asked, but still %s after %s: the task host may still be stopping its processes "+
+		"(see: ai_processing_server queue show %s)", orDash(last), cancelWait, id)
+}
+
+// cancelWait covers cancel mode's worst case (pm/cancel.mdx §5): the 62 s first wait, the 3-minute escalation cap,
+// 10 s of tree verification and 30 s of GPU release, about 4 min 45 s, plus margin.
+const cancelWait = 6 * time.Minute
+
+// printStop prints CANCEL MODE's report: one sentence, then any problems on their own lines.
+func printStop(r *jobs.StopReport) {
+	if r == nil {
+		return
+	}
+	verdict := "clean"
+	if !r.Clean() {
+		verdict = "NEEDS ATTENTION"
+	}
+	fmt.Printf("  stopped    [%s] %s\n", verdict, r.Summary())
 }
 
 func orDash(s string) string {

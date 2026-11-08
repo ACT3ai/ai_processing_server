@@ -102,6 +102,34 @@ def say(line):
         sys.stdout.flush()
 
 
+# ── ACT3 cancel mode (~/BGit/act3/ai_processing_server/pm/cancel.mdx §4.2) ───────────────────────────────────────────
+# The render server's task host writes $ACT3_CANCEL_FILE when the job is cancelled. On Unix it also sends SIGINT, but on
+# Windows a detached process cannot be sent a Ctrl-C, so the script watches the file itself: it prints
+# "ACT3_STAGE cancelled" and raises KeyboardInterrupt in the main thread, which unwinds the finally blocks (free CUDA
+# memory, stop a child server, close an ffmpeg pipe) inside the render type's grace. The task host kills the process
+# tree when the grace runs out, and the controller removes the run directory with everything this script wrote.
+ACT3_CANCEL_FILE = os.environ.get("ACT3_CANCEL_FILE", "")
+
+
+def act3_cancelled():
+    return bool(ACT3_CANCEL_FILE) and os.path.exists(ACT3_CANCEL_FILE)
+
+
+def act3_watch_cancel(poll=1.0):
+    if not ACT3_CANCEL_FILE:
+        return
+    import _thread
+    import threading
+
+    def watch():
+        while not act3_cancelled():
+            time.sleep(poll)
+        print("ACT3_STAGE cancelled", flush=True)
+        _thread.interrupt_main()
+
+    threading.Thread(target=watch, name="act3-cancel", daemon=True).start()
+
+
 def setup_process():
     """UTF-8 output whatever the console's code page (a progress bar's █ must not kill the pump), and SIGTERM unwinds
     like Ctrl-C so the finally blocks stop the private ComfyUI instead of leaving it on the GPU."""
@@ -116,12 +144,18 @@ def setup_process():
 
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, interrupt)
+    act3_watch_cancel()  # Windows has no SIGINT for a detached process: the cancel file unwinds the same finally blocks
 
 
 def error_exit(e):
     """The one ACT3_ERROR line and its exit code, for a Fail or anything unexpected."""
     if isinstance(e, Fail):
         kind, msg = e.kind, str(e)
+    elif isinstance(e, KeyboardInterrupt) and act3_cancelled():
+        # ACT3 cancel mode: the job was cancelled, not broken. No ACT3_ERROR line (it would read as a failure);
+        # the finally blocks have stopped the private server. 130 is the conventional "interrupted" exit code.
+        say("ACT3_STAGE cancelled")
+        return 130
     elif isinstance(e, KeyboardInterrupt):
         kind, msg = "internal", "interrupted"
     else:
@@ -354,6 +388,23 @@ def run_logged(argv, prog, cwd=None, latents=None):
     t_start = time.time()
     p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                          env={**os.environ, "PYTHONUNBUFFERED": "1"})
+    try:
+        return _follow(p, latents, t_start, prog, tail)
+    finally:
+        # A cancel (KeyboardInterrupt) or any error while following: never leave the model process on the GPU. On
+        # Windows nothing else would end it (ai_processing_server pm/cancel.mdx §5.4); the step's Job Object is the
+        # backstop.
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+
+def _follow(p, latents, t_start, prog, tail):
+    saw_decode = False
     for raw in p.stdout:
         line = raw.rstrip("\n")
         if not line:

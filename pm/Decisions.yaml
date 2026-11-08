@@ -320,3 +320,23 @@
   code: >
     data/servers/known_servers.yaml (BLAP dev, BMTR, services_off on B5090 and BMS);
     ~/BGit/all/film/pm/subp/render_queue/render_task/render_task.mdx §8, post_topaz_render_task.mdx §8.
+
+- id: D-028
+  title: "Cancel mode: a cancelled render is stopped, verified gone (process groups and NVIDIA VRAM) and cleaned before its slot is freed"
+  status: decided
+  date: 2026-11-08
+  decision: >
+    A cancel puts the render into cancel mode (pm/cancel.mdx §5): the task host interrupts the step and kills its group
+    after the render type's grace (20 s diffusion, 15 s FlashVSR, 45 s for the H3 paths with a private server, 5 s
+    ffmpeg); the controller escalates to killing the task host's and every recorded step's process group when the task
+    host does not stop, verifies every group is gone and nvidia-smi lists none of them, removes the run directory, and
+    writes a stop report that travels to production. The slot stays held until then. Cancels missed by the control
+    watch (restart, watch drop, re-adopted job) are applied by a reconcile on every heartbeat. Task scripts watch
+    ACT3_CANCEL_FILE because Windows cannot deliver Ctrl-C to a detached group.
+  why: "Bryan, 2026-11-08: the Cancel Render Job of the Render Queue must actually stop the render on our servers, with
+    the right cleanup for every render type. Before: the controller waited 30 s then deleted the run directory and freed
+    the GPU whatever the process did; a cancel set while the controller restarted was lost."
+  code: >
+    code/internal/runners/cancel.go; code/internal/runners/oss.go (runDetached); code/internal/taskhost/taskhost.go;
+    code/internal/procs/procs.go; code/internal/jobs/stop.go; code/internal/scheduler/{server,execute,queue}.go;
+    code/internal/api/api.go (cancelBy); code/cmd/ai_processing_server/queuecmd.go (printStop).

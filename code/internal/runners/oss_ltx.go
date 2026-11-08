@@ -125,7 +125,7 @@ func ltxTask(p videoParams, image, last, out string, w, h, frames int) detachedT
 	if accelerator() == "mps" {
 		env = append(env, "PYTORCH_ENABLE_MPS_FALLBACK=1")
 	}
-	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out}
+	return detachedTask{Argv: argv, Dir: repo, Env: env, Output: out, Cancel: ProfileLTX}
 }
 
 // framesWanted is the job's frame count at fps: its own count (rescaled when it was counted at another rate), else

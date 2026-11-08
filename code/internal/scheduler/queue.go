@@ -527,7 +527,14 @@ func (s *Server) settleLocked(j *jobs.Job, retryable bool) {
 		ev.Outputs, _ = json.Marshal(publicOutputs(j.Outputs))
 		ev.Result = j.Result
 	case jobs.Cancelled:
-		st.State, ev.Type, ev.By = queue.StateCancelled, "cancelled", strings.TrimPrefix(j.LastErr, "cancelled by ")
+		st.State, ev.Type, ev.By = queue.StateCancelled, "cancelled", j.CancelledBy
+		if ev.By == "" { // a record from before 2026-11-08
+			ev.By = strings.TrimSuffix(strings.TrimPrefix(j.LastErr, "cancelled by "), " before it started")
+		}
+		if j.Stop != nil { // CANCEL MODE's proof that the work stopped (pm/cancel.mdx §6): the caller can show it
+			ev.Note = j.Stop.Summary()
+			ev.Result, _ = json.Marshal(map[string]any{"stop": j.Stop})
+		}
 	default:
 		if retryable && h.attempt < h.maxAttempts {
 			delay = backoff(h.attempt)
@@ -758,6 +765,7 @@ func (s *Server) heartbeatLoop(ctx context.Context, q queue.Queue) {
 				s.log.Warn("could not extend a claim", "job_id", d.Envelope().JobID, "error", err)
 			}
 		}
+		s.reconcileControl(ctx, q) // belt and braces: a cancel the watch missed is applied within one heartbeat
 		s.putServer(ctx, q)
 	}
 }
@@ -791,6 +799,9 @@ func (s *Server) controlLoop(ctx context.Context, q queue.Queue) {
 				continue
 			}
 		}
+		// The watch delivers only changes made after it started: a cancel set while this process was down, or
+		// while the watch was broken, is found by reading every held job's flag now (pm/cancel.mdx §5.6).
+		s.reconcileControl(ctx, q)
 		for c := range ch {
 			if !c.Cancel {
 				continue
@@ -807,6 +818,39 @@ func (s *Server) controlLoop(ctx context.Context, q queue.Queue) {
 					elog.Warn("applying a cancel from job_control", err, "job_id", c.JobID)
 				}
 			}
+		}
+	}
+}
+
+// reconcileControl applies the cancel flag of every job this server holds. Cheap (one KV read per held job) and
+// idempotent: a job already cancelling or finished is left alone.
+func (s *Server) reconcileControl(ctx context.Context, q queue.Queue) {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.held))
+	for id := range s.held {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		ctl, err := q.GetControl(ctx, id)
+		if err != nil || !ctl.Cancel {
+			continue
+		}
+		s.mu.Lock()
+		j, ok := s.jobs[id]
+		_, asked := s.cancelAsked[id]
+		live := ok && !j.State.Final() && !asked
+		s.mu.Unlock()
+		if !live {
+			continue
+		}
+		by := ctl.By
+		if by == "" {
+			by = "caller"
+		}
+		s.log.Info("applying a cancel the control watch missed", "job_id", id, "by", by)
+		if _, err := s.Cancel(id, by); err != nil && !errors.Is(err, ErrFinal) && !errors.Is(err, ErrNotFound) {
+			elog.Warn("applying a missed cancel", err, "job_id", id)
 		}
 	}
 }
@@ -871,7 +915,7 @@ func (s *Server) reclaimOne(ctx context.Context, q queue.Queue, c queue.ClaimHan
 		return nil
 	}
 	h := &heldJob{d: d, caller: c.Caller, band: cur.Band, attempt: c.Attempt, rev: rev, seq: int64(c.Attempt)*eventSeqBase + eventSeqBase/2}
-	if s.readopt(ctx, h, c) {
+	if s.readopt(ctx, q, h, c) {
 		return nil
 	}
 	st := cur
@@ -884,7 +928,7 @@ func (s *Server) reclaimOne(ctx context.Context, q queue.Queue, c queue.ClaimHan
 }
 
 // readopt runs a reclaimed job again on this machine when its runner re-attaches; false means "requeue it".
-func (s *Server) readopt(ctx context.Context, h *heldJob, c queue.ClaimHandle) bool {
+func (s *Server) readopt(ctx context.Context, q queue.Queue, h *heldJob, c queue.ClaimHandle) bool {
 	s.mu.Lock()
 	def, ok := s.cat.Services[c.Service]
 	r, _ := s.runners[def.Runner].(runners.Reattacher)
@@ -912,6 +956,19 @@ func (s *Server) readopt(ctx context.Context, h *heldJob, c queue.ClaimHandle) b
 	}
 	s.held[c.JobID] = h
 	s.eventLocked(j, "claimed", func(e *queue.Event) { e.State, e.Note = queue.StateClaimed, "re-adopted after a restart" })
+	// A cancel asked while the controller was down is applied as soon as the job is ours again (pm/cancel.mdx §5.6).
+	if ctl, err := q.GetControl(ctx, c.JobID); err == nil && ctl.Cancel {
+		go func() {
+			defer elog.Recover("applying a cancel to a re-adopted job")
+			by := ctl.By
+			if by == "" {
+				by = "caller"
+			}
+			if _, err := s.Cancel(c.JobID, by); err != nil && !errors.Is(err, ErrFinal) {
+				elog.Warn("applying a cancel to a re-adopted job", err, "job_id", c.JobID)
+			}
+		}()
+	}
 	s.log.Info("claimed job re-adopted after a restart", "job_id", c.JobID, "service", c.Service, "attempt", c.Attempt)
 	return true
 }
@@ -1036,6 +1093,32 @@ type QueueJob struct {
 	Revision uint64         `json:"revision"`
 	Events   []queue.Event  `json:"events"`
 	Control  queue.Control  `json:"control"` // cancel / pause flags set for the job
+	// Stop is CANCEL MODE's report (pm/cancel.mdx §6): from this server's record of the job, else from the final
+	// `cancelled` event of whichever server stopped it. The render-server agent passes it on to production.
+	Stop *jobs.StopReport `json:"stop,omitempty"`
+}
+
+// stopOf finds a stop report: the local job record first, then the last cancelled event's result.
+func (s *Server) stopOf(id string, evs []queue.Event) *jobs.StopReport {
+	s.mu.Lock()
+	if j, ok := s.jobs[id]; ok && j.Stop != nil {
+		r := *j.Stop
+		s.mu.Unlock()
+		return &r
+	}
+	s.mu.Unlock()
+	for i := len(evs) - 1; i >= 0; i-- {
+		if evs[i].Type != "cancelled" || len(evs[i].Result) == 0 {
+			continue
+		}
+		var res struct {
+			Stop *jobs.StopReport `json:"stop"`
+		}
+		if json.Unmarshal(evs[i].Result, &res) == nil && res.Stop != nil {
+			return res.Stop
+		}
+	}
+	return nil
 }
 
 func (s *Server) QueueJob(ctx context.Context, id string) (*QueueJob, error) {
@@ -1058,7 +1141,7 @@ func (s *Server) QueueJob(ctx context.Context, id string) (*QueueJob, error) {
 		evs = []queue.Event{}
 	}
 	ctl, _ := q.GetControl(ctx, id)
-	return &QueueJob{State: st, Revision: rev, Events: evs, Control: ctl}, nil
+	return &QueueJob{State: st, Revision: rev, Events: evs, Control: ctl, Stop: s.stopOf(id, evs)}, nil
 }
 
 // QueueItem is one row of GET /v1/queue/jobs: a job the WORK stream holds, with its job_state and cancel flag.

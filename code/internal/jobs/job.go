@@ -204,6 +204,11 @@ type Job struct {
 	// broker took all of it (or another worker fenced this one off), so a broker that is down when a 30-minute job
 	// finishes, or a crash right after it, never loses the result and never makes the job run again.
 	Settle *Settlement `json:"settle,omitempty"`
+
+	// Stop is CANCEL MODE's report once a cancel stopped this job (pm/cancel.mdx §6).
+	Stop *StopReport `json:"stop,omitempty"`
+	// CancelledBy is who asked for the cancel ("production", "owner (local API)", ...).
+	CancelledBy string `json:"cancelled_by,omitempty"`
 }
 
 // Settlement is one pending queue outcome (scheduler/queue.go settleLocked, runSettlement).

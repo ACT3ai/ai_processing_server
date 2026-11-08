@@ -304,7 +304,7 @@ func wanTask(snap snapshot.Snapshot, p videoParams, image, out string, w, h, fra
 	if accel == "mps" {
 		env = append(env, "PYTORCH_ENABLE_MPS_FALLBACK=1")
 	}
-	return detachedTask{Argv: argv, Dir: filepath.Dir(out), Env: append(env, "PYTHONUNBUFFERED=1"), Output: out}
+	return detachedTask{Argv: argv, Dir: filepath.Dir(out), Env: append(env, "PYTHONUNBUFFERED=1"), Output: out, Cancel: ProfileWan}
 }
 
 func hasInput(job *jobs.Job, name string) bool {

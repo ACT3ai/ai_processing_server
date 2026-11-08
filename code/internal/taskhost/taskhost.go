@@ -55,6 +55,20 @@ const (
 	LogFile       = "task.log"
 	CheckpointDir = "checkpoint"
 	DeathsFile    = "deaths.json"
+	// ProcsFile lists every process group the task host started (one per step), so the controller can verify a
+	// stop and kill the groups itself when the task host is wedged (pm/cancel.mdx §5.3).
+	ProcsFile = "procs.json"
+	// ScratchDir is the task's own temporary space; its path is exported as ACT3_SCRATCH_DIR. It lives inside the
+	// run directory, so removing the run directory after a cancel removes everything the task made (pm/cancel.mdx §7).
+	ScratchDir = "scratch"
+)
+
+// Environment every step gets (pm/cancel.mdx §4.2): a task script that watches ACT3_CANCEL_FILE stops gracefully on
+// every OS, including Windows, where a detached process group cannot be sent a Ctrl-C.
+const (
+	EnvCancelFile = "ACT3_CANCEL_FILE"
+	EnvRunDir     = "ACT3_RUN_DIR"
+	EnvScratchDir = "ACT3_SCRATCH_DIR"
 )
 
 // Timing. Variables so tests can shorten them.
@@ -100,10 +114,53 @@ type Task struct {
 	Steps []Step `json:"steps,omitempty"`
 	// MinFreeRAMGB is the low-memory guard's floor (limits.ram_floor_gb); 0 = 5% of the machine's RAM, at least 4 GB.
 	MinFreeRAMGB float64 `json:"min_free_ram_gb,omitempty"`
+	// Cancel is the render type's cancel profile: how long its tree gets after the interrupt before it is killed.
+	// Nil (a task.json from an older controller): procs.GraceBeforeKill.
+	Cancel *CancelSpec `json:"cancel,omitempty"`
 	// Phases, for a tool that runs several counted passes in one process (SeedVR2: encode, upscale, decode,
 	// post-process, each its own "batch k/n"): a line matching a phase moves the bar into it, and the pass's own count
 	// fills only its share. A one-step task's; Steps carry their own.
 	Phases []Phase `json:"phases,omitempty"`
+}
+
+// CancelSpec is the part of a render type's cancel profile the task host needs (runners/cancel.go).
+type CancelSpec struct {
+	Profile      string  `json:"profile"`
+	GraceSeconds float64 `json:"grace_seconds,omitempty"`
+}
+
+// Procs is procs.json.
+type Procs struct {
+	HostPID int        `json:"host_pid"`
+	Boot    string     `json:"boot,omitempty"`
+	Groups  []ProcStep `json:"groups"`
+}
+
+// ProcStep is one step's process: on Unix its pid is also its process group id.
+type ProcStep struct {
+	Step      string    `json:"step"`
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+	// JobName is the step's Windows Job Object (procs.Spec.JobName); empty elsewhere.
+	JobName string `json:"job_name,omitempty"`
+	// EndedAt: the step's process exited and its group was killed for any leftovers. An ended step's pid is never
+	// signalled again: the OS may have given it to someone else.
+	EndedAt *time.Time `json:"ended_at,omitempty"`
+}
+
+// Stop is exit.json's account of a cancel: when it was asked and seen, which step it stopped, and whether the
+// tree had to be killed after its grace.
+type Stop struct {
+	AskedAt      time.Time `json:"asked_at,omitempty"`
+	SeenAt       time.Time `json:"seen_at,omitempty"`
+	ExitedAt     time.Time `json:"exited_at"`
+	Step         string    `json:"step,omitempty"`
+	StepsDone    int       `json:"steps_done"`
+	StepsTotal   int       `json:"steps_total"`
+	GraceSeconds float64   `json:"grace_seconds,omitempty"`
+	Forced       bool      `json:"forced,omitempty"`
+	// Escaped: processes that had left the step's process group and were killed after it (procs.Spec.OnEscaped).
+	Escaped int `json:"escaped,omitempty"`
 }
 
 // Phase is one counted pass of a task: Match is a regular expression, Weight its share of the bar.
@@ -170,7 +227,9 @@ type Step struct {
 	Env    []string `json:"env,omitempty"`
 	Output string   `json:"output"` // the file this step must write; its size is the checkpoint
 	Weight float64  `json:"weight,omitempty"`
-	Phases []Phase  `json:"phases,omitempty"` // as Task.Phases, for this step's process
+	// GraceSeconds overrides the task's cancel grace for this step (an ffmpeg cut or join stops in a second).
+	GraceSeconds float64 `json:"grace_seconds,omitempty"`
+	Phases       []Phase `json:"phases,omitempty"` // as Task.Phases, for this step's process
 }
 
 // steps returns the task as a list: Steps, or one step made of Argv.
@@ -269,6 +328,7 @@ type Exit struct {
 	Tail        string    `json:"tail,omitempty"` // last lines of output, for the failure message
 	OutputBytes int64     `json:"output_bytes"`
 	FinishedAt  time.Time `json:"finished_at"`
+	Stop        *Stop     `json:"stop,omitempty"` // set when a cancel stopped it
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -341,6 +401,33 @@ func host(dir string) error {
 		defer stop()
 	}
 	errCancel := errors.New("cancelled")
+	var stopMu sync.Mutex
+	var seenAt time.Time
+	cancelled := func() bool { // the cancel file is there: stop (once), remembering when it was first seen
+		if _, err := os.Stat(filepath.Join(dir, CancelFile)); err != nil {
+			return false
+		}
+		stopMu.Lock()
+		if seenAt.IsZero() {
+			seenAt = time.Now().UTC()
+		}
+		stopMu.Unlock()
+		cancel(errCancel)
+		return true
+	}
+	scratch := filepath.Join(dir, ScratchDir)
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
+		fmt.Fprintf(logf, "# cannot create the scratch dir: %v\n", err)
+	}
+	stepEnv := []string{EnvCancelFile + "=" + filepath.Join(dir, CancelFile), EnvRunDir + "=" + dir, EnvScratchDir + "=" + scratch}
+	pr := Procs{HostPID: os.Getpid(), Boot: boot}
+	escaped := 0
+	jobPrefix := "act3_" + shortHash(dir)
+	savePr := func() {
+		if err := writeJSON(filepath.Join(dir, ProcsFile), pr, true); err != nil {
+			fmt.Fprintf(logf, "# cannot write procs.json: %v\n", err)
+		}
+	}
 	done := make(chan struct{})
 	go func() {
 		hb := time.NewTicker(HeartbeatEvery)
@@ -354,9 +441,7 @@ func host(dir string) error {
 			case <-hb.C:
 				beat()
 			case <-cp.C:
-				if _, err := os.Stat(filepath.Join(dir, CancelFile)); err == nil {
-					cancel(errCancel)
-				}
+				cancelled()
 			}
 		}
 	}()
@@ -447,15 +532,35 @@ func host(dir string) error {
 			before += weights[n]
 			continue
 		}
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || cancelled() { // a cancel written before this step: never start it
 			break
 		}
 		if len(steps) > 1 {
 			ev.add(Event{Type: "note", Note: fmt.Sprintf("step %d/%d: %s", n+1, len(steps), st.Name)})
 		}
 		fmt.Fprintf(logf, "# step %d/%d %s\n# %s\n", n+1, len(steps), st.Name, strings.Join(st.Argv, " "))
-		runErr = procs.Run(ctx, procs.Spec{Name: st.Argv[0], Args: st.Argv[1:], Dir: st.Dir, Env: st.Env, GPU: t.GPU,
-			Stdout: line, Stderr: line, StdinNil: true})
+		grace := st.GraceSeconds
+		if grace <= 0 && t.Cancel != nil {
+			grace = t.Cancel.GraceSeconds
+		}
+		stepName, jobName := st.Name, fmt.Sprintf("%s_s%d", jobPrefix, n)
+		started := -1
+		runErr = procs.Run(ctx, procs.Spec{Name: st.Argv[0], Args: st.Argv[1:], Dir: st.Dir, Env: append(append([]string{}, stepEnv...), st.Env...), GPU: t.GPU,
+			Stdout: line, Stderr: line, StdinNil: true, Grace: time.Duration(grace * float64(time.Second)), JobName: jobName,
+			OnEscaped: func(n int) { escaped += n },
+			OnStart: func(pid int) {
+				started = len(pr.Groups)
+				pr.Groups = append(pr.Groups, ProcStep{Step: stepName, PID: pid, StartedAt: time.Now().UTC(), JobName: jobName})
+				savePr()
+			}})
+		if started >= 0 { // the step is over: kill anything it left behind, then never touch its pid again
+			if g := pr.Groups[started]; procs.OurGroup(g.PID, g.StartedAt) { // identity-checked: never a reused pid
+				procs.KillGroup(g.PID)
+			}
+			now := time.Now().UTC()
+			pr.Groups[started].EndedAt = &now
+			savePr()
+		}
 		if runErr != nil || ctx.Err() != nil {
 			break
 		}
@@ -479,6 +584,17 @@ func host(dir string) error {
 	switch {
 	case errors.Is(cause, errCancel):
 		x.Code, x.Cancelled, x.Error = -1, true, "cancelled"
+		stopMu.Lock()
+		x.Stop = &Stop{AskedAt: cancelAskedAt(dir), SeenAt: seenAt, ExitedAt: x.FinishedAt, Step: steps[cur].Name,
+			StepsDone: cur, StepsTotal: len(steps), Forced: errors.Is(runErr, procs.ErrForcedKill), Escaped: escaped}
+		stopMu.Unlock()
+		if g := steps[cur].GraceSeconds; g > 0 {
+			x.Stop.GraceSeconds = g
+		} else if t.Cancel != nil {
+			x.Stop.GraceSeconds = t.Cancel.GraceSeconds
+		} else {
+			x.Stop.GraceSeconds = procs.GraceBeforeKill.Seconds()
+		}
 	case errors.Is(cause, errTimedOut):
 		x.Code, x.TimedOut, x.Error = -1, true, fmt.Sprintf("timed out after %d s", t.TimeoutSeconds)
 	case errors.Is(cause, procs.ErrKillNow):
@@ -768,10 +884,50 @@ func ReadTask(dir string) (Task, error) {
 	return t, err
 }
 
+// cancelAskedAt is the time written into the cancel file (Cancel), else its modification time.
+func cancelAskedAt(dir string) time.Time {
+	p := filepath.Join(dir, CancelFile)
+	if b, err := os.ReadFile(p); err == nil {
+		if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b))); err == nil {
+			return t
+		}
+	}
+	if fi, err := os.Stat(p); err == nil {
+		return fi.ModTime().UTC()
+	}
+	return time.Time{}
+}
+
+// ReadProcs reads procs.json: every process group the task host started. Missing: no step has started.
+func ReadProcs(dir string) (Procs, error) {
+	var p Procs
+	err := readJSON(filepath.Join(dir, ProcsFile), &p)
+	return p, err
+}
+
+// HostProcess is the task host's own pid and start time from its heartbeat (this boot only), for the controller's
+// escalation and verification (pm/cancel.mdx §5.3). Identity is pid + start time checked against the OS
+// (procs.SameProcess), never the heartbeat's age: a host stalled on disk stops beating but is still the one to kill.
+func HostProcess(dir string) (pid int, startedAt time.Time, ok bool) {
+	var hb Heartbeat
+	if readHeartbeat(filepath.Join(dir, HeartbeatFile), &hb) != nil || hb.Boot != BootID() || hb.PID <= 1 || hb.StartedAt.IsZero() {
+		return 0, time.Time{}, false
+	}
+	return hb.PID, hb.StartedAt, true
+}
+
+func shortHash(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:6])
+}
+
 // Cancel asks the task host to stop its tree; it writes exit.json within CancelPoll plus the procs grace period.
 // A run directory that is already gone needs no cancel.
 func Cancel(dir string) error {
-	err := os.WriteFile(filepath.Join(dir, CancelFile), []byte(time.Now().UTC().Format(time.RFC3339)), 0o600)
+	if _, err := os.Stat(filepath.Join(dir, CancelFile)); err == nil {
+		return nil // asked already: keep the first time, which the stop report measures from
+	}
+	err := os.WriteFile(filepath.Join(dir, CancelFile), []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0o600)
 	if os.IsNotExist(err) {
 		if _, serr := os.Stat(dir); os.IsNotExist(serr) {
 			return nil

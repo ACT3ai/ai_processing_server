@@ -177,7 +177,7 @@ func h3Task(snap snapshot.Snapshot, env Env, p videoParams, inputs map[string]st
 		"--seconds", h3SecondsArg(p), "--steps", fmt.Sprint(steps), "--seed", fmt.Sprint(seed),
 	}
 	argv = append(argv, h3InputArgs(p.Kind, inputs)...)
-	return detachedTask{Argv: argv, Dir: work, Env: h3Env(env), Output: out, ExpectFrames: int(math.Round(h3Seconds(p) * h3FPS))}, nil
+	return detachedTask{Argv: argv, Dir: work, Env: h3Env(env), Output: out, ExpectFrames: int(math.Round(h3Seconds(p) * h3FPS)), Cancel: ProfileH3}, nil
 }
 
 // h3InputArgs: reference images and audio (a Seedance-fed request: Ref2VA) in their <Picture N> / <Audio N> order,

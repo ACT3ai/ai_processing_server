@@ -468,6 +468,10 @@ func TestTaskHostThatKeepsDyingGivesUp(t *testing.T) {
 		t.Fatalf("death count in the new run directory: %d, want 1", n)
 	}
 	taskhost.Cancel(dir)
+	// wait for the task host to stop before TempDir cleanup removes the directory under it
+	wctx, done := context.WithTimeout(context.Background(), 20*time.Second)
+	defer done()
+	taskhost.Watch(wctx, dir, nil)
 }
 
 // A render that exits 0 is only done when its output is a real video, with every frame when the count is known.
