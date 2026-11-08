@@ -882,10 +882,15 @@ func ReadProcs(dir string) (Procs, error) {
 	return p, err
 }
 
-// HostPID is the task host's own pid from its heartbeat (0 when unknown), for the controller's escalation.
+// HostPID is the task host's own pid from its heartbeat, for the controller's escalation; 0 when it cannot be trusted.
+// Only a heartbeat from this boot that is younger than 2 × StaleAfter counts: a pid from an older heartbeat may have
+// been reused by an unrelated process, and killing its process group would hit someone else (pm/cancel.mdx §5.3).
 func HostPID(dir string) int {
 	var hb Heartbeat
-	if readHeartbeat(filepath.Join(dir, HeartbeatFile), &hb) != nil || hb.Boot != BootID() {
+	if readHeartbeat(filepath.Join(dir, HeartbeatFile), &hb) != nil || hb.Boot != BootID() || hb.PID <= 1 {
+		return 0
+	}
+	if time.Since(hb.At) > 2*StaleAfter {
 		return 0
 	}
 	return hb.PID
