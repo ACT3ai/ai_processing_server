@@ -29,11 +29,16 @@ type StopReport struct {
 	GraceSeconds float64 `json:"grace_seconds,omitempty"`
 	// Graceful: the task stopped on the interrupt / cancel file within its grace (its finally blocks ran).
 	Graceful bool `json:"graceful"`
+	// How it ended, in one word: graceful | forced | escalated | host_gone (its task host was already gone) |
+	// not_started (cancelled before anything ran) | in_process (an in-process / procs.Run runner).
+	How string `json:"how,omitempty"`
 	// Forced: the grace ran out and the task host killed the tree.
 	Forced bool `json:"forced,omitempty"`
 	// Escalated: the task host did not finish the stop itself, so the controller killed its process groups.
 	Escalated bool `json:"escalated,omitempty"`
 
+	// EscapedKilled: processes that had left the render's process group (setsid children) and were found and killed.
+	EscapedKilled int `json:"escaped_killed,omitempty"`
 	// TreeVerified: every process group the task ran was checked and is gone.
 	TreeVerified bool `json:"tree_verified"`
 	// GPU is the VRAM check: "released" (nvidia-smi lists none of the tree's processes), "held" (still listed at
@@ -61,13 +66,20 @@ func (r *StopReport) Summary() string {
 		return ""
 	}
 	how := "gracefully"
-	switch {
-	case r.Escalated:
+	switch r.How {
+	case "escalated":
 		how = "after the controller killed it"
-	case r.Forced:
+	case "forced":
 		how = fmt.Sprintf("by force after its %.0f s grace", r.GraceSeconds)
-	case !r.Graceful:
+	case "host_gone":
+		how = "after its task host had already died"
+	case "not_started":
 		how = "before it started rendering"
+	case "in_process":
+		how = "(in-process tool)"
+		if r.Forced {
+			how = fmt.Sprintf("by force after its %.0f s grace", r.GraceSeconds)
+		}
 	}
 	parts := []string{fmt.Sprintf("%s stopped %s in %.1f s", orDash(r.Profile), how, r.Seconds)}
 	if r.Step != "" {
@@ -83,6 +95,8 @@ func (r *StopReport) Summary() string {
 		parts = append(parts, "GPU memory released")
 	case "held":
 		parts = append(parts, "GPU memory STILL HELD")
+	case "not_checked":
+		parts = append(parts, "GPU not checked (no NVIDIA tools here)")
 	}
 	if r.ScratchBytesRemoved > 0 {
 		parts = append(parts, fmt.Sprintf("%.1f MB of scratch removed", float64(r.ScratchBytesRemoved)/1e6))

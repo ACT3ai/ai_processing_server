@@ -388,6 +388,23 @@ def run_logged(argv, prog, cwd=None, latents=None):
     t_start = time.time()
     p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                          env={**os.environ, "PYTHONUNBUFFERED": "1"})
+    try:
+        return _follow(p, latents, t_start, prog, tail)
+    finally:
+        # A cancel (KeyboardInterrupt) or any error while following: never leave the model process on the GPU. On
+        # Windows nothing else would end it (ai_processing_server pm/cancel.mdx §5.4); the step's Job Object is the
+        # backstop.
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+
+def _follow(p, latents, t_start, prog, tail):
+    saw_decode = False
     for raw in p.stdout:
         line = raw.rstrip("\n")
         if not line:

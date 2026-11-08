@@ -114,7 +114,7 @@ func (FFmpeg) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (*R
 	rep.Stage("encode")
 	var tail []string
 	err := procs.Run(ctx, procs.Spec{
-		Name: ff, Args: args, Dir: env.WorkDir, GPU: env.Slot.GPU,
+		Name: ff, Args: args, Dir: env.WorkDir, GPU: env.Slot.GPU, Grace: ProfileFFmpeg.Grace, // pm/cancel.mdx §8
 		Stdout: func(line string) {
 			if v, ok := strings.CutPrefix(line, "out_time_us="); ok && total > 0 {
 				if us, err := strconv.ParseFloat(v, 64); err == nil && us > 0 {

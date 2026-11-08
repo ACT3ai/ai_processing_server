@@ -141,6 +141,11 @@ type ProcStep struct {
 	Step      string    `json:"step"`
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started_at"`
+	// JobName is the step's Windows Job Object (procs.Spec.JobName); empty elsewhere.
+	JobName string `json:"job_name,omitempty"`
+	// EndedAt: the step's process exited and its group was killed for any leftovers. An ended step's pid is never
+	// signalled again: the OS may have given it to someone else.
+	EndedAt *time.Time `json:"ended_at,omitempty"`
 }
 
 // Stop is exit.json's account of a cancel: when it was asked and seen, which step it stopped, and whether the
@@ -154,6 +159,8 @@ type Stop struct {
 	StepsTotal   int       `json:"steps_total"`
 	GraceSeconds float64   `json:"grace_seconds,omitempty"`
 	Forced       bool      `json:"forced,omitempty"`
+	// Escaped: processes that had left the step's process group and were killed after it (procs.Spec.OnEscaped).
+	Escaped int `json:"escaped,omitempty"`
 }
 
 // Phase is one counted pass of a task: Match is a regular expression, Weight its share of the bar.
@@ -414,6 +421,13 @@ func host(dir string) error {
 	}
 	stepEnv := []string{EnvCancelFile + "=" + filepath.Join(dir, CancelFile), EnvRunDir + "=" + dir, EnvScratchDir + "=" + scratch}
 	pr := Procs{HostPID: os.Getpid(), Boot: boot}
+	escaped := 0
+	jobPrefix := "act3_" + shortHash(dir)
+	savePr := func() {
+		if err := writeJSON(filepath.Join(dir, ProcsFile), pr, true); err != nil {
+			fmt.Fprintf(logf, "# cannot write procs.json: %v\n", err)
+		}
+	}
 	done := make(chan struct{})
 	go func() {
 		hb := time.NewTicker(HeartbeatEvery)
@@ -529,15 +543,24 @@ func host(dir string) error {
 		if grace <= 0 && t.Cancel != nil {
 			grace = t.Cancel.GraceSeconds
 		}
-		stepName := st.Name
+		stepName, jobName := st.Name, fmt.Sprintf("%s_s%d", jobPrefix, n)
+		started := -1
 		runErr = procs.Run(ctx, procs.Spec{Name: st.Argv[0], Args: st.Argv[1:], Dir: st.Dir, Env: append(append([]string{}, stepEnv...), st.Env...), GPU: t.GPU,
-			Stdout: line, Stderr: line, StdinNil: true, Grace: time.Duration(grace * float64(time.Second)),
+			Stdout: line, Stderr: line, StdinNil: true, Grace: time.Duration(grace * float64(time.Second)), JobName: jobName,
+			OnEscaped: func(n int) { escaped += n },
 			OnStart: func(pid int) {
-				pr.Groups = append(pr.Groups, ProcStep{Step: stepName, PID: pid, StartedAt: time.Now().UTC()})
-				if err := writeJSON(filepath.Join(dir, ProcsFile), pr, true); err != nil {
-					fmt.Fprintf(logf, "# cannot write procs.json: %v\n", err)
-				}
+				started = len(pr.Groups)
+				pr.Groups = append(pr.Groups, ProcStep{Step: stepName, PID: pid, StartedAt: time.Now().UTC(), JobName: jobName})
+				savePr()
 			}})
+		if started >= 0 { // the step is over: kill anything it left behind, then never touch its pid again
+			if g := pr.Groups[started]; procs.OurGroup(g.PID, g.StartedAt) { // identity-checked: never a reused pid
+				procs.KillGroup(g.PID)
+			}
+			now := time.Now().UTC()
+			pr.Groups[started].EndedAt = &now
+			savePr()
+		}
 		if runErr != nil || ctx.Err() != nil {
 			break
 		}
@@ -563,7 +586,7 @@ func host(dir string) error {
 		x.Code, x.Cancelled, x.Error = -1, true, "cancelled"
 		stopMu.Lock()
 		x.Stop = &Stop{AskedAt: cancelAskedAt(dir), SeenAt: seenAt, ExitedAt: x.FinishedAt, Step: steps[cur].Name,
-			StepsDone: cur, StepsTotal: len(steps), Forced: errors.Is(runErr, procs.ErrForcedKill)}
+			StepsDone: cur, StepsTotal: len(steps), Forced: errors.Is(runErr, procs.ErrForcedKill), Escaped: escaped}
 		stopMu.Unlock()
 		if g := steps[cur].GraceSeconds; g > 0 {
 			x.Stop.GraceSeconds = g
@@ -882,18 +905,20 @@ func ReadProcs(dir string) (Procs, error) {
 	return p, err
 }
 
-// HostPID is the task host's own pid from its heartbeat, for the controller's escalation; 0 when it cannot be trusted.
-// Only a heartbeat from this boot that is younger than 2 × StaleAfter counts: a pid from an older heartbeat may have
-// been reused by an unrelated process, and killing its process group would hit someone else (pm/cancel.mdx §5.3).
-func HostPID(dir string) int {
+// HostProcess is the task host's own pid and start time from its heartbeat (this boot only), for the controller's
+// escalation and verification (pm/cancel.mdx §5.3). Identity is pid + start time checked against the OS
+// (procs.SameProcess), never the heartbeat's age: a host stalled on disk stops beating but is still the one to kill.
+func HostProcess(dir string) (pid int, startedAt time.Time, ok bool) {
 	var hb Heartbeat
-	if readHeartbeat(filepath.Join(dir, HeartbeatFile), &hb) != nil || hb.Boot != BootID() || hb.PID <= 1 {
-		return 0
+	if readHeartbeat(filepath.Join(dir, HeartbeatFile), &hb) != nil || hb.Boot != BootID() || hb.PID <= 1 || hb.StartedAt.IsZero() {
+		return 0, time.Time{}, false
 	}
-	if time.Since(hb.At) > 2*StaleAfter {
-		return 0
-	}
-	return hb.PID
+	return hb.PID, hb.StartedAt, true
+}
+
+func shortHash(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:6])
 }
 
 // Cancel asks the task host to stop its tree; it writes exit.json within CancelPoll plus the procs grace period.

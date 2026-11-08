@@ -117,6 +117,25 @@ def act3_watch_cancel(poll=1.0):
     threading.Thread(target=watch, name="act3-cancel", daemon=True).start()
 
 
+def act3_exit_130_on_cancel():
+    """A cancel that reaches the top of the script (finally blocks already ran) ends it with 130, the conventional
+    "interrupted" code, and no traceback: a cancel is not a failure (ai_processing_server pm/cancel.mdx §4.2 C4)."""
+    prev = sys.excepthook
+
+    def hook(kind, value, tb):
+        if issubclass(kind, KeyboardInterrupt) and act3_cancelled():
+            print("ACT3_STAGE cancelled", flush=True)
+            sys.stdout.flush()
+            os._exit(130)
+        prev(kind, value, tb)
+
+    sys.excepthook = hook
+
+
+
+act3_watch_cancel()  # before the model load: a cancel during a multi-minute load is graceful too
+act3_exit_130_on_cancel()
+
 def stage(name):
     print(f"ACT3_STAGE {name}", flush=True)
 
@@ -300,7 +319,6 @@ def render():
     ).frames[0]
 
 
-act3_watch_cancel()
 stage("rendering")
 extra = {"image": first_frame(x.image, x.width, x.height)} if i2v else {}
 try:

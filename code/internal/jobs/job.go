@@ -207,6 +207,8 @@ type Job struct {
 
 	// Stop is CANCEL MODE's report once a cancel stopped this job (pm/cancel.mdx §6).
 	Stop *StopReport `json:"stop,omitempty"`
+	// CancelledBy is who asked for the cancel ("production", "owner (local API)", ...).
+	CancelledBy string `json:"cancelled_by,omitempty"`
 }
 
 // Settlement is one pending queue outcome (scheduler/queue.go settleLocked, runSettlement).

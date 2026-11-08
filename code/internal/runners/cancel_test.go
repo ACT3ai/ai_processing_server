@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
+	"github.com/ACT3ai/ai_processing_server/internal/procs"
 	"github.com/ACT3ai/ai_processing_server/internal/snapshot"
 	"github.com/ACT3ai/ai_processing_server/internal/taskhost"
 )
@@ -66,15 +68,17 @@ func TestCancelModeEscalatesWhenTheTaskHostIsWedged(t *testing.T) {
 	t.Cleanup(func() { StopMargin, TreeVerifyWait = oldM, oldV })
 	dir := t.TempDir()
 	host, step := startGroup(t), startGroup(t)
+	hostAt, _ := procs.StartTime(host)
+	stepAt, _ := procs.StartTime(step)
 	b, _ := json.Marshal(taskhost.Task{RunVersion: 1, JobID: "w1", Argv: []string{"true"}, Output: filepath.Join(dir, "out.mp4"),
 		Cancel: &taskhost.CancelSpec{Profile: "fake", GraceSeconds: 0.2}})
 	os.WriteFile(filepath.Join(dir, taskhost.TaskFile), b, 0o600)
 	beat := func() {
-		b, _ := json.Marshal(taskhost.Heartbeat{PID: host, Boot: taskhost.BootID(), StartedAt: time.Now(), At: time.Now()})
+		b, _ := json.Marshal(taskhost.Heartbeat{PID: host, Boot: taskhost.BootID(), StartedAt: hostAt, At: time.Now()})
 		os.WriteFile(filepath.Join(dir, taskhost.HeartbeatFile), b, 0o600)
 	}
 	beat()
-	b, _ = json.Marshal(taskhost.Procs{HostPID: host, Groups: []taskhost.ProcStep{{Step: "task", PID: step}}})
+	b, _ = json.Marshal(taskhost.Procs{HostPID: host, Groups: []taskhost.ProcStep{{Step: "task", PID: step, StartedAt: stepAt}}})
 	os.WriteFile(filepath.Join(dir, taskhost.ProcsFile), b, 0o600)
 
 	rep := &stopRep{}
@@ -96,6 +100,10 @@ func TestGPUReleaseCheck(t *testing.T) {
 	old, oldW := gpuPIDs, GPUReleaseWait
 	t.Cleanup(func() { gpuPIDs, GPUReleaseWait = old, oldW })
 	GPUReleaseWait = 1500 * time.Millisecond
+	dir := t.TempDir()
+	b, _ := json.Marshal(taskhost.Procs{Groups: []taskhost.ProcStep{{Step: "upscale 1/2", PID: 4242, StartedAt: time.Now()}}})
+	os.WriteFile(filepath.Join(dir, taskhost.ProcsFile), b, 0o600)
+	tr := treeOf(dir)
 	calls := 0
 	gpuPIDs = func() ([]int, bool) {
 		calls++
@@ -104,19 +112,19 @@ func TestGPUReleaseCheck(t *testing.T) {
 		}
 		return nil, true
 	}
-	if got := waitGPUReleased([]int{4242}, GPUReleaseWait); got != "released" {
+	if got := waitGPUReleased(tr, GPUReleaseWait); got != "released" {
 		t.Fatalf("got %s", got)
 	}
 	gpuPIDs = func() ([]int, bool) { return []int{4242}, true }
-	if got := waitGPUReleased([]int{4242}, 300*time.Millisecond); got != "held" {
+	if got := waitGPUReleased(tr, 300*time.Millisecond); got != "held" {
 		t.Fatalf("got %s", got)
 	}
 	gpuPIDs = func() ([]int, bool) { return []int{999999}, true } // someone else's render on the same card
-	if got := waitGPUReleased([]int{4242}, 300*time.Millisecond); got != "released" {
+	if got := waitGPUReleased(tr, 300*time.Millisecond); got != "released" {
 		t.Fatalf("another job's process counted as ours: %s", got)
 	}
 	gpuPIDs = func() ([]int, bool) { return nil, false }
-	if got := waitGPUReleased([]int{4242}, time.Second); got != "not_checked" {
+	if got := waitGPUReleased(tr, time.Second); got != "not_checked" {
 		t.Fatalf("got %s", got)
 	}
 }
@@ -135,6 +143,11 @@ func TestEveryRenderTypeHasACancelProfile(t *testing.T) {
 		"ltx_2_5":     ltxTask(vp, "", "", "out.mp4", 832, 480, 81),
 		"kandinsky_6": kandinskyTask(snap, Env{}, vp, "", "out.mp4", 832, 480, 81),
 	}
+	h3, err := h3Task(snap, Env{WorkDir: t.TempDir()}, vp, map[string]string{}, filepath.Join(t.TempDir(), "out.mp4"), 1280, 720)
+	if err != nil {
+		t.Fatalf("h3Task: %v", err)
+	}
+	cases["minimax_h3"] = h3
 	for want, task := range cases {
 		if task.Cancel.Name != want || task.Cancel.Grace <= 0 {
 			t.Errorf("%s: cancel profile %+v", want, task.Cancel)
@@ -167,5 +180,61 @@ func TestCancelModeForcesARenderThatIgnoresTheStop(t *testing.T) {
 	}
 	if r.Seconds < ProfileFake.Grace.Seconds() {
 		t.Fatalf("stopped in %.1f s, before its %.0f s grace", r.Seconds, ProfileFake.Grace.Seconds())
+	}
+}
+
+// C-R6 (CTO review M1): an ENDED step's pid is never signalled again, and a pid that now belongs to another process
+// (reused: its start time does not match ours) is never killed or counted.
+func TestPidReuseIsNeverKilled(t *testing.T) {
+	stranger := startGroup(t) // an unrelated process that happens to hold a pid we once recorded
+	dir := t.TempDir()
+	ended := time.Now().Add(-time.Hour)
+	b, _ := json.Marshal(taskhost.Procs{Groups: []taskhost.ProcStep{
+		{Step: "cut 1/3", PID: stranger, StartedAt: time.Now().Add(-2 * time.Hour), EndedAt: &ended}, // ended long ago
+		{Step: "upscale 1/3", PID: stranger, StartedAt: time.Now().Add(-time.Hour)},                  // start time differs
+	}})
+	os.WriteFile(filepath.Join(dir, taskhost.ProcsFile), b, 0o600)
+	tr := treeOf(dir)
+	if a := tr.alive(); len(a) != 0 {
+		t.Fatalf("a reused pid counted as ours: %v", a)
+	}
+	tr.kill()
+	time.Sleep(200 * time.Millisecond)
+	if syscall.Kill(stranger, 0) != nil {
+		t.Fatal("cancel mode killed an unrelated process that reused a recorded pid")
+	}
+}
+
+// C-R7 (CTO review M4): a child that left the step's process group (setsid: a private model server) is found and
+// killed: by procs.Run's descendant snapshot taken when the cancel arrives (any Unix), and by its ACT3_RUN_DIR marker
+// (Linux). The stop report counts it.
+func TestEscapedChildIsKilled(t *testing.T) {
+	env, job := setupFake(t)
+	_ = env
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	tk := taskhost.Task{RunVersion: 1, JobID: job.ID, Snapshot: "test", Output: filepath.Join(dir, "out.mp4"),
+		Cancel: &taskhost.CancelSpec{Profile: "fake", GraceSeconds: 0.5},
+		Argv:   []string{"/bin/sh", "-c", `python3 -c "import os,time; os.setsid(); open('` + pidFile + `','w').write(str(os.getpid())); time.sleep(60)" & sleep 60`}}
+	if err := taskhost.Launch(HostCommand(snapshot.Snapshot{}), dir, tk); err != nil {
+		t.Fatal(err)
+	}
+	var child int
+	for i := 0; i < 50 && child == 0; i++ {
+		time.Sleep(100 * time.Millisecond)
+		b, _ := os.ReadFile(pidFile)
+		child, _ = strconv.Atoi(string(b))
+	}
+	if child == 0 {
+		t.Fatal("the setsid child never started")
+	}
+	t.Cleanup(func() { syscall.Kill(child, syscall.SIGKILL) })
+	rep := &stopRep{}
+	r := stopTask(dir, rep)
+	if syscall.Kill(child, 0) == nil {
+		t.Fatalf("the escaped child %d survived the cancel: %+v", child, r)
+	}
+	if !r.TreeVerified || r.EscapedKilled < 1 {
+		t.Fatalf("stop report %+v", r)
 	}
 }

@@ -527,7 +527,10 @@ func (s *Server) settleLocked(j *jobs.Job, retryable bool) {
 		ev.Outputs, _ = json.Marshal(publicOutputs(j.Outputs))
 		ev.Result = j.Result
 	case jobs.Cancelled:
-		st.State, ev.Type, ev.By = queue.StateCancelled, "cancelled", strings.TrimPrefix(j.LastErr, "cancelled by ")
+		st.State, ev.Type, ev.By = queue.StateCancelled, "cancelled", j.CancelledBy
+		if ev.By == "" { // a record from before 2026-11-08
+			ev.By = strings.TrimSuffix(strings.TrimPrefix(j.LastErr, "cancelled by "), " before it started")
+		}
 		if j.Stop != nil { // CANCEL MODE's proof that the work stopped (pm/cancel.mdx §6): the caller can show it
 			ev.Note = j.Stop.Summary()
 			ev.Result, _ = json.Marshal(map[string]any{"stop": j.Stop})

@@ -16,6 +16,7 @@ import (
 	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/logging"
+	"github.com/ACT3ai/ai_processing_server/internal/procs"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
 	"github.com/ACT3ai/ai_processing_server/internal/storage"
 )
@@ -65,18 +66,6 @@ func (s *Server) execute(ctx context.Context, cancel context.CancelCauseFunc, jo
 		env := runners.Env{WorkDir: workDir, OutDir: outDir, Inputs: map[string]string{}, Slot: *job.Slot,
 			Engines: engines, MinFreeRAMGB: s.cfg.Limits.RAMFloorGB, Logger: s.log.With("ctx", "runner."+def.Runner, "job_id", job.ID, "service", job.Type)}
 		rep.Log(fmt.Sprintf("attempt %d of %s on %s (timeout %s)", job.Retried+1, job.Type, job.Slot.ID, timeout))
-		if ctx.Err() != nil {
-			// Cancelled before it started here (a pending cancel, Server.Cancel). A runner that re-attaches may still
-			// have a task host rendering from before a restart: hand it the cancelled context without staging, so
-			// CANCEL MODE stops that render, verifies it and cleans up (pm/cancel.mdx §5.6). Nothing is uploaded.
-			if ra, ok := runner.(runners.Reattacher); ok && ra.Reattachable() {
-				stage = jobs.StageRunning
-				if _, rerr := runner.Run(ctx, job, env, rep); rerr != nil && !errors.Is(rerr, context.Canceled) {
-					rep.Log("cancel mode: " + rerr.Error())
-				}
-			}
-			return context.Cause(ctx)
-		}
 		if err := runner.Check(ctx, job, env); err != nil {
 			return err
 		}
@@ -155,6 +144,17 @@ func (s *Server) execute(ctx context.Context, cancel context.CancelCauseFunc, jo
 		return
 	}
 	kind, msg := classify(ctx, err)
+	if kind == jobs.KindCancelled && j.Stop == nil {
+		// A runner without a task host (ffmpeg, compute, render test): what procs.Run said is the truth (forced after
+		// its grace; a process outside the group that kept the pipes means the stop is NOT verified).
+		j.Stop = s.plainStopLocked(j, stage, true, time.Now().UTC())
+		j.Stop.How, j.Stop.Forced = "in_process", errors.Is(err, procs.ErrForcedKill)
+		j.Stop.Graceful = !j.Stop.Forced
+		if errors.Is(err, procs.ErrPipesHeld) {
+			j.Stop.TreeVerified = false
+			j.Stop.Problems = append(j.Stop.Problems, procs.ErrPipesHeld.Error())
+		}
+	}
 	recordUnexpected(job, kind, stage, msg, err)
 	rep.Log(fmt.Sprintf("failed in %s: %s: %s", stage, kind, msg))
 	s.finishLocked(j, jobs.Archived, kind, stage, msg, &def.Retry.RetryOn)
@@ -228,6 +228,10 @@ func (s *Server) finishLocked(j *jobs.Job, st jobs.State, kind jobs.ErrorKind, s
 			j.Stop = s.plainStopLocked(j, stage, wasActive, now)
 		}
 		delete(s.cancelAsked, j.ID)
+		if by, ok := s.cancelBy[j.ID]; ok {
+			delete(s.cancelBy, j.ID)
+			j.CancelledBy = by
+		}
 		j.Move(jobs.Cancelled, jobs.StageCancelled, msg)
 		s.stats.Cancelled[j.Type]++
 		s.log.Info("job cancelled", "job_id", j.ID, "service", j.Type, "stop", j.Stop.Summary())
@@ -397,8 +401,12 @@ func (s *Server) plainStopLocked(j *jobs.Job, stage jobs.Stage, wasActive bool, 
 	if prof == "" {
 		prof = j.Type
 	}
-	return &jobs.StopReport{Profile: prof, Stage: string(stage), AskedAt: asked, StoppedAt: now,
-		Seconds: now.Sub(asked).Seconds(), Graceful: wasActive && stage != jobs.StageStaging, TreeVerified: true, GPU: "not_checked"}
+	how := "not_started"
+	if wasActive && stage != jobs.StageStaging {
+		how = "in_process"
+	}
+	return &jobs.StopReport{Profile: prof, Stage: string(stage), AskedAt: asked, StoppedAt: now, How: how,
+		Seconds: now.Sub(asked).Seconds(), Graceful: how == "in_process", TreeVerified: true, GPU: "not_checked"}
 }
 
 func (r *reporter) Log(line string) {

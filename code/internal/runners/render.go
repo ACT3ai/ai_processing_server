@@ -167,7 +167,7 @@ func (r Render) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporter) (
 			Args: []string{"-hide_banner", "-y", "-framerate", strconv.Itoa(p.FPS), "-i", filepath.Join(framesDir, "frame_%04d.png"),
 				"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
 				"-progress", "pipe:1", "-nostats", video},
-			GPU: env.Slot.GPU,
+			GPU: env.Slot.GPU, Grace: ProfileFFmpeg.Grace,
 			Stdout: func(line string) {
 				if v, ok := strings.CutPrefix(line, "frame="); ok {
 					if n, err := strconv.Atoi(v); err == nil {

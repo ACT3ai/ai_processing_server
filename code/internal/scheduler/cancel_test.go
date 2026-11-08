@@ -1,3 +1,5 @@
+//go:build !windows
+
 package scheduler
 
 // CANCEL MODE in the scheduler (pm/cancel.mdx §5.6, §6, §11 tests C-S1..C-S4).
@@ -6,14 +8,17 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/ACT3ai/ai_processing_server/internal/config"
 	"github.com/ACT3ai/ai_processing_server/internal/hardware"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
+	"github.com/ACT3ai/ai_processing_server/internal/procs"
 	"github.com/ACT3ai/ai_processing_server/internal/queue"
 	"github.com/ACT3ai/ai_processing_server/internal/queue/queuetest"
 	"github.com/ACT3ai/ai_processing_server/internal/runners"
@@ -24,7 +29,6 @@ import (
 type stopRunner struct{ started chan struct{} }
 
 func (stopRunner) Name() string                                        { return "stopper" }
-func (stopRunner) Reattachable() bool                                  { return true }
 func (stopRunner) Check(context.Context, *jobs.Job, runners.Env) error { return nil }
 func (r stopRunner) Run(ctx context.Context, _ *jobs.Job, _ runners.Env, rep runners.Reporter) (*runners.Result, error) {
 	close(r.started)
@@ -117,16 +121,28 @@ func TestMissedCancelIsAppliedByReconcile(t *testing.T) {
 }
 
 // C-S3: a job cancelled while it waits for a slot, whose task host is already rendering (re-adopted after a
-// restart), is NOT finished on the spot (that would orphan the render): its task host gets the cancel file now, and
-// the job is cancelled the moment it starts, so the runner verifies the stop.
-func TestCancelOfAWaitingJobWithALiveTaskHostIsPending(t *testing.T) {
+// restart), is stopped WITHOUT a slot and never started (CTO review M5): the run directory is stopped directly,
+// verified and removed, and only then is the job finished.
+func TestCancelOfAWaitingJobWithALiveTaskHostStopsItWithoutASlot(t *testing.T) {
+	oldM := runners.StopMargin
+	runners.StopMargin = 300 * time.Millisecond
+	t.Cleanup(func() { runners.StopMargin = oldM })
 	q := queuetest.NewMem()
-	s, r := newCancelServer(t, q, "c2")
+	s, _ := newCancelServer(t, q, "c2")
 	dir := filepath.Join(s.opt.StateDir, "runs", runners.RunDirName("c2"))
 	os.MkdirAll(dir, 0o700)
-	b, _ := json.Marshal(taskhost.Task{RunVersion: 1, JobID: "c2", Argv: []string{"true"}, Output: filepath.Join(dir, "out.mp4")})
+	host := exec.Command("/bin/sh", "-c", `trap "" INT TERM; sleep 60`) // a task host that never stops by itself
+	host.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := host.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go host.Wait()
+	t.Cleanup(func() { syscall.Kill(-host.Process.Pid, syscall.SIGKILL) })
+	at, _ := procs.StartTime(host.Process.Pid)
+	b, _ := json.Marshal(taskhost.Task{RunVersion: 1, JobID: "c2", Argv: []string{"true"}, Output: filepath.Join(dir, "out.mp4"),
+		Cancel: &taskhost.CancelSpec{Profile: "fake", GraceSeconds: 0.2}})
 	os.WriteFile(filepath.Join(dir, taskhost.TaskFile), b, 0o600)
-	b, _ = json.Marshal(taskhost.Heartbeat{PID: os.Getpid(), Boot: taskhost.BootID(), StartedAt: time.Now(), At: time.Now()})
+	b, _ = json.Marshal(taskhost.Heartbeat{PID: host.Process.Pid, Boot: taskhost.BootID(), StartedAt: at, At: time.Now()})
 	os.WriteFile(filepath.Join(dir, taskhost.HeartbeatFile), b, 0o600)
 
 	if _, err := s.Cancel("c2", "staff"); err != nil {
@@ -135,14 +151,23 @@ func TestCancelOfAWaitingJobWithALiveTaskHostIsPending(t *testing.T) {
 	if st, _ := jobState(s, "c2"); st == jobs.Cancelled {
 		t.Fatal("finished at once: the live task host would be orphaned")
 	}
-	if _, err := os.Stat(filepath.Join(dir, taskhost.CancelFile)); err != nil {
-		t.Fatal("the task host was not told to stop")
-	}
 	s.mu.Lock()
-	s.startLocked(s.jobs["c2"], jobs.Slot{ID: "gpu0"})
+	_, stopping := s.cancelPending["c2"]
 	s.mu.Unlock()
-	<-r.started
-	waitFor(t, "the pending cancel to stop the job", func() bool { st, _ := jobState(s, "c2"); return st == jobs.Cancelled })
+	if !stopping {
+		t.Fatal("not marked as stopping: admit could start it")
+	}
+	waitFor(t, "the run directory to be stopped and the job cancelled", func() bool { st, _ := jobState(s, "c2"); return st == jobs.Cancelled })
+	_, stop := jobState(s, "c2")
+	if stop == nil || !stop.Escalated || !stop.TreeVerified {
+		t.Fatalf("stop report %+v", stop)
+	}
+	if syscall.Kill(host.Process.Pid, 0) == nil {
+		t.Fatal("the task host survived")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("run directory kept after a verified stop")
+	}
 }
 
 // C-S4: a waiting job with no task host is cancelled at once, and its stop report says it never started.

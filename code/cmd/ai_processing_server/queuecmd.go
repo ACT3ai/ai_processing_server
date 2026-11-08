@@ -359,8 +359,8 @@ func cancelOne(c *client, p paths, id string) error {
 	}
 	t0 := time.Now()
 	last := ""
-	// CANCEL MODE may take a render type's grace (up to 45 s) plus a margin, or up to its 3-minute hard cap when the
-	// controller has to kill a wedged task host (pm/cancel.mdx §5): wait past that.
+	// CANCEL MODE may take a render type's grace (up to 45 s) plus a margin, or ~4 min 45 s when the controller has
+	// to kill a wedged task host (pm/cancel.mdx §5): wait past that.
 	for time.Since(t0) < cancelWait {
 		if route == "queue" {
 			if c.call("GET", "/v1/queue/jobs/"+esc, &qj) == nil {
@@ -388,8 +388,9 @@ func cancelOne(c *client, p paths, id string) error {
 		"(see: ai_processing_server queue show %s)", orDash(last), cancelWait, id)
 }
 
-// cancelWait: StopHardCap (3 min) plus the longest grace and margins.
-const cancelWait = 4 * time.Minute
+// cancelWait covers cancel mode's worst case (pm/cancel.mdx §5): the 62 s first wait, the 3-minute escalation cap,
+// 10 s of tree verification and 30 s of GPU release, about 4 min 45 s, plus margin.
+const cancelWait = 6 * time.Minute
 
 // printStop prints CANCEL MODE's report: one sentence, then any problems on their own lines.
 func printStop(r *jobs.StopReport) {

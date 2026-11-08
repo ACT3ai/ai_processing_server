@@ -274,6 +274,21 @@ def act3_watch_cancel(poll=1.0):
     threading.Thread(target=watch, name="act3-cancel", daemon=True).start()
 
 
+def act3_exit_130_on_cancel():
+    """A cancel that reaches the top of the script (finally blocks already ran) ends it with 130, the conventional
+    "interrupted" code, and no traceback: a cancel is not a failure (ai_processing_server pm/cancel.mdx §4.2 C4)."""
+    prev = sys.excepthook
+
+    def hook(kind, value, tb):
+        if issubclass(kind, KeyboardInterrupt) and act3_cancelled():
+            print("ACT3_STAGE cancelled", flush=True)
+            sys.stdout.flush()
+            os._exit(130)
+        prev(kind, value, tb)
+
+    sys.excepthook = hook
+
+
 def write_video(frames_u8, path, rate, src, has_audio):
     n, h, w, _ = frames_u8.shape
     tmp = path + ".noaudio.mp4"
@@ -398,6 +413,8 @@ def main():
     ap.add_argument("--sparse-ratio", type=float, default=2.0)  # upstream: 1.5 faster, 2.0 more stable
     ap.add_argument("--local-range", type=int, default=11)      # upstream: 9 sharper, 11 more stable
     a = ap.parse_args()
+    act3_watch_cancel()
+    act3_exit_130_on_cancel()
     if DEVICE == "cuda" and not torch.cuda.is_available():
         sys.exit("PyTorch does not see a CUDA GPU")
     if DEVICE == "mps" and not torch.backends.mps.is_available():

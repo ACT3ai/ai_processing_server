@@ -53,7 +53,16 @@ type Spec struct {
 	// (Setpgid), so the task host records it in procs.json and the controller can kill the group if the task host
 	// itself is wedged (pm/cancel.mdx §5.3).
 	OnStart func(pid int)
+	// JobName (Windows) runs the step in a named Job Object (job_windows.go) so the controller can list and kill its
+	// whole tree by name; ignored elsewhere.
+	JobName string
+	// OnEscaped is told how many processes that had left the step's process group were killed after the stop.
+	OnEscaped func(n int)
 }
+
+// ErrPipesHeld is wrapped into Run's error when the tree was killed but a process that left it still held the output
+// pipes when PipeDrainWait ran out: the stop could not be confirmed (pm/cancel.mdx §5.4).
+var ErrPipesHeld = errors.New("a process outside the group still held the output pipes")
 
 // Run starts the command and waits. Cancelling ctx stops the process tree; the returned error then wraps ctx.Err().
 func Run(ctx context.Context, s Spec) error {
@@ -92,9 +101,14 @@ func Run(ctx context.Context, s Spec) error {
 		return fmt.Errorf("start %s: %w", s.Name, err)
 	}
 	lowerPriority(cmd)
-	if s.OnStart != nil && cmd.Process != nil {
-		s.OnStart(cmd.Process.Pid)
+	var job *jobHandle
+	if cmd.Process != nil {
+		job = attachJob(cmd.Process.Pid, s.JobName)
+		if s.OnStart != nil {
+			s.OnStart(cmd.Process.Pid)
+		}
 	}
+	defer job.release()
 	wg.Add(2)
 	go pipe(stdout, s.Stdout)
 	go pipe(stderr, s.Stderr)
@@ -106,9 +120,23 @@ func Run(ctx context.Context, s Spec) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		pid := cmd.Process.Pid
+		snap := descendants(pid) // before any signal: an escaped child is still a descendant now
+		escaped := func() {
+			if n := killEscaped(snap); n > 0 {
+				elog.Warn("killed processes that had left the stopped step's process group", fmt.Errorf("%d process(es)", n), "process", s.Name)
+				if s.OnEscaped != nil {
+					s.OnEscaped(n)
+				}
+			}
+		}
 		if errors.Is(context.Cause(ctx), ErrKillNow) {
 			killGroup(cmd)
-			waitDrained(done, s.Name)
+			job.terminate()
+			escaped()
+			if !waitDrained(done, s.Name, stdout, stderr) {
+				return fmt.Errorf("%s stopped: %w: %w", s.Name, ErrPipesHeld, context.Cause(ctx))
+			}
 			return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
 		}
 		grace := s.Grace
@@ -116,25 +144,63 @@ func Run(ctx context.Context, s Spec) error {
 			grace = GraceBeforeKill
 		}
 		interruptGroup(cmd)
-		select {
-		case <-done:
-			return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
-		case <-time.After(grace):
-			killGroup(cmd)
-			waitDrained(done, s.Name)
-			return fmt.Errorf("%s stopped: %w: %w", s.Name, ErrForcedKill, context.Cause(ctx))
+		// Graceful = the step's own process group ended within the grace. An escaped child may keep the output pipes
+		// open, so `done` alone cannot tell: the group's liveness is watched too.
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
+		forced := false
+	wait:
+		for {
+			select {
+			case <-done:
+				escaped()
+				return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
+			case <-tick.C:
+				if !groupAlive(pid) {
+					break wait
+				}
+			case <-timer.C:
+				killGroup(cmd)
+				forced = true
+				break wait
+			}
 		}
+		job.terminate()
+		escaped()
+		drained := waitDrained(done, s.Name, stdout, stderr)
+		switch {
+		case forced && !drained:
+			return fmt.Errorf("%s stopped: %w: %w: %w", s.Name, ErrForcedKill, ErrPipesHeld, context.Cause(ctx))
+		case forced:
+			return fmt.Errorf("%s stopped: %w: %w", s.Name, ErrForcedKill, context.Cause(ctx))
+		case !drained:
+			return fmt.Errorf("%s stopped: %w: %w", s.Name, ErrPipesHeld, context.Cause(ctx))
+		}
+		return fmt.Errorf("%s stopped: %w", s.Name, context.Cause(ctx))
 	}
 }
 
-// waitDrained waits for the process to be reaped and its pipes to close, at most PipeDrainWait.
-func waitDrained(done <-chan error, name string) {
+// waitDrained waits for the process to be reaped and its pipes to close, at most PipeDrainWait. When that runs out (a
+// child that left the group holds the pipes), it closes our ends of the pipes so the readers stop and cmd.Wait reaps
+// the killed process: nothing leaks in a long-lived controller. False: the pipes were still held.
+func waitDrained(done <-chan error, name string, pipes ...io.Closer) bool {
 	select {
 	case <-done:
+		return true
 	case <-time.After(PipeDrainWait):
-		elog.Warn("a killed process tree still holds its output pipes open (a child left the process group); "+
-			"returning without them", errors.New(name), "process", name)
 	}
+	elog.Warn("a killed process tree still holds its output pipes open (a child left the process group); "+
+		"closing them and returning", errors.New(name), "process", name)
+	for _, p := range pipes {
+		_ = p.Close()
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+	return false
 }
 
 // GroupAlive reports whether any process of the process group pgid still exists (Unix), or the process pid
