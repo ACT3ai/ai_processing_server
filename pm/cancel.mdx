@@ -15,7 +15,8 @@ task_queue.mdx §16.5 and task_authoring.mdx R9/R10, which now point here. */}
 # Cancel mode: stopping a render on a render server, verifiably
 
 **Owner:** CTO · **As of:** 2026-11-08 · **Status:** built and tested on branch `bryan/feat/cancel-mode-20261108_1124`
-(§11 lists every test). Product side: [render_queue/cancel/](~/BGit/all/film/pm/subp/render_queue/cancel/cancel.mdx).
+(§11 lists every test), revised after a CTO review the same day (§19). Product side:
+`~/BGit/all/film/pm/subp/render_queue/cancel/cancel.mdx`.
 
 ## Contents
 
@@ -34,14 +35,19 @@ task_queue.mdx §16.5 and task_authoring.mdx R9/R10, which now point here. */}
 12. [Operations](#12-operations)
 13. [Decisions](#13-decisions)
 14. [Code map](#14-code-map)
+15. [Timing: the one table](#15-timing-the-one-table)
+16. [Rollout and mixed versions](#16-rollout-and-mixed-versions)
+17. [Observability](#17-observability)
+18. [Security](#18-security)
+19. [Review log](#19-review-log)
 
 ## 1. Goal
 
 When a person cancels a render job in ACT3, the render on our own server **stops for real, soon, and provably**:
 
 * **G1 Stops.** Every process the render started is gone: Python, ffmpeg, a private model server, their children.
-* **G2 Soon.** Within the render type's grace (≤ 45 s) plus ~15 s in the normal case; within 3 minutes even when the
-  task host itself is wedged.
+* **G2 Soon.** Within the render type's grace (≤ 45 s) plus ~15 s in the normal case; within ~4 min 45 s even when
+  the task host itself is wedged (§15).
 * **G3 Provably.** The server checks that the processes are gone and that NVIDIA GPU memory is released, and says so
   in a **stop report** that reaches ACT3 production.
 * **G4 Clean.** Nothing the render wrote stays on disk: inputs, segments, checkpoints, scratch, the partial output.
@@ -166,7 +172,7 @@ compile caches live under the temp directory, so every job would recompile from 
 | File | Written by | Content |
 | --- | --- | --- |
 | `cancel` | controller (`taskhost.Cancel`), CLI, sweep | RFC 3339 time of the first ask. Never rewritten. |
-| `procs.json` (new) | task host, at every step start (`procs.Spec.OnStart`) | `{host_pid, boot, groups:[{step, pid, started_at}]}`: every process group it started. On Unix a step's pid is its process group id. |
+| `procs.json` (new) | task host, at every step start and end (`procs.Spec.OnStart`) | `{host_pid, boot, groups:[{step, pid, started_at, job_name, ended_at}]}`: every step's process (on Unix its pid is its process group id; on Windows `job_name` is its Job Object). `ended_at` is set when the step exits (its group is then killed for leftovers, identity-checked); an ended step's pid is never signalled again. |
 | `exit.json` `stop` (new) | task host | `{asked_at, seen_at, exited_at, step, steps_done, steps_total, grace_seconds, forced}`. |
 | `task.json` `cancel` (new) | controller at launch | `{profile, grace_seconds}`; per-step `grace_seconds` overrides (ffmpeg steps). A task.json from an older controller has none: grace falls back to `procs.GraceBeforeKill` (10 s), profile "task". |
 
@@ -200,26 +206,53 @@ the job's slot until the runner returns, so the GPU is not handed to another job
 ### 5.3 Escalation: the controller kills the tree itself
 
 If no `exit.json` appears within `CancelPoll + max grace + StopMargin (15 s)` the task host is **wedged** (a disk
-stall, a hung kernel call, a bug). The controller then, every second until the tree is gone or `StopHardCap` (3 min):
+stall, a hung kernel call, a bug). The controller then, every second until the tree is gone or `StopHardCap` (3 min),
+kills the **tree** (§5.4): the task host's own process group, every live step group / Job Object, and every escaped
+process.
 
-1. kills the task host's own process group (its pid from heartbeat.json, only if the heartbeat is from this boot);
-2. kills every process group in `procs.json`;
-3. stops when `taskhost.Alive` is no longer Running and no group in `procs.json` answers signal 0.
+**Identity, never a bare pid (revised after review M1, M2).** The OS reuses pids. Every kill and every liveness check
+first confirms the process now holding the pid started when ours did (`procs.SameProcess`: Linux `/proc/<pid>/stat`
+start ticks + `btime`; macOS `ps -o lstart`; Windows `GetProcessTimes`; tolerance 10 s). The task host is identified by
+the pid and `started_at` in heartbeat.json (this boot only) — **not** by the heartbeat's age, so a host stalled on disk
+(no heartbeats) is still found, killed and verified. A process group whose leader is gone but whose members live is
+ours (the OS never reuses a pid that is a live group's id); a live leader with another start time is a reused pid and
+is never touched. Implemented in: `~/BGit/act3/ai_processing_server/code/internal/procs/identity.go` — `SameProcess`,
+`OurGroup`, `StartTime`; `taskhost.go` — `HostProcess`.
 
 Before 2026-11-08 the controller waited 30 s, then **removed the run directory and released the slot regardless**,
 so a wedged render kept the GPU while the next job was started on it, and its files were deleted under it.
 
 ### 5.4 Verify the tree is gone
 
-Every group in `procs.json` must fail signal 0 (`procs.GroupAlive`) within `TreeVerifyWait` (10 s); stragglers are
-killed again while waiting. Windows has no process groups: the step's root process must be gone (`taskkill /T /F`
-ends the tree by parentage). The result is `tree_verified`.
+The **tree** is everything the render may still have running (`runners.tree`):
+
+| Member | Unix | Windows |
+| --- | --- | --- |
+| Task host | pid + start time | pid + start time |
+| Each step not ended | its process group (`OurGroup`) | its named Job Object (`procs.JobPIDs`): every process the step started, whatever its parentage |
+| Escaped processes (left the group: setsid, a daemonising server) | (a) `procs.Run` snapshots every descendant by parentage **when the cancel arrives, before any signal**, and kills the ones still alive after the group is gone; (b) the controller sweeps descendants of the host and live steps, and on Linux every process carrying `ACT3_RUN_DIR=<run dir>` in its environment | the Job Object holds them |
+
+`tree_verified` = nothing in the tree is alive within `TreeVerifyWait` (10 s; stragglers are killed again while
+waiting). `escaped_killed` counts escapees, and a non-zero count is listed as a problem (it means a script leaves
+children behind).
+
+**Limits, stated plainly.** macOS hides other processes' environments (`ps -E` and `kern.procargs2` return none since
+recent releases), so on the Mac Studio an escaped child is found only by parentage: if its parent died **before** the
+cancel arrived, it was reparented to launchd and is not found. On Linux the marker sweep covers that case. Windows
+relies on the Job Object: a child started in the first milliseconds of a step, before the step is assigned to its job,
+would escape it (Python and ffmpeg start no child that early). Implemented in:
+`~/BGit/act3/ai_processing_server/code/internal/procs/procs.go` — `Run` (snapshot, `killEscaped`, group-liveness
+during the grace); `tree_unix.go` — `descendants`; `job_windows.go` — `attachJob`, `JobPIDs`, `KillJob`;
+`~/BGit/act3/ai_processing_server/code/internal/runners/cancel.go` — `tree`, `treeOf`, `finishStop`.
 
 ### 5.5 GPU memory release
 
 For a profile with `GPU: true`, on a machine with `nvidia-smi` (B5090, BPC, the Nepal servers), the controller polls
 `nvidia-smi --query-compute-apps=pid` for up to `GPUReleaseWait` (30 s) until no listed process belongs to the
-cancelled tree (its pid, or on Unix its process group, is in `procs.json`). Another job's process on the same card is
+cancelled tree (§5.4: a step pid, a member of a step's process group on Unix, a member of a step's Job Object on
+Windows, or an escaped process). **To verify on B5090 at the acceptance run:** whether `nvidia-smi` lists per-process
+pids under WDDM on a GeForce card; if it lists none, the check reads `released` trivially there and the Job Object
+verification (§5.4) is the real proof. Another job's process on the same card is
 not ours and does not hold the stop. Results: `released`, `held` (a problem, reported), `not_checked` (no NVIDIA
 tools: the Mac Studio and Mac towers, where Apple unified memory is freed with the process), `not_used`.
 
@@ -231,12 +264,13 @@ Four holes found and closed on 2026-11-08:
 | --- | --- | --- |
 | The JetStream control watch uses `UpdatesOnly()`: a flag set while the controller was down, or while the watch was broken (2 s reconnect, broker restart), was never delivered. | The render ran to completion. | `reconcileControl` reads `job_control` for every held job when the watch (re)starts and on every claim heartbeat (20 s). |
 | `readopt` (boot reclaim of a job whose task host is still rendering) never read `job_control`. | Cancel lost across a restart. | `readopt` reads the flag and cancels. |
-| A cancel of a job that is held but not yet started here finished it at once. For a re-adopted job its task host is still rendering. | The render was orphaned until the sweep killed it, unverified. | **Pending cancel:** the task host gets the cancel file at once; the job is cancelled the moment it starts, and `execute` hands a cancelled re-attachable job straight to its runner (no staging), so cancel mode verifies the stop. |
+| A cancel of a job that is held but not yet started here finished it at once. For a re-adopted job its task host is still rendering; a job in Retry may hold a dead host's checkpoints. | The render was orphaned until the sweep killed it, unverified. | **Stop without a slot (revised after review M5):** when the job's run directory exists (task host running, dead or finished), the job is marked stopping (`cancelPending`; `admit` skips it, so it is never started), and `runners.StopRunDir` runs cancel mode on the directory directly — no slot is needed because the render already occupies the hardware — and the job is finished CANCELLED with the stop report when it returns. Nothing is ever launched or relaunched for a cancelled job (the first version started the job to let its runner stop it, which could relaunch a dead host from its checkpoints). |
 | The CLI or a previous controller wrote the cancel file; the runner found `exit.json` with `cancelled`. | Run directory removed, nothing verified. | `stopFromExit` verifies the tree and GPU and reports. |
 
 Implemented in: `~/BGit/act3/ai_processing_server/code/internal/scheduler/queue.go` — `reconcileControl`, `controlLoop`,
-`heartbeatLoop`, `readopt`; `server.go` — `Server.Cancel` (pending), `startLocked`, `runDirOf`; `execute.go` — `execute`
-(cancelled re-attachable job); `~/BGit/act3/ai_processing_server/code/internal/runners/cancel.go` — `stopFromExit`.
+`heartbeatLoop`, `readopt`; `server.go` — `Server.Cancel` (file I/O outside the lock), `noteCancelLocked`, `admit`
+(skips stopping jobs), `runDirOf`; `~/BGit/act3/ai_processing_server/code/internal/runners/cancel.go` — `StopRunDir`,
+`stopFromExit`.
 
 ### 5.7 Cancel at each lifecycle stage
 
@@ -244,7 +278,7 @@ Implemented in: `~/BGit/act3/ai_processing_server/code/internal/scheduler/queue.
 | --- | --- | --- |
 | QUEUED, nobody holds it | `cancelWaiting`: job_state → CANCELLED, final `cancelled` event; the WORK message is acked when pulled. | No |
 | Held, waiting for a slot, no task host | Finished at once; stop report "stopped before it started rendering". | No |
-| Held, waiting, task host rendering (re-adopted) | Pending cancel (§5.6). | No |
+| Held, waiting, a run directory exists (re-adopted host, or Retry checkpoints) | Stopped without a slot (§5.6). | No |
 | STAGING (downloading inputs) | `storage.Fetch` aborts on the context; the work dir is removed. | No |
 | RUNNING, task-host runner | Cancel mode (§5.1–5.5). | No |
 | RUNNING, in-process / `procs.Run` runner (ffmpeg transcode, compute) | `procs.Run` interrupts, waits its grace, kills, reaps before returning; `plainStopLocked` writes the report. | No |
@@ -262,9 +296,11 @@ passed by the render-server agent to production (`release.stop`).
 | `profile` | Render type (§8), "task" for an old task.json, the runner name for in-process runners. |
 | `stage`, `step`, `steps_done`, `steps_total` | Where it was ("upscale 3/7"). |
 | `asked_at`, `seen_at`, `stopped_at`, `seconds` | When the cancel reached this server, when the task host saw it, when the last process was gone; asked → stopped. |
+| `how` | One word: `graceful`, `forced`, `escalated`, `host_gone` (the task host had already died), `not_started`, `in_process` (ffmpeg/compute: what `procs.Run` reported, including a forced kill or pipes held by an escaped process). |
 | `grace_seconds`, `graceful`, `forced`, `escalated` | How it stopped (§5.2, §5.3). |
+| `escaped_killed` | Processes that had left the group and were killed separately (§5.4). |
 | `tree_verified` | §5.4. |
-| `gpu` | `released` / `held` / `not_checked` / `not_used` (§5.5). |
+| `gpu` | `released` / `held` / `not_checked` (printed "GPU not checked (no NVIDIA tools here)") / `not_used` (§5.5). |
 | `scratch_bytes_removed`, `run_dir_kept` | §7. |
 | `problems[]` | Anything that went wrong while stopping. |
 
@@ -360,15 +396,19 @@ All pass on 2026-11-08 (`cd code && GOWORK=off go test ./...`).
 | C-R5 | `TestCancelModeForcesARenderThatIgnoresTheStop` | `FAKE_IGNORE_STOP`: forced after the fake grace, tree verified. |
 | C-S1 | `scheduler/cancel_test.go TestMissedCancelIsAppliedByReconcile` | A flag the watch never delivered stops the running job; stop report on the record. |
 | C-S2 | (same test) | Final event `cancelled`, `by` = who asked (not "the machine owner"), note + `result.stop`; job_state CANCELLED; never `requeued`. |
-| C-S3 | `TestCancelOfAWaitingJobWithALiveTaskHostIsPending` | No orphaned render: cancel file written, job not finished until it starts, then stopped through the runner. |
+| C-S3 | `TestCancelOfAWaitingJobWithALiveTaskHostStopsItWithoutASlot` | A waiting job whose wedged task host renders is never started: stopped directly (escalated), verified, run dir removed, then finished. |
+| C-R6 | `runners/cancel_test.go TestPidReuseIsNeverKilled` | An ended step's pid and a pid now owned by a process with another start time are never killed or counted. |
+| C-R7 | `TestEscapedChildIsKilled` | A `setsid` child of a step (a private-server stand-in) is killed by the descendant snapshot; `escaped_killed` ≥ 1; runs on macOS. |
 | C-S4 | `TestCancelOfAWaitingJobFinishesAtOnce` | A waiting job with no task host ends at once, "before it started rendering". |
 | C-PY | `~/BGit/all/film/code/subp/video_gen_ai/nvidia/h3_regenerate_2k/__tests__/test_render_h3_regenerate.py CancelModeTest` | H3: a cancel exits 130 with no ACT3_ERROR; an interrupt without a cancel is still internal. |
+| C-PY2 | smoke run of the shared watcher + `act3_exit_130_on_cancel` block (2026-11-08) | The cancel file → `ACT3_STAGE cancelled` → `finally` ran → exit 130. Wan/Kandinsky/FlashVSR model paths run only with weights: acceptance run. |
+| — | Windows code paths (Job Objects, `GetProcessTimes`) | Compiled and vetted (`GOOS=windows go vet ./...`), **not run**: the acceptance run on B5090/BPC is required before relying on them (§12). |
 | G5 | `just render-test` (task_authoring.mdx §8 G5) | On a real render server: a SeedVR2 upscale cancelled mid-render ends CANCELLED, no task host or render process left. **Run on BMS and B5090 after deploy** (§12). |
 
 ## 12. Operations
 
 * Cancel from the shell on the render server: `ai_processing_server cancel <job_id>` (or `--prefix act3_<hash>_` for
-  every attempt). It now waits up to 4 minutes and prints `stopped [clean] …` or `stopped [NEEDS ATTENTION] …`.
+  every attempt). It now waits up to 6 minutes (§15) and prints `stopped [clean] …` or `stopped [NEEDS ATTENTION] …`.
 * See one job: `ai_processing_server queue show <job_id>` prints the stop report under `stopped`.
 * A `NEEDS ATTENTION` stop: read `~/T/ai_processing_server/error.err`; `nvidia-smi` for a held card; `ps -o pid,pgid,stat`
   for a process in state `D`; the kept run directory under `data/git_ignore/runs/<job_id>/` has task.log, procs.json and
@@ -391,7 +431,8 @@ All pass on 2026-11-08 (`cd code && GOWORK=off go test ./...`).
 
 ## 14. Code map
 
-* The verified stop (ask, wait, escalate, verify, GPU, clean, report) and the profiles — `~/BGit/act3/ai_processing_server/code/internal/runners/cancel.go` — `stopTask`, `stopFromExit`, `Profiles`, `waitGPUReleased`
+* The verified stop (ask, wait, escalate, verify, GPU, clean, report) and the profiles — `~/BGit/act3/ai_processing_server/code/internal/runners/cancel.go` — `stopTask`, `stopFromExit`, `StopRunDir`, `finishStop`, `tree`, `Profiles`, `waitGPUReleased`
+* Process identity, escaped children, Windows Job Objects — `~/BGit/act3/ai_processing_server/code/internal/procs/identity*.go`, `tree_unix.go`, `descendants.go`, `job_windows.go`
 * Where a render's context ending turns into cancel mode — `~/BGit/act3/ai_processing_server/code/internal/runners/oss.go` — `runDetached`, `launch`
 * Each render type's profile — `oss_upscale.go seedvr2Task`, `oss_flashvsr.go flashvsrTask`, `oss_video.go wanTask`, `oss_ltx.go ltxTask`, `oss_kandinsky.go kandinskyTask`, `oss_h3.go h3Task`, `oss_regenerate.go` (refine/finish task), `oss_segments.go segmentedSteps`, `oss.go fakeTask`
 * The task host's side (env, procs.json, cancel before a step, exit.json stop) — `~/BGit/act3/ai_processing_server/code/internal/taskhost/taskhost.go` — `host`, `Cancel`, `ReadProcs`, `HostPID`
@@ -400,3 +441,72 @@ All pass on 2026-11-08 (`cd code && GOWORK=off go test ./...`).
 * Scheduler: cancel, pending cancel, reconcile, report, event — `~/BGit/act3/ai_processing_server/code/internal/scheduler/server.go` (`Cancel`, `startLocked`), `execute.go` (`execute`, `finishLocked`, `reporter.Stopped`, `plainStopLocked`), `queue.go` (`reconcileControl`, `controlLoop`, `heartbeatLoop`, `readopt`, `settleLocked`, `QueueJob`)
 * API — `~/BGit/act3/ai_processing_server/code/internal/api/api.go` — `cancelBy`, `queueCancel`, `cancel`
 * CLI — `~/BGit/act3/ai_processing_server/code/cmd/ai_processing_server/queuecmd.go` — `cancelOne`, `queueShow`, `printStop`
+
+## 15. Timing: the one table
+
+Every number in this spec and in the product spec set comes from here.
+
+| Stage | Normal | Worst | Source |
+| --- | --- | --- | --- |
+| Task host sees the cancel file | ≤ 2 s | 2 s | `taskhost.CancelPoll` |
+| Step stops on its own (graceful) | 0–5 s | grace: 5 s ffmpeg, 15 s FlashVSR, 20 s diffusion, 45 s H3 paths | §8 |
+| Controller waits for exit.json | — | CancelPoll + max grace + 15 s = **62 s** (H3) | `StopMargin` |
+| Escalation (wedged host) | — | **180 s** | `StopHardCap` |
+| Tree verification | < 1 s | 10 s | `TreeVerifyWait` |
+| GPU release | < 2 s | 30 s | `GPUReleaseWait` |
+| **Cancel mode total** | **≈ 3–25 s** | **≈ 4 min 45 s** (62 + 180 + 10 + 30) | |
+| CLI `cancel` waits | | 6 min | `queuecmd.go cancelWait` |
+| Reconcile backstop for a missed watch | < 1 s | 20 s | `continuity.heartbeat` |
+
+The product side adds its own legs (production ≤ 1 s, agent ≤ one long poll, heartbeat backstop 10 s) and must keep
+a placement **stopping** for at least 8 minutes (> 4 min 45 s + the agent's legs) before it gives the server's capacity
+away: `~/BGit/all/film/pm/subp/render_queue/cancel/production.mdx` §2.
+
+## 16. Rollout and mixed versions
+
+Deploy order: **(1) appsrv** (accepts `release.stop`, keeps placements stopping, sends `generation`), **(2) this Go
+server** (`just update` on each render server), **(3) the render-server agent**, then the acceptance run. The task scripts
+reach render servers **only** through this repo: they are copied from ~/BGit/all by `code/scripts/sync_from_all.sh` and
+frozen into each snapshot, so a script fix ships with a Go `just update`.
+
+| Combination | Behaviour |
+| --- | --- |
+| Old agent → new Go | No `by` body (events say `owner (local API)`); no stop report forwarded. Cancel mode still runs fully on the server. |
+| New agent → old Go | No `stop` in answers (`stop` absent: the agent reports `goState` only). The old Go removes the run dir 30 s after the cancel whatever the processes do (the bug this spec fixes). |
+| Old task.json (render started before the update) | No `cancel` section: grace = 10 s, profile "task", no `procs.json` (no step groups to verify: only the host by pid and descendants), no Job Object. |
+| Old exit.json | No `stop` section: the report says graceful with no step details. |
+
+Rollback: `git checkout <previous tag> && just build && just restart` on the server; running renders keep their
+snapshot. No data migration is involved (new JSON fields are optional both ways).
+
+## 17. Observability
+
+* Logs: `job cancelled … stop=<sentence>` (INFO) in `~/_act3_logs/processing_server.info`; every unclean stop is an
+  `error.err` entry `cancel mode: the stop needs attention` with the sentence.
+* Telemetry counters (existing `stats`): `cancelled` per service. **To add** (follow-up, not built): stop seconds
+  histogram, `escalated`, `forced`, `escaped_killed`, `gpu_held`, `unverified` counters in the server's telemetry
+  record, so production's monitoring can alert without opening a job page.
+* Correlation: the Go task id `act3_<hash of the ACT3 job id>_[g<G>_]a<N>` and the envelope's `trace_id` (the ACT3 job
+  id) appear in every log line and the stop report travels back on the release.
+
+## 18. Security
+
+* The local API (`/v1/...`) requires the server's bearer token (`api.go` `auth`); only the render-server agent and the
+  operator CLI on the machine hold it.
+* `by` is caller-supplied text, cleaned to one line of ≤ 120 characters. It is **attribution, not authorization**:
+  whoever can call the API may cancel; production's audit (`params.cancellation.byUserId`) is the authority on which
+  person asked.
+* `job_control` writes need a broker account with permission on the bucket; callers are separated by broker accounts
+  (task_queue.mdx §15.2). A process on the broker with write access could cancel jobs: that is accepted and audited in
+  the `AUDIT` stream.
+* Kills are identity-checked (§5.3), so a cancel can never terminate a process that is not part of the render.
+
+## 19. Review log
+
+2026-11-08, CTO review (verdict on the first version: reject the product set; accept the Go spec with changes). Fixed in
+this version: M1 pid reuse (identity checks, ended steps), M2 host identity and verification, M3 Windows Job Objects +
+H3 CLI child killed in `finally`, M4 escaped children (descendant snapshot, marker sweep, honest limits), M5 slot-free
+stop of waiting jobs (never relaunch), M6 truthful in-process reports and ffmpeg grace, M7 problems and wording on
+every path; minors: timing table (§15), Wan watcher before load, exit 130 everywhere, profile test covers H3, `by`
+attribution, pipe leak, I/O under the lock, wording of `not_checked`. Product-side blockers (restart generation,
+stopping placement, release schema, late cloud results) are owned by the product spec set.
