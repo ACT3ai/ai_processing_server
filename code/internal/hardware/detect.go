@@ -84,6 +84,9 @@ type engineProbe struct {
 	extra    map[string][]string // GOOS → common install paths
 	args     []string
 	url      string // HTTP engines: health URL
+	// noRun: found by path only, never executed (the openai-whisper CLI takes ~10 s to print its help, past the
+	// probe timeout); its version reads "unknown"
+	noRun bool
 }
 
 var engineProbes = []engineProbe{
@@ -95,6 +98,12 @@ var engineProbes = []engineProbe{
 	}},
 	{name: "python", binaries: []string{"python3", "python"}, args: []string{"--version"}},
 	{name: "docker", binaries: []string{"docker"}, args: []string{"--version"}},
+	// openai-whisper's CLI (act3.transcription / wtc.transcription, runners/whisper.go); pip --user installs land in
+	// ~/.local/bin, which a launchd/systemd service PATH often lacks
+	{name: "whisper", binaries: []string{"whisper"}, noRun: true, extra: map[string][]string{
+		"darwin": {"~/.local/bin/whisper", "/opt/homebrew/bin/whisper"},
+		"linux":  {"~/.local/bin/whisper", "/usr/local/bin/whisper"},
+	}},
 	{name: "comfyui", url: "http://127.0.0.1:8188/system_stats"},
 }
 
@@ -111,6 +120,10 @@ func detectEngines(ctx context.Context, f *Facts, overrides map[string]string) {
 		path := findBinary(p, overrides[p.name])
 		if path == "" {
 			f.Engines[p.name] = nil
+			continue
+		}
+		if p.noRun {
+			f.Engines[p.name] = &Engine{Path: path, Version: "unknown"}
 			continue
 		}
 		out, err := run(ctx, path, p.args...)
@@ -152,8 +165,8 @@ func findBinary(p engineProbe, override string) string {
 		}
 	}
 	for _, c := range p.extra[runtime.GOOS] {
-		if _, err := os.Stat(c); err == nil {
-			return c
+		if _, err := os.Stat(expandHome(c)); err == nil {
+			return expandHome(c)
 		}
 	}
 	return ""

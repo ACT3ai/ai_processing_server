@@ -86,6 +86,7 @@
 * [ ] Task continuity (task_queue.mdx §9): detached task hosts, frozen code snapshots, re-adoption after restart, so `git pull` + restart never kills a running render. The v0.1 in-process runners do not survive a restart yet.
 * [ ] ACT3 / WTC submit through NATS (task_queue.mdx §20); `broker/httplease` is dropped (D-001 superseded).
 * [ ] Phase 4: runners `comfy`, `python`, `whisper`, `blender`; model cache; profiles b5090, bpc, bms.
+  * [x] `whisper` runner built 2026-11-18 (act3.transcription + wtc.transcription; openai-whisper CLI, not detached; ai_processing_server.mdx §8.1.1). Still to do: enable on BMS / BPC (human), whisper.cpp fallback.
 * [ ] JSON Schemas in `data/schemas/` for params (today each runner validates its params in Go).
 * [ ] `data/sites/sites.yaml` and the customer-data rule (§16.3).
 * [ ] GPU telemetry (nvidia-smi load, temperature) and the DEGRADED thermal guard (§12.4).
