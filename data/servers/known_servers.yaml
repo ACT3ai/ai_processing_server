@@ -25,7 +25,8 @@ servers:
     site: bryan_office
     local_mode: share
     # Reserved for Gen AI video and work that needs the 5090 (Bryan, 2026-11-06): CPU/ffmpeg tasks never run here.
-    services_off: [act3.upscale_finish, act3.transcode, act3.video_merge]
+    # act3.transcription (Whisper) is CPU/ffmpeg-class work too: never here (2026-11-18, ACT3 dialogue audio D3).
+    services_off: [act3.upscale_finish, act3.transcode, act3.video_merge, act3.transcription]
   - key: BPC
     display_name: "Bryan PC"
     match: { hostname: ["BRYAN-PC"], gpu_count_min: 2 }          # guess
@@ -58,6 +59,7 @@ servers:
     site: bryan_office
     local_mode: share
     services_on: [act3.upscale_finish]
+    services_off: [act3.transcription]                          # Whisper not installed or measured there (2026-11-18)
   - key: BMS
     display_name: "Bryan Mac Studio"
     servers_dir: Bryan_Mac_Studio
@@ -82,6 +84,7 @@ servers:
     family: office
     site: nepal_office
     local_mode: idle_only
+    services_off: [act3.transcription]                          # Whisper not installed or measured there (2026-11-18)
   - key: NPL2
     display_name: "Nepal 2"
     match: { hostname: ["NPL2", "nepal-2"] }                     # placeholder
@@ -89,6 +92,7 @@ servers:
     family: office
     site: nepal_office
     local_mode: idle_only
+    services_off: [act3.transcription]                          # Whisper not installed or measured there (2026-11-18)
   - key: NPL3
     display_name: "Nepal 3"
     match: { hostname: ["NPL3", "nepal-3"] }                     # placeholder
@@ -96,3 +100,4 @@ servers:
     family: office
     site: nepal_office
     local_mode: idle_only
+    services_off: [act3.transcription]                          # Whisper not installed or measured there (2026-11-18)

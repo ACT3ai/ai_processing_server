@@ -1,0 +1,18 @@
+schema_version: 1
+id: act3.transcription
+platform: act3
+title: "Dialogue transcription with word timestamps (Whisper)"
+# ACT3 dialogue audio (film/pm/subp/dialogue_audio/dialogue_audio.mdx §27, decision D3 2026-11-18): the words a
+# recorded dialogue clip speaks, with word timestamps, so the web app aligns them to the script's lines. 0 credits;
+# the web app records runtime_ms per job. Runner: code/internal/runners/whisper.go (also serves wtc.transcription).
+# Opt-in per machine (render_task.mdx §13 rule 1): BMS and BPC; off on B5090, BMTR and the Nepal machines.
+runner: whisper
+default_enabled: false
+requires:
+  engines: { whisper: "", ffmpeg: ">=6.0", ffprobe: ">=6.0" }
+  gpu: optional
+  compute: [cuda, metal, none]
+resources_per_job: { cpu_cores: 4, ram_gb: 8, vram_gb: 6 }
+max_parallel_default: 1
+timeouts: { stage_inputs: 10m, run: 60m, upload: 10m }
+retry: { max_attempts: 1 }

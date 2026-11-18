@@ -565,11 +565,37 @@ Server page can answer "why does B5090 not offer Blender?" without reading a log
 | `act3.transcode` | ACT3 | `ffmpeg` | CPU | export formats, social exports |
 | `act3.blender_render` | ACT3 | `blender` | GPU preferred | shot video, set renders |
 | `act3.tts_local` | ACT3 | `python` | CPU or Apple | Kokoro voice lines |
-| `wtc.transcription` | WTC | `whisper` | Apple or NVIDIA, CPU fallback | video and audio to text |
+| `wtc.transcription` | WTC | `whisper` | Apple or NVIDIA, CPU fallback | video and audio to text (same runner as `act3.transcription`) |
+| `act3.transcription` | ACT3 | `whisper` | CPU, CUDA optional; BMS + BPC opt in, off on B5090 / BMTR / Nepal | dialogue clip → words with timestamps for script-line alignment (§8.1.1) |
 | `wtc.ai_description` | WTC | `python` / vendor | GPU or vendor API | visual descriptions of images and video |
 | `wtc.ocr` | WTC | `python` | CPU | text in images |
 | `wtc.transcode` | WTC | `ffmpeg` | CPU | H.264 + AAC + yuv420p for X compatibility, never AV1 for X |
 | `sys.self_test` | both | `selftest` | any | a tiny known job used by acceptance tests and the admin "Test this server" button |
+
+#### 8.1.1 `act3.transcription` — the Whisper runner (built 2026-11-18)
+
+ACT3 dialogue audio decision D3 (~/BGit/all/film/pm/subp/dialogue_audio/dialogue_audio.mdx §27, §28): transcribe an
+imported dialogue clip on our own render servers (0 credits, no paid speech-to-text vendor), so the web app aligns the
+words to the script's dialogue lines. The web app saves the transcript per source media and records `runtime_ms`.
+
+* One input (ACT3 names it `source_audio`; any single input is accepted, so `wtc.transcription` shares the runner). Params
+  `{model: whisper-large-v3-turbo (default) | whisper-large-v3 | whisper-medium | whisper-small | whisper-base |
+  whisper-tiny, language: "en" | null (auto), word_timestamps: true}`; anything else in params is ignored.
+* Runs the open-source openai-whisper CLI: `whisper <in> --model <size> --output_format json --output_dir <work>
+  --verbose False --task transcribe --word_timestamps True [--language xx] [--fp16 False when no CUDA slot]
+  [--model_dir $APS_WHISPER_MODEL_DIR]`. The engine probe `whisper` finds it on PATH or in ~/.local/bin (found by path
+  only: its help takes ~10 s; `engines.whisper` in this_server.yaml overrides the path).
+* One output `transcript` (application/json), schema `act3.transcript.v1`: `{schema, engine, model, language,
+  duration_s, runtime_ms, text, segments: [{start_s, end_s, text, words: [{start_s, end_s, word, p}]}]}`.
+* Errors: unknown model / bad language / input count / unreadable audio → `invalid_input`; whisper or ffmpeg missing →
+  `infra`; any other whisper failure → `transient`.
+* Not detached (like `ffmpeg`): a transcription is seconds to minutes, so a controller restart runs it again instead
+  of re-attaching. Service `default_enabled: false`, `retry.max_attempts: 1` (production owns retries).
+
+When a job asks for a transcription of a dialogue clip — implemented in:
+~/BGit/act3/ai_processing_server/code/internal/runners/whisper.go · `Whisper.Check`, `Whisper.Run`, `ConvertWhisperJSON`
+(service ~/BGit/act3/ai_processing_server/data/services/act3.transcription.yaml; engine probe
+~/BGit/act3/ai_processing_server/code/internal/hardware/detect.go · `engineProbes` "whisper"; tests `whisper_test.go`).
 
 Service ids are `platform.name`, lower case, stable forever. A renamed service gets a new id and the old one is listed
 under `replaced_by` in its catalog file for one release.

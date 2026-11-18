@@ -41,7 +41,7 @@ type Env struct {
 	Engines map[string]*hardware.Engine
 	// MinFreeRAMGB is limits.ram_floor_gb: a detached task is stopped when the machine's free RAM stays under it
 	MinFreeRAMGB float64
-	Logger  *slog.Logger
+	Logger       *slog.Logger
 }
 
 // Reporter carries progress back to the job record and the per-job log.
@@ -60,7 +60,7 @@ type Result struct {
 // All returns the runners built into this binary, by name.
 func All() map[string]Runner {
 	m := map[string]Runner{}
-	for _, r := range []Runner{Compute{}, Render{}, FFmpeg{}, OSSVideo{}, OSSUpscale{}, OSSRegenerate{}} {
+	for _, r := range []Runner{Compute{}, Render{}, FFmpeg{}, OSSVideo{}, OSSUpscale{}, OSSRegenerate{}, Whisper{}} {
 		m[r.Name()] = r
 	}
 	return m
