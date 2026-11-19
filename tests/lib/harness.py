@@ -30,7 +30,7 @@ BINARY = Path(os.environ.get("APS_BINARY", REPO_ROOT / ("ai_processing_server.ex
 
 ALL_SERVICES = [
     "sys.self_test", "sys.compute", "sys.render_test",
-    "act3.transcode", "act3.video_merge", "wtc.transcode", "wtc.transcription",
+    "act3.transcode", "act3.video_merge", "wtc.transcode", "wtc.transcription", "act3.llm_batch",
 ]
 
 

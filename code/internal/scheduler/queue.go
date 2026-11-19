@@ -198,9 +198,13 @@ func (s *Server) pullOrderLocked() []queue.ConsumerRef {
 		return nil
 	}
 	var svcs []string
+	idle := s.machineIdleLocked(pending)
 	for id, o := range s.offers {
 		if _, p := s.pausedSvc[id]; p || o.Parallel == 0 {
 			continue
+		}
+		if st := s.cfg.Service(id); st != nil && st.IdleOnly && !idle {
+			continue // idle-only service (B5090 act3.llm_batch): only while nothing else uses this machine
 		}
 		if s.activeBy[id]+pendingBy[id] < o.Parallel {
 			svcs = append(svcs, id)
@@ -1300,4 +1304,30 @@ func (s *Server) queueOrErr() (queue.Queue, error) {
 		return nil, fmt.Errorf("%w: %s (%s)", ErrBroker, s.qState, s.qErr)
 	}
 	return s.q, nil
+}
+
+// Idle-only thresholds (ServiceSetting.IdleOnly): the busiest NVIDIA GPU under IdleGPUBusyPct, and the 1-minute CPU
+// load under IdleCPULoadFraction of the logical cores (machines that cannot read one of them skip that check).
+var (
+	IdleGPUBusyPct      = 10.0
+	IdleCPULoadFraction = 0.15
+)
+
+// machineIdleLocked reports whether this machine is truly idle for an idle-only service: no job of ANY service running
+// or claimed here, no recent telemetry saying the GPU or CPU is busy (someone using the 5090 for other work).
+func (s *Server) machineIdleLocked(pending int) bool {
+	if s.active > 0 || pending > 0 {
+		return false
+	}
+	if s.opt.Monitor == nil {
+		return true
+	}
+	l := s.opt.Monitor.Load()
+	if l.GPUBusyPct >= IdleGPUBusyPct {
+		return false
+	}
+	if cores := s.effective.CPU.LogicalCores; cores > 0 && l.CPULoad1 > IdleCPULoadFraction*float64(cores) {
+		return false
+	}
+	return true
 }

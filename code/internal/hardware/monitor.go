@@ -2,6 +2,9 @@ package hardware
 
 import (
 	"context"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,6 +15,9 @@ type Load struct {
 	CPULoad1   float64   `json:"cpu_load_1m"`
 	DiskFreeGB float64   `json:"disk_free_gb"`        // the lower of the work dir's and the state dir's disks
 	DiskPath   string    `json:"disk_path,omitempty"` // the directory DiskFreeGB was measured on
+	// GPUBusyPct is the busiest NVIDIA GPU's utilization (nvidia-smi), -1 when this machine has none or it could not
+	// be read. The idle-only gate (ServiceSetting.IdleOnly) reads it: someone gaming or rendering on the 5090 is busy.
+	GPUBusyPct float64 `json:"gpu_busy_pct"`
 }
 
 // Monitor holds the latest detection and telemetry for the running server.
@@ -56,7 +62,7 @@ func (m *Monitor) Refresh(ctx context.Context) Facts {
 
 // SampleLoad takes one telemetry sample.
 func (m *Monitor) SampleLoad(ctx context.Context) {
-	l := Load{At: time.Now(), CPULoad1: readLoad(ctx)}
+	l := Load{At: time.Now(), CPULoad1: readLoad(ctx), GPUBusyPct: readGPUBusy(ctx)}
 	for _, dir := range []string{m.opts.WorkDir, m.opts.StateDir} {
 		if dir == "" {
 			continue
@@ -68,4 +74,28 @@ func (m *Monitor) SampleLoad(ctx context.Context) {
 	m.mu.Lock()
 	m.load = l
 	m.mu.Unlock()
+}
+
+// readGPUBusy returns the highest utilization.gpu of the NVIDIA GPUs, or -1 (no nvidia-smi, or it failed).
+func readGPUBusy(ctx context.Context) float64 {
+	smi, err := exec.LookPath("nvidia-smi")
+	if err != nil {
+		return -1
+	}
+	out, err := run(ctx, smi, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits")
+	if err != nil {
+		return -1
+	}
+	return ParseGPUBusy(out)
+}
+
+// ParseGPUBusy reads nvidia-smi's utilization lines ("12\n0\n") and returns the highest, or -1.
+func ParseGPUBusy(out string) float64 {
+	best := -1.0
+	for _, l := range strings.Split(out, "\n") {
+		if v, err := strconv.ParseFloat(strings.TrimSpace(l), 64); err == nil && v > best {
+			best = v
+		}
+	}
+	return best
 }

@@ -121,3 +121,48 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		t.Fatalf("want errors for max_parallel_jobs, duplicate and bias, got %v", errs)
 	}
 }
+
+// act3.llm_batch (2026-11-19): on for the Mac Studio (services_on), idle-only on the 5090 (services_idle_only), off on
+// every other known machine because the catalog defaults it off.
+func TestLLMBatchPresets(t *testing.T) {
+	cat := catalog(t)
+	if _, ok := cat.Services["act3.llm_batch"]; !ok {
+		t.Fatal("act3.llm_batch is not in the service catalog")
+	}
+	var bms, b5090 *KnownServer
+	for i := range cat.Known.Servers {
+		switch cat.Known.Servers[i].Key {
+		case "BMS":
+			bms = &cat.Known.Servers[i]
+		case "B5090":
+			b5090 = &cat.Known.Servers[i]
+		}
+	}
+	if bms == nil || b5090 == nil {
+		t.Fatal("BMS or B5090 preset missing")
+	}
+	has := func(l []string, s string) bool {
+		for _, x := range l {
+			if x == s {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(bms.ServicesOn, "act3.llm_batch") || !has(b5090.ServicesIdleOnly, "act3.llm_batch") {
+		t.Fatalf("presets: BMS on %v, B5090 idle-only %v", bms.ServicesOn, b5090.ServicesIdleOnly)
+	}
+	if cat.Services["act3.llm_batch"].DefaultEnabled {
+		t.Fatal("act3.llm_batch must be off by default (only BMS and, idle-only, B5090)")
+	}
+	f := laptop
+	f.Hostname = b5090.Match.Hostname[0]
+	_, ts, err := Generate(cat, f, "t", canRunAll, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := ts.Service("act3.llm_batch")
+	if s == nil || !s.Enabled || !s.IdleOnly {
+		t.Fatalf("B5090 this_server.yaml: %+v", s)
+	}
+}

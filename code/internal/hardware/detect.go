@@ -3,6 +3,7 @@ package hardware
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -87,6 +88,8 @@ type engineProbe struct {
 	// noRun: found by path only, never executed (the openai-whisper CLI takes ~10 s to print its help, past the
 	// probe timeout); its version reads "unknown"
 	noRun bool
+	// ollama: found by HTTP (GET /api/version) on loopback, at the override, OLLAMA_HOST, then 11434 and 19391 (BMS)
+	ollama bool
 }
 
 var engineProbes = []engineProbe{
@@ -105,10 +108,16 @@ var engineProbes = []engineProbe{
 		"linux":  {"~/.local/bin/whisper", "/usr/local/bin/whisper"},
 	}},
 	{name: "comfyui", url: "http://127.0.0.1:8188/system_stats"},
+	// the local LLM server behind act3.llm_batch (runners/llm_batch.go); see detectOllama for where it is looked for
+	{name: "ollama", ollama: true},
 }
 
 func detectEngines(ctx context.Context, f *Facts, overrides map[string]string) {
 	for _, p := range engineProbes {
+		if p.ollama {
+			f.Engines[p.name] = detectOllama(ctx, overrides[p.name])
+			continue
+		}
 		if p.url != "" {
 			u := p.url
 			if o := overrides[p.name]; o != "" {
@@ -170,6 +179,63 @@ func findBinary(p engineProbe, override string) string {
 		}
 	}
 	return ""
+}
+
+// OllamaCandidates is where detectOllama looks, in order: the this_server.yaml override, OLLAMA_HOST (0.0.0.0 read as
+// loopback), the stock port, then 19391 (BMS: OpenClaw's Ollama since 2026-10, servers/Bryan_Mac_Studio/server.yaml).
+func OllamaCandidates(override, ollamaHost string) []string {
+	var out []string
+	add := func(u string) {
+		u = strings.TrimRight(strings.TrimSpace(u), "/")
+		if u == "" {
+			return
+		}
+		if !strings.Contains(u, "://") {
+			u = "http://" + u
+		}
+		u = strings.Replace(u, "0.0.0.0", "127.0.0.1", 1)
+		for _, o := range out {
+			if o == u {
+				return
+			}
+		}
+		out = append(out, u)
+	}
+	add(override)
+	add(ollamaHost)
+	add("http://127.0.0.1:11434")
+	add("http://127.0.0.1:19391")
+	return out
+}
+
+// detectOllama returns the first candidate whose /api/version answers, with its version; nil when none does.
+func detectOllama(ctx context.Context, override string) *Engine {
+	for _, base := range OllamaCandidates(override, os.Getenv("OLLAMA_HOST")) {
+		c, cancel := context.WithTimeout(ctx, urlTimeout)
+		req, err := http.NewRequestWithContext(c, http.MethodGet, base+"/api/version", nil)
+		if err != nil {
+			cancel()
+			continue
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			cancel()
+			continue
+		}
+		var v struct {
+			Version string `json:"version"`
+		}
+		ok := resp.StatusCode == http.StatusOK && json.NewDecoder(resp.Body).Decode(&v) == nil
+		resp.Body.Close()
+		cancel()
+		if ok {
+			if v.Version == "" {
+				v.Version = "unknown"
+			}
+			return &Engine{URL: base, Version: v.Version}
+		}
+	}
+	return nil
 }
 
 func probeURL(ctx context.Context, u string) *Engine {

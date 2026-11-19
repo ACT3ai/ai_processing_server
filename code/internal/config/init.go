@@ -155,7 +155,7 @@ var sectionKey = regexp.MustCompile(`(?m)^([a-z_]+):`)
 // Generate renders the template for this machine and parses it back, so what is written is exactly what loads.
 func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunFunc, keep *Identity) (string, *ThisServer, error) {
 	id := Identity{Key: "CHANGE_ME", DisplayName: facts.Hostname, Profile: "generic", Family: "office", Site: "unknown"}
-	var off, on map[string]bool
+	var off, on, idle map[string]bool
 	localMode := LocalShare
 	if ks := MatchKnown(cat.Known, facts); ks != nil {
 		if ks.LocalMode != "" {
@@ -170,6 +170,10 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 		on = map[string]bool{}
 		for _, s := range ks.ServicesOn {
 			on[s] = true
+		}
+		idle = map[string]bool{}
+		for _, s := range ks.ServicesIdleOnly {
+			idle[s] = true
 		}
 	}
 	if keep != nil {
@@ -191,8 +195,11 @@ func Generate(cat *Catalog, facts hardware.Facts, version string, canRun CanRunF
 			fmt.Fprintf(&svc, "  # %s: %s\n", sid, why)
 			continue
 		}
-		enabled := (def.DefaultEnabled || on[sid]) && !off[sid]
+		enabled := (def.DefaultEnabled || on[sid] || idle[sid]) && !off[sid]
 		fmt.Fprintf(&svc, "  - id: %s\n    enabled: %t\n", sid, enabled)
+		if enabled && idle[sid] {
+			fmt.Fprintf(&svc, "    idle_only: true   # pulled only while this machine is truly idle\n")
+		}
 		if def.Title != "" {
 			fmt.Fprintf(&svc, "    # %s\n", def.Title)
 		}

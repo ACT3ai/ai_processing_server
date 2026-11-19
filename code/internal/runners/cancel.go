@@ -67,7 +67,7 @@ var (
 // Profiles lists every profile, for the spec's table test and `ai_processing_server cancel --profiles`.
 func Profiles() []CancelProfile {
 	return []CancelProfile{ProfileSeedVR2, ProfileFlashVSR, ProfileWan, ProfileLTX, ProfileKandinsky, ProfileH3,
-		ProfileH3Regenerate, ProfileFFmpeg, ProfileWhisper, ProfileFake}
+		ProfileH3Regenerate, ProfileFFmpeg, ProfileWhisper, ProfileLLMBatch, ProfileFake}
 }
 
 func profileByName(name string) (CancelProfile, bool) {
