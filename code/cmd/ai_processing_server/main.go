@@ -262,6 +262,16 @@ func findRoot() string {
 	return ""
 }
 
+// detectConfigured detects with this_server.yaml's `engines:` overrides and work dir. Without them an engine found only
+// through `engines:` (whisper in a venv) reads as missing and its services are never offered.
+func detectConfigured(p paths) hardware.Facts {
+	ts, err := config.Load(p.Config)
+	if err != nil {
+		ts = nil
+	}
+	return detect(p, ts)
+}
+
 func detect(p paths, ts *config.ThisServer) hardware.Facts {
 	work := filepath.Join(p.State, "work")
 	var overrides map[string]string
@@ -374,7 +384,7 @@ func cmdInit(p paths) error {
 }
 
 func cmdValidate(p paths) error {
-	facts := detect(p, nil) // needed for the server.bound_to check (a file copied from another machine)
+	facts := detectConfigured(p) // needed for the server.bound_to check (a file copied from another machine)
 	ts, _, warns, err := loadConfig(p, &facts)
 	for _, w := range warns {
 		fmt.Println("warning:", w)
@@ -397,7 +407,7 @@ func cmdValidate(p paths) error {
 }
 
 func cmdDetect(p paths) error {
-	facts := detect(p, nil)
+	facts := detectConfigured(p)
 	ts, cat, warns, err := loadConfig(p, &facts)
 	if err != nil {
 		var gerr error
@@ -442,14 +452,11 @@ func cmdRun(p paths) error {
 	}
 	defer closeLog()
 
-	facts := detect(p, nil)
+	facts := detectConfigured(p)
 	ts, cat, warns, err := loadConfig(p, &facts)
 	if err != nil {
 		log.Error("refusing to start", "error", err)
 		return err
-	}
-	if ts.Paths.WorkDir != "" { // re-detect disks against the configured work dir
-		facts = detect(p, ts)
 	}
 	for _, w := range warns {
 		log.Warn(w)
