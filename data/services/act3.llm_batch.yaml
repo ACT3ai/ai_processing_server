@@ -1,0 +1,22 @@
+schema_version: 1
+id: act3.llm_batch
+platform: act3
+title: "LLM render task: a batch of 1-2000 LLM calls through the local Ollama, K in flight (default 6)"
+# runner llm_batch (code/internal/runners/llm_batch.go): stages load_prompts → preflight → select_model → warm → prompts →
+# report; outputs llm_results + llm_report (act3.llm_batch_report.v1: stages, Ollama health before/after, every attempt
+# with a live diagnosis when it failed); errors also in ~/_act3_logs/llm_batch.err.
+# Spec: ~/BGit/all/film/pm/subp/llm_gen_ai/mac_studio/llm_render_task.mdx · design on_prem_chinese_llm.mdx §4.
+# WHERE IT RUNS (Bryan, 2026-11-19): the Mac Studio (BMS) only — services_on there; on the 5090 (B5090) only when that
+# machine is truly idle (services_idle_only: no job running, CPU and GPU quiet); off everywhere else.
+runner: llm_batch
+default_enabled: false
+requires:
+  # Ollama is looked up live by the runner (it may start after this server); the engine probe "ollama" records it.
+  gpu: optional
+  compute: [metal, cuda, none]
+# The model lives in Ollama's own process: this job holds little CPU/RAM itself; K prompts run inside the one job.
+resources_per_job: { cpu_cores: 2, ram_gb: 4 }
+max_parallel_default: 1
+# 300 long prompts at ~25 s each, 6 at a time, plus a cold model load: ~25 min; 6 h leaves room for big batches.
+timeouts: { stage_inputs: 10m, run: 360m, upload: 10m }
+retry: { max_attempts: 2, retry_on: [infra, timeout] }

@@ -155,6 +155,10 @@ type ServiceSetting struct {
 	MaxParallel int    `yaml:"max_parallel,omitempty" json:"max_parallel,omitempty"`
 	GPUs        []int  `yaml:"gpus,omitempty" json:"gpus,omitempty"`
 	LocalBias   int    `yaml:"local_bias,omitempty" json:"local_bias,omitempty"`
+	// IdleOnly: pull this service's jobs only while the machine is truly idle — no job of any service running or
+	// claimed here, and the GPU (NVIDIA) and CPU quiet (scheduler machineIdleLocked). B5090 takes act3.llm_batch this
+	// way (Bryan, 2026-11-19: LLM render tasks go to the Mac Studio, to the 5090 only if it is truly not being used).
+	IdleOnly bool `yaml:"idle_only,omitempty" json:"idle_only,omitempty"`
 }
 
 type PlatformSetting struct {
@@ -171,11 +175,11 @@ type Limits struct {
 	// RAMFloorGB: a running task is stopped when the machine's free RAM stays under this (0 = 5% of RAM, at least
 	// 4 GB). RAMReserveGB only decides which jobs start; this keeps a render that outgrows its booking from freezing
 	// the machine.
-	RAMFloorGB float64 `yaml:"ram_floor_gb" json:"ram_floor_gb"`
-	VRAMHeadroomGB  float64 `yaml:"vram_headroom_gb" json:"vram_headroom_gb"`
-	DiskMinFreeGB   float64 `yaml:"disk_min_free_gb" json:"disk_min_free_gb"`
-	GPUTempMaxC     int     `yaml:"gpu_temp_max_c" json:"gpu_temp_max_c"`
-	DrainTimeoutS   int     `yaml:"drain_timeout_s" json:"drain_timeout_s"`
+	RAMFloorGB     float64 `yaml:"ram_floor_gb" json:"ram_floor_gb"`
+	VRAMHeadroomGB float64 `yaml:"vram_headroom_gb" json:"vram_headroom_gb"`
+	DiskMinFreeGB  float64 `yaml:"disk_min_free_gb" json:"disk_min_free_gb"`
+	GPUTempMaxC    int     `yaml:"gpu_temp_max_c" json:"gpu_temp_max_c"`
+	DrainTimeoutS  int     `yaml:"drain_timeout_s" json:"drain_timeout_s"`
 }
 
 type Paths struct {
@@ -299,8 +303,10 @@ type KnownServer struct {
 	// ServicesOn: services init writes enabled: true on this machine even when the catalog defaults them off (the
 	// model services on the box whose weights are installed: BMS Wan 2.2 + SeedVR2, problems 2026_oct_27 #2).
 	ServicesOn []string `yaml:"services_on"`
-	LocalMode  string   `yaml:"local_mode"` // callers.local.mode init writes; share when empty
-	Dev        bool     `yaml:"dev"`        // a development machine, not a render server (Identity.Dev)
+	// ServicesIdleOnly: services init writes enabled: true AND idle_only: true on this machine (ServiceSetting.IdleOnly).
+	ServicesIdleOnly []string `yaml:"services_idle_only"`
+	LocalMode        string   `yaml:"local_mode"` // callers.local.mode init writes; share when empty
+	Dev              bool     `yaml:"dev"`        // a development machine, not a render server (Identity.Dev)
 }
 
 type Match struct {

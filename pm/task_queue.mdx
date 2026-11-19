@@ -1782,3 +1782,13 @@ Writing the nats-server config and checking the broker's version are implemented
   scheduler's queue link, config `queue` / `continuity` / `callers`, local API queue routes, `just broker-*`, Go and
   black-box tests (§21.2b). Decisions D-015 to D-017 record the choices made while building (strict band order and
   inline admission for now, caller_state beside the Asynq names, settle-or-re-attach at boot).
+* 2026-11-19 (LLM render task): new service `act3.llm_batch`, runner `llm_batch` (code/internal/runners/llm_batch.go).
+  One job = 1-2000 LLM calls through this machine's loopback Ollama, K in flight (default 6, refilled as each prompt
+  finishes, longest first); stages load_prompts → preflight → select_model → warm → prompts → report; a failed attempt
+  carries a live Ollama diagnosis (port, /api/version, /api/tags, /api/ps, processes, free RAM); outputs `llm_results`
+  + `llm_report`; errors also in ~/_act3_logs/llm_batch.err. New engine probe `ollama` (hardware/detect.go
+  `detectOllama`, 11434 then 19391). New per-service `idle_only` (ServiceSetting.IdleOnly, preset
+  `services_idle_only`): pulled only while no job runs here and the NVIDIA GPU (<10 %) and CPU (<15 % of cores) are
+  quiet (scheduler `machineIdleLocked`). Presets: BMS on, B5090 idle-only, every other machine off (Bryan: these
+  calls go to the Mac Studio, to the 5090 only if it truly is not being used). Black-box suite tests/llm/.
+  Product spec: ~/BGit/all/film/pm/subp/llm_gen_ai/mac_studio/llm_render_task.mdx.

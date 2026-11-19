@@ -76,3 +76,20 @@ func TestFreeRAMParsers(t *testing.T) {
 		t.Fatalf("vm_stat: %g", g)
 	}
 }
+
+func TestParseGPUBusy(t *testing.T) {
+	if got := ParseGPUBusy("12\n87\n"); got != 87 {
+		t.Fatal(got)
+	}
+	if got := ParseGPUBusy(""); got != -1 {
+		t.Fatal(got)
+	}
+}
+
+func TestOllamaCandidates(t *testing.T) {
+	got := OllamaCandidates("", "0.0.0.0:19391")
+	want := []string{"http://127.0.0.1:19391", "http://127.0.0.1:11434"}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("%v", got)
+	}
+}

@@ -27,6 +27,9 @@ servers:
     # Reserved for Gen AI video and work that needs the 5090 (Bryan, 2026-11-06): CPU/ffmpeg tasks never run here.
     # act3.transcription (Whisper) is CPU/ffmpeg-class work too: never here (2026-11-18, ACT3 dialogue audio D3).
     services_off: [act3.upscale_finish, act3.transcode, act3.video_merge, act3.transcription]
+    # LLM render tasks (act3.llm_batch) go to the Mac Studio; here ONLY while the 5090 is truly idle: no job running and
+    # the GPU quiet (Bryan, 2026-11-19; scheduler machineIdleLocked). Ollama on this box holds up to ~30B models.
+    services_idle_only: [act3.llm_batch]
   - key: BPC
     display_name: "Bryan PC"
     match: { hostname: ["BRYAN-PC"], gpu_count_min: 2 }          # guess
@@ -71,7 +74,8 @@ servers:
     # Wan 2.2 and SeedVR2 are installed here (~/act3_render/wan_2_2, ~/act3_render/seedvr2), so init turns both model
     # services on; on any other machine they stay off until the owner installs the weights and runs `just enable`.
     # The bms profile yields to OpenClaw when it is busy.
-    services_on: [act3.video_gen_open_source, act3.upscale_open_source]
+    # act3.llm_batch: the LLM render task through BMS's Ollama (Bryan, 2026-11-19: these calls go to the Mac Studio).
+    services_on: [act3.video_gen_open_source, act3.upscale_open_source, act3.llm_batch]
     # Reserved for OpenClaw, non-NVIDIA Gen AI video, upscalers and big local models (Bryan, 2026-11-06): no CPU finish here.
     services_off: [act3.upscale_finish]
   # The three Nepal office machines (task_authoring.mdx §2, §10 Q1, D-020). Hostnames are placeholders until `init`
