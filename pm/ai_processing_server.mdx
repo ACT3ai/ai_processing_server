@@ -508,6 +508,13 @@ whisper.cpp, docker, OpenClaw gateway, Kokoro. Each entry says how to find it (P
 an override key in `this_server.yaml` under `engines:`) and how to read its version. A service declares which engines,
 at what minimum version, it needs (§8.2).
 
+Blender is an opt-in engine (Bryan, 2026-11-19). Detection never launches Blender, not even `blender --version`,
+unless this server's `this_server.yaml` enables `act3.blender_render`; otherwise Blender is found by path only and its
+version reads `unknown`. Render servers that do not render Blender (the Mac Studio among them) must never install,
+start or use it. When Blender detection is not opted in, `hardware.Options.RunOptIn` is empty — implemented in:
+`~/BGit/act3/ai_processing_server/code/internal/hardware/detect.go` (`engineProbe.optIn`, `detectEngines`) and
+`~/BGit/act3/ai_processing_server/code/cmd/ai_processing_server/main.go` (`runOptIn`).
+
 ### 7.3 From hardware to offers
 
 The **capability** package turns facts into a list of **offers**: for each enabled service, can this machine run it,

@@ -283,7 +283,20 @@ func detect(p paths, ts *config.ThisServer) hardware.Facts {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	return hardware.Detect(ctx, hardware.Options{WorkDir: work, EnginePaths: overrides})
+	return hardware.Detect(ctx, hardware.Options{WorkDir: work, EnginePaths: overrides, RunOptIn: runOptIn(ts)})
+}
+
+// runOptIn: the opt-in engines this server may execute while detecting. Blender runs (`blender --version`) only when
+// this_server.yaml enables act3.blender_render; every other server finds it by path and never starts it
+// (Bryan, 2026-11-19: render servers such as the Mac Studio must not launch Blender).
+func runOptIn(ts *config.ThisServer) map[string]bool {
+	if ts == nil {
+		return nil
+	}
+	if s := ts.Service("act3.blender_render"); s != nil && s.Enabled {
+		return map[string]bool{"blender": true}
+	}
+	return nil
 }
 
 // loadConfig returns the config to run with. A legacy (schema-less) this_server.yaml is never modified: the
@@ -491,7 +504,7 @@ func cmdRun(p paths) error {
 	if ts.Paths.WorkDir != "" {
 		work = config.ExpandHome(ts.Paths.WorkDir)
 	}
-	mon := hardware.NewMonitor(hardware.Options{WorkDir: work, StateDir: p.State, EnginePaths: ts.Engines}, facts)
+	mon := hardware.NewMonitor(hardware.Options{WorkDir: work, StateDir: p.State, EnginePaths: ts.Engines, RunOptIn: runOptIn(ts)}, facts)
 	loader := func() (*config.ThisServer, *config.Catalog, []string, error) {
 		f := mon.Detected()
 		return loadConfig(p, &f)
