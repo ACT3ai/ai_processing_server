@@ -687,3 +687,32 @@ func TestLayersRunRealBinaries(t *testing.T) {
 	}
 	t.Logf("rendered with %d HTML layer(s): summary %v", html, sum)
 }
+
+// An asset id from the plan never steers where a file is written: duplicate names and nameless assets use the id in
+// the file name, and an id like "../../x" must stay inside the assets folder.
+func TestPlaceLayersAssetsHostileIDs(t *testing.T) {
+	in := t.TempDir()
+	mk := func(name string) string {
+		p := filepath.Join(in, name)
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	assets := []LayersAsset{
+		{ID: "ok", Role: "image", Name: "pic.png"},
+		{ID: "../../escape", Role: "image", Name: "pic.png"}, // duplicate name -> id prefix
+		{ID: "/abs/../../escape2", Role: "image", Name: ""},  // nameless -> <id>.bin
+	}
+	inputs := map[string]string{"ok": mk("ok.png"), "../../escape": mk("e.png"), "/abs/../../escape2": mk("e2.png")}
+	dir := filepath.Join(t.TempDir(), "assets")
+	paths, err := PlaceLayersAssets(assets, inputs, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, p := range paths {
+		if filepath.Dir(p) != dir {
+			t.Errorf("asset %q placed at %q, outside %s", id, p, dir)
+		}
+	}
+}
