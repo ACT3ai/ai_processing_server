@@ -273,7 +273,17 @@ func SafeAssetName(a LayersAsset) string {
 	n := unsafeNameRe.ReplaceAllString(filepath.Base(strings.ReplaceAll(a.Name, `\`, "/")), "_")
 	n = strings.TrimLeft(n, ".")
 	if n == "" || n == "_" {
-		return a.ID + ".bin"
+		return safeIDPart(a.ID) + ".bin"
+	}
+	return n
+}
+
+// safeIDPart is an asset id made safe to use inside a file name: an id from the plan is not trusted to be a bare
+// token, so `../x` or `/abs` can never steer where an asset is written (security pass 2026-11-19, WEB-N2-1 follow-up).
+func safeIDPart(id string) string {
+	n := strings.TrimLeft(unsafeNameRe.ReplaceAllString(strings.ReplaceAll(id, `\`, "/"), "_"), "._")
+	if n == "" {
+		return "asset"
 	}
 	return n
 }
@@ -324,10 +334,13 @@ func PlaceLayersAssets(assets []LayersAsset, inputs map[string]string, dir strin
 		}
 		name := SafeAssetName(a)
 		if used[name] {
-			name = a.ID + "_" + name
+			name = safeIDPart(a.ID) + "_" + name
 		}
 		used[name] = true
 		dst := filepath.Join(abs, name)
+		if filepath.Dir(dst) != abs {
+			return nil, jobs.Errf(jobs.KindInvalidInput, "asset %q would be written outside the assets folder", a.ID)
+		}
 		if err := linkOrCopy(src, dst); err != nil {
 			return nil, jobs.Wrap(jobs.KindInfra, err, "place asset "+a.ID)
 		}
