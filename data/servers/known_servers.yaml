@@ -75,7 +75,9 @@ servers:
     # services on; on any other machine they stay off until the owner installs the weights and runs `just enable`.
     # The bms profile yields to OpenClaw when it is busy.
     # act3.llm_batch: the LLM render task through BMS's Ollama (Bryan, 2026-11-19: these calls go to the Mac Studio).
-    services_on: [act3.video_gen_open_source, act3.upscale_open_source, act3.llm_batch]
+    # act3.layers_render: AI Video Layers shot renders (act3-motion-video + act3-motion-audio; motion.mdx §39, §64.5),
+    # BMS only for now (2026-11-19).
+    services_on: [act3.video_gen_open_source, act3.upscale_open_source, act3.llm_batch, act3.layers_render]
     # Reserved for OpenClaw, non-NVIDIA Gen AI video, upscalers and big local models (Bryan, 2026-11-06): no CPU finish here.
     services_off: [act3.upscale_finish]
   # The three Nepal office machines (task_authoring.mdx §2, §10 Q1, D-020). Hostnames are placeholders until `init`

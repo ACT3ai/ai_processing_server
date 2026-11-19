@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -96,6 +97,9 @@ type engineProbe struct {
 	optIn bool
 	// ollama: found by HTTP (GET /api/version) on loopback, at the override, OLLAMA_HOST, then 11434 and 19391 (BMS)
 	ollama bool
+	// candidates: more places to look, computed at probe time (environment variables, version-named cache folders),
+	// tried after the this_server.yaml override and before PATH
+	candidates func() []string
 }
 
 var engineProbes = []engineProbe{
@@ -113,6 +117,18 @@ var engineProbes = []engineProbe{
 		"darwin": {"~/.local/bin/whisper", "/opt/homebrew/bin/whisper"},
 		"linux":  {"~/.local/bin/whisper", "/usr/local/bin/whisper"},
 	}},
+	// act3.layers_render (runners/layers_render.go): the two Rust render tasks from ~/BGit/all/film/code/render_tasks
+	// (cargo build --release --workspace), Node for its HTML runner, and a headless Chromium. The motion binaries run
+	// `--version` only when act3.layers_render is enabled (opt-in); Chromium is never started by a probe.
+	{name: "act3_motion_video", binaries: []string{"act3-motion-video"}, args: []string{"--version"}, optIn: true,
+		candidates: func() []string { return MotionBinCandidates("act3-motion-video") }},
+	{name: "act3_motion_audio", binaries: []string{"act3-motion-audio"}, args: []string{"--version"}, optIn: true,
+		candidates: func() []string { return MotionBinCandidates("act3-motion-audio") }},
+	{name: "node", binaries: []string{"node"}, args: []string{"--version"}, extra: map[string][]string{
+		"darwin": {"/opt/homebrew/bin/node", "/usr/local/bin/node"},
+		"linux":  {"/usr/local/bin/node", "/usr/bin/node"},
+	}},
+	{name: "chromium", noRun: true, candidates: ChromiumCandidates},
 	{name: "comfyui", url: "http://127.0.0.1:8188/system_stats"},
 	// the local LLM server behind act3.llm_batch (runners/llm_batch.go); see detectOllama for where it is looked for
 	{name: "ollama", ollama: true},
@@ -172,6 +188,13 @@ func findBinary(p engineProbe, override string) string {
 	if override != "" {
 		if _, err := os.Stat(expandHome(override)); err == nil {
 			return expandHome(override)
+		}
+	}
+	if p.candidates != nil {
+		for _, c := range p.candidates() {
+			if st, err := os.Stat(expandHome(c)); err == nil && !st.IsDir() {
+				return expandHome(c)
+			}
 		}
 	}
 	for _, b := range p.binaries {
@@ -300,4 +323,50 @@ func expandHome(p string) string {
 		return filepath.Join(home, strings.TrimPrefix(p, "~"))
 	}
 	return p
+}
+
+// MotionBinDirs is where the act3-motion-video / act3-motion-audio binaries are looked for, in order:
+// $ACT3_MOTION_BIN_DIR, then the release build of the render_tasks workspace in the ~/BGit/all checkout (dev) or the
+// ~/repos/all checkout (render servers). this_server.yaml `engines.act3_motion_video` / `act3_motion_audio` override all.
+func MotionBinDirs() []string {
+	var out []string
+	if d := strings.TrimSpace(os.Getenv("ACT3_MOTION_BIN_DIR")); d != "" {
+		out = append(out, d)
+	}
+	return append(out, "~/BGit/all/film/code/render_tasks/target/release", "~/repos/all/film/code/render_tasks/target/release")
+}
+
+// MotionBinCandidates is MotionBinDirs joined with one binary name (".exe" on Windows).
+func MotionBinCandidates(name string) []string {
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	var out []string
+	for _, d := range MotionBinDirs() {
+		out = append(out, filepath.Join(d, name))
+	}
+	return out
+}
+
+// ChromiumCandidates is where act3-motion-video's HTML runner finds a Chromium (render_tasks motion_video/src/html.rs
+// find_chrome, same order): $ACT3_CHROMIUM, Playwright's headless shell (newest first), then a system Chromium/Chrome.
+func ChromiumCandidates() []string {
+	var out []string
+	if p := strings.TrimSpace(os.Getenv("ACT3_CHROMIUM")); p != "" {
+		out = append(out, p)
+	}
+	home, _ := os.UserHomeDir()
+	subs := []string{"chrome-headless-shell-mac-arm64/chrome-headless-shell", "chrome-headless-shell-mac-x64/chrome-headless-shell",
+		"chrome-headless-shell-linux64/chrome-headless-shell", "chrome-linux/headless_shell"}
+	for _, cache := range []string{filepath.Join(home, "Library/Caches/ms-playwright"), filepath.Join(home, ".cache/ms-playwright")} {
+		dirs, _ := filepath.Glob(filepath.Join(cache, "chromium_headless_shell-*"))
+		sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
+		for _, d := range dirs {
+			for _, s := range subs {
+				out = append(out, filepath.Join(d, s))
+			}
+		}
+	}
+	return append(out, "/usr/bin/chromium", "/usr/bin/chromium-browser", "/Applications/Chromium.app/Contents/MacOS/Chromium",
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 }

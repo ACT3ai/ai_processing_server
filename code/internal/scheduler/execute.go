@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ACT3ai/ai_processing_server/internal/config"
 	"github.com/ACT3ai/ai_processing_server/internal/errlog"
 	"github.com/ACT3ai/ai_processing_server/internal/jobs"
 	"github.com/ACT3ai/ai_processing_server/internal/logging"
@@ -35,6 +36,10 @@ func (s *Server) execute(ctx context.Context, cancel context.CancelCauseFunc, jo
 	runner := s.runners[def.Runner]
 	engines := s.effective.Engines
 	keep := s.cfg.Debug.KeepWorkDirs
+	cacheDir := ""
+	if s.cfg.Paths.CacheDir != "" {
+		cacheDir = config.ExpandHome(s.cfg.Paths.CacheDir)
+	}
 	s.mu.Unlock()
 
 	workDir := filepath.Join(s.workDir, job.ID)
@@ -64,7 +69,7 @@ func (s *Server) execute(ctx context.Context, cancel context.CancelCauseFunc, jo
 			}
 		}
 		env := runners.Env{WorkDir: workDir, OutDir: outDir, Inputs: map[string]string{}, Slot: *job.Slot,
-			Engines: engines, MinFreeRAMGB: s.cfg.Limits.RAMFloorGB, Logger: s.log.With("ctx", "runner."+def.Runner, "job_id", job.ID, "service", job.Type)}
+			Engines: engines, MinFreeRAMGB: s.cfg.Limits.RAMFloorGB, CacheDir: cacheDir, Logger: s.log.With("ctx", "runner."+def.Runner, "job_id", job.ID, "service", job.Type)}
 		rep.Log(fmt.Sprintf("attempt %d of %s on %s (timeout %s)", job.Retried+1, job.Type, job.Slot.ID, timeout))
 		if err := runner.Check(ctx, job, env); err != nil {
 			return err

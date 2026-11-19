@@ -1,0 +1,25 @@
+schema_version: 1
+id: act3.layers_render
+platform: act3
+title: "AI Video Layers shot render (act3-motion-video + act3-motion-audio: HTML layers, combine, audio mix, join)"
+# ACT3 render type `layers_render` (job LAYERS_RENDER_ON_PREM; contract
+# ~/BGit/all/film/code/p/act3ai-appsrv/src/modules/layers-render/layers-render.contract.ts; spec
+# ~/BGit/all/film/pm/subp/motion/motion.mdx §39, §54, §64.5). Runner: code/internal/runners/layers_render.go.
+# Binaries from ~/BGit/all/film/code/render_tasks (`cargo build --release --workspace`), found by the engine probes
+# act3_motion_video / act3_motion_audio ($ACT3_MOTION_BIN_DIR, else render_tasks/target/release in ~/BGit/all or
+# ~/repos/all; this_server.yaml engines: overrides). Node runs the HTML runner; Chromium is Playwright's headless shell
+# ($ACT3_CHROMIUM overrides). Offered only when all of them are present.
+# WHERE IT RUNS (2026-11-19): the Mac Studio (BMS) only — services_on there; off everywhere else.
+runner: layers_render
+default_enabled: false
+requires:
+  engines: { act3_motion_video: "", act3_motion_audio: "", ffmpeg: ">=6.0", ffprobe: ">=6.0", node: "", chromium: "" }
+  gpu: optional
+  compute: [metal, cuda, none]
+# act3-motion-video uses every core it is given (rayon) plus Chromium pages: one shot at a time.
+resources_per_job: { cpu_cores: 8, ram_gb: 16 }
+max_parallel_default: 1
+# The runner also stops a wedged render at its own limit, scaled by output seconds and HTML layers (LayersTimeLimit,
+# at most 4 h); the job's timeout_seconds still wins when it is shorter.
+timeouts: { stage_inputs: 15m, run: 245m, upload: 15m }
+retry: { max_attempts: 1 }

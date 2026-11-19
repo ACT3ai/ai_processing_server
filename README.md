@@ -118,6 +118,7 @@ Rules:
 | `act3.video_merge`, `act3.transcode` | ffmpeg | CPU (NVENC / VideoToolbox optional) |
 | `act3.blender_render` | blender | GPU preferred |
 | `act3.tts_local` (Kokoro) | python | CPU or Apple |
+| `act3.layers_render` (AI Video Layers) | layers_render | CPU; BMS only (act3-motion-video + act3-motion-audio, Node, Chromium) |
 | `wtc.transcription` | whisper | Apple or NVIDIA, CPU fallback |
 | `wtc.ai_description`, `wtc.ocr` | python | GPU / CPU |
 | `wtc.transcode` | ffmpeg | CPU. Outputs H.264 + AAC + yuv420p, never AV1 for X. |

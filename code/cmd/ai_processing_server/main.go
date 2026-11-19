@@ -293,10 +293,18 @@ func runOptIn(ts *config.ThisServer) map[string]bool {
 	if ts == nil {
 		return nil
 	}
+	m := map[string]bool{}
 	if s := ts.Service("act3.blender_render"); s != nil && s.Enabled {
-		return map[string]bool{"blender": true}
+		m["blender"] = true
 	}
-	return nil
+	// the AI Video Layers render tasks print their version only on a server that runs act3.layers_render (BMS)
+	if s := ts.Service("act3.layers_render"); s != nil && s.Enabled {
+		m["act3_motion_video"], m["act3_motion_audio"] = true, true
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // loadConfig returns the config to run with. A legacy (schema-less) this_server.yaml is never modified: the

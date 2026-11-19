@@ -574,6 +574,7 @@ Server page can answer "why does B5090 not offer Blender?" without reading a log
 | `act3.tts_local` | ACT3 | `python` | CPU or Apple | Kokoro voice lines |
 | `wtc.transcription` | WTC | `whisper` | Apple or NVIDIA, CPU fallback | video and audio to text (same runner as `act3.transcription`) |
 | `act3.transcription` | ACT3 | `whisper` | CPU, CUDA optional; BMS + BPC opt in, off on B5090 / BMTR / Nepal | dialogue clip → words with timestamps for script-line alignment (§8.1.1) |
+| `act3.layers_render` | ACT3 | `layers_render` | CPU (Apple or NVIDIA optional); BMS only | AI Video Layers shot render: act3-motion-video + act3-motion-audio (§8.1.2) |
 | `wtc.ai_description` | WTC | `python` / vendor | GPU or vendor API | visual descriptions of images and video |
 | `wtc.ocr` | WTC | `python` | CPU | text in images |
 | `wtc.transcode` | WTC | `ffmpeg` | CPU | H.264 + AAC + yuv420p for X compatibility, never AV1 for X |
@@ -603,6 +604,57 @@ When a job asks for a transcription of a dialogue clip — implemented in:
 ~/BGit/act3/ai_processing_server/code/internal/runners/whisper.go · `Whisper.Check`, `Whisper.Run`, `ConvertWhisperJSON`
 (service ~/BGit/act3/ai_processing_server/data/services/act3.transcription.yaml; engine probe
 ~/BGit/act3/ai_processing_server/code/internal/hardware/detect.go · `engineProbes` "whisper"; tests `whisper_test.go`).
+
+#### 8.1.2 `act3.layers_render` — AI Video Layers shot renders (built 2026-11-19)
+
+ACT3 render type `layers_render` (job `LAYERS_RENDER_ON_PREM`; ~/BGit/all/film/pm/subp/motion/motion.mdx §39, §54,
+§64.5). The contract is appsrv's
+~/BGit/all/film/code/p/act3ai-appsrv/src/modules/layers-render/layers-render.contract.ts (`LayersRenderTask`): a render
+plan whose every media reference is `asset:<id>`, plus the asset list (`a1`, `a2`, … with name, role, contentType,
+bytes). The internal web app's render engine (~/BGit/all/app/code/film/servers) pulls each asset from production and
+hands the job to this server like every other render.
+
+* Params: `renderTask: {plan, assets, htmlLayers, durationSeconds, renderId, shotId}` (the job's own renderTask, passed
+  through), or the same fields flat (`plan` or `layersPlan`). Without htmlLayers the plan's `html_render` steps are
+  counted; without durationSeconds `output.lengthFlicks` is used.
+* Inputs: one per asset, named by the asset id (`a1`), by `<role>_<index>` (the engine's `envelopeFor` naming) or by the
+  asset's file name. Each is placed in the job folder under the asset's own name (extensions matter to FFmpeg and
+  Chromium); a wrong byte count is `invalid_input`.
+* Every string `asset:<id>` anywhere in the plan (layers' `source.url` / `source.path`, `bundle.files[].url` — their
+  relative `path` is kept —, audio_mix `plan.inputs[].source.url`, `join.picture.url`) becomes the absolute local path.
+  An id the job did not send is `invalid_input`, naming each one. Prose such as "asset: the map" is not a reference.
+* Frozen tools (house rule: a git pull or a rebuild never changes a running job): both binaries are copied into
+  `<job>/bin/`, and render_tasks' `motion_video/templates` + `html_runner/render.mjs` (found beside the binaries, or at
+  `$ACT3_MOTION_SRC_DIR`) into `<job>/motion_video/`, passed as `--templates` / `--runner`.
+* Command: `<job>/bin/act3-motion-video run --plan <job>/plan.json --out <out>/final.mp4 --work <job>/work --cache
+  <cache> --audio-bin <job>/bin/act3-motion-audio [--profile hardware_profile.json] --ffmpeg … --ffprobe … --node …
+  [--chrome …] [--templates … --runner …]`. Cache (shared across jobs, content-hashed): `$ACT3_MOTION_CACHE_DIR`, else
+  `<paths.cache_dir>/layers_render`, else the user cache folder. Profile: `$ACT3_MOTION_PROFILE`, else
+  `<cache>/hardware_profile.json` when present.
+* Progress: the JSON lines on stderr (`{"event":"progress","step":…,"done":N,"total":M}`, `{"event":"step",…}`) become one
+  rising fraction (HTML layers 0.05-0.35, combine to 0.90, join to 0.98), reported at most about once a second (a
+  finished step always). Other stderr lines go to the job log.
+* Output `video` (video/mp4, `final.mp4`); the job's `result` is `{summary: <act3-motion-video's stdout JSON>, runtime_ms,
+  render_id, shot_id}` — the engine sends `summary` as `complete.body.summary`.
+* Errors: exit 2 (bad command line or plan) → `invalid_input`; a tool that cannot start → `infra`; exit 3 or anything else
+  → `transient`. The message is the summary's `error` plus the last stderr lines; each failure is also a WARN in
+  error.err (`internal/errlog`).
+* Time limit `LayersTimeLimit`: 180 s + output seconds × (30 s + 20 s per HTML layer), 5 min .. 4 h (a 10 s shot with 3
+  HTML layers: 18 min) → `timeout`. Cancel and the limit stop the whole process group (Node, Chromium, FFmpeg): interrupt,
+  10 s grace (`ProfileLayers`), kill. The job folder is removed on every exit. Not detached (a restart renders again; the
+  HTML layer cache makes that cheap).
+* Capability: offered only when this_server.yaml enables `act3.layers_render` (default off; the BMS preset turns it on)
+  and the engine probes find `act3_motion_video`, `act3_motion_audio` (`$ACT3_MOTION_BIN_DIR`, else
+  `film/code/render_tasks/target/release` under ~/BGit/all or ~/repos/all; `engines:` overrides), `ffmpeg`, `ffprobe`,
+  `node` and `chromium` (`$ACT3_CHROMIUM`, Playwright's chromium-headless-shell, a system Chromium/Chrome). The motion
+  binaries run `--version` only on a server that enables the service; Chromium is never started by a probe.
+
+When a job asks for an AI Video Layers shot render — implemented in:
+~/BGit/act3/ai_processing_server/code/internal/runners/layers_render.go · `LayersRender.Check`, `LayersRender.Run`,
+`RewriteAssetRefs`, `PlaceLayersAssets`, `LayersCommand`, `ParseMotionEvent`, `LayersTimeLimit`
+(service ~/BGit/act3/ai_processing_server/data/services/act3.layers_render.yaml; engine probes
+~/BGit/act3/ai_processing_server/code/internal/hardware/detect.go · `engineProbes`, `MotionBinCandidates`,
+`ChromiumCandidates`; tests `layers_render_test.go` (real binaries when found) and `hardware/layers_probe_test.go`).
 
 Service ids are `platform.name`, lower case, stable forever. A renamed service gets a new id and the old one is listed
 under `replaced_by` in its catalog file for one release.
