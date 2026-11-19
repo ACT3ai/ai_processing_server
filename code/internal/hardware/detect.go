@@ -28,6 +28,10 @@ type Options struct {
 	StateDir string
 	// EnginePaths overrides where to look for an engine (this_server.yaml `engines:`), name → path or URL.
 	EnginePaths map[string]string
+	// RunOptIn names the opt-in engines (engineProbe.optIn) this server may EXECUTE to read their version: an
+	// opt-in engine is otherwise found by path only and never started. Blender is opt-in (Bryan, 2026-11-19): a
+	// server that does not run act3.blender_render must never launch Blender, not even `blender --version`.
+	RunOptIn map[string]bool
 }
 
 // Detect probes the machine. It never fails as a whole: probe errors are collected in Facts.Errors.
@@ -60,7 +64,7 @@ func Detect(ctx context.Context, opts Options) Facts {
 		f.Errors = append(f.Errors, "disk: "+err.Error())
 	}
 
-	detectEngines(ctx, &f, opts.EnginePaths)
+	detectEngines(ctx, &f, opts.EnginePaths, opts.RunOptIn)
 	return f
 }
 
@@ -88,6 +92,8 @@ type engineProbe struct {
 	// noRun: found by path only, never executed (the openai-whisper CLI takes ~10 s to print its help, past the
 	// probe timeout); its version reads "unknown"
 	noRun bool
+	// optIn: found by path only (version "unknown") unless Options.RunOptIn names it; only then executed
+	optIn bool
 	// ollama: found by HTTP (GET /api/version) on loopback, at the override, OLLAMA_HOST, then 11434 and 19391 (BMS)
 	ollama bool
 }
@@ -95,7 +101,7 @@ type engineProbe struct {
 var engineProbes = []engineProbe{
 	{name: "ffmpeg", binaries: []string{"ffmpeg"}, args: []string{"-version"}},
 	{name: "ffprobe", binaries: []string{"ffprobe"}, args: []string{"-version"}},
-	{name: "blender", binaries: []string{"blender"}, args: []string{"--version"}, extra: map[string][]string{
+	{name: "blender", binaries: []string{"blender"}, args: []string{"--version"}, optIn: true, extra: map[string][]string{
 		"darwin":  {"/Applications/Blender.app/Contents/MacOS/Blender"},
 		"windows": {`C:\Program Files\Blender Foundation\Blender 4.5\blender.exe`, `C:\Program Files\Blender Foundation\Blender 4.2\blender.exe`},
 	}},
@@ -112,7 +118,7 @@ var engineProbes = []engineProbe{
 	{name: "ollama", ollama: true},
 }
 
-func detectEngines(ctx context.Context, f *Facts, overrides map[string]string) {
+func detectEngines(ctx context.Context, f *Facts, overrides map[string]string, runOptIn map[string]bool) {
 	for _, p := range engineProbes {
 		if p.ollama {
 			f.Engines[p.name] = detectOllama(ctx, overrides[p.name])
@@ -131,7 +137,7 @@ func detectEngines(ctx context.Context, f *Facts, overrides map[string]string) {
 			f.Engines[p.name] = nil
 			continue
 		}
-		if p.noRun {
+		if p.noRun || (p.optIn && !runOptIn[p.name]) {
 			f.Engines[p.name] = &Engine{Path: path, Version: "unknown"}
 			continue
 		}
