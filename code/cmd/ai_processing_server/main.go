@@ -921,6 +921,7 @@ func cmdService(p paths, args []string) error {
 		}
 		units = rest
 	}
+	explicit := sub == "install" // `just install-service` by a person; `ensure` is `just build`
 	switch sub {
 	case "print":
 		for _, u := range units {
@@ -947,7 +948,9 @@ func cmdService(p paths, args []string) error {
 			}
 			fmt.Println("broker: the act3-nats container (restarts with Docker); no nats-server service")
 		}
-		did, err := service.Install(units, spec.LogDir)
+		// Linux: start the unit now only when a person asked and no server runs here yet (a running one, started by
+		// `just run` outside systemd, would make the unit crash-loop on the port); `just build` only enables it.
+		did, err := service.Install(units, spec.LogDir, explicit && !serverRunning(p))
 		for _, d := range did {
 			fmt.Println(d)
 		}
@@ -957,7 +960,10 @@ func cmdService(p paths, args []string) error {
 				fmt.Println("macOS: launchd agents start at login: turn on automatic login on a render box so a power cut recovers unattended")
 			}
 			if runtime.GOOS == "linux" {
-				fmt.Println("linux: run `loginctl enable-linger $USER` once so the user services start at boot without a login")
+				out, _ := exec.Command("loginctl", "show-user", strconv.Itoa(os.Getuid()), "-p", "Linger", "--value").Output()
+				if strings.TrimSpace(string(out)) != "yes" {
+					fmt.Println("linux: run `sudo loginctl enable-linger $USER` once so the user services start at boot without a login")
+				}
 			}
 		}
 		return err
@@ -973,6 +979,20 @@ func cmdService(p paths, args []string) error {
 		return nil
 	}
 	return errors.New("usage: ai_processing_server service install|ensure|uninstall|status|print [--force]")
+}
+
+// serverRunning: this machine's server process is alive (its pid file names a live process).
+func serverRunning(p paths) bool {
+	b, err := os.ReadFile(filepath.Join(p.State, "state", "server.pid"))
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	return err == nil && alive(proc)
 }
 
 func errString(err error) string {

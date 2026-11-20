@@ -1336,7 +1336,7 @@ Engine setup (ComfyUI, Blender, Python environments, model downloads) is documen
 | --- | --- | --- |
 | macOS | launchd user agent `~/Library/LaunchAgents/ai.act3.processing_server.plist`, `KeepAlive` | user session so Metal is available |
 | Windows | Windows service through `golang.org/x/sys/windows/svc`, or Task Scheduler at logon when GPU desktop access is needed | NVIDIA works from a service; ComfyUI is its own process |
-| Linux | systemd user unit, `Restart=on-failure` | cloud boxes |
+| Linux | systemd user unit `~/.config/systemd/user/act3-processing-server.service`, `Restart=on-failure`; `just build` enables it, `just run` / `just stop` start and stop it, linger starts it at boot | Nepal render servers, cloud boxes |
 
 ### 19.3 Updates
 

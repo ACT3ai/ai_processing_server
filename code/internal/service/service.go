@@ -145,7 +145,12 @@ func quoteAll(argv []string) []string {
 }
 
 // Install writes and loads the units. It replaces an earlier install of the same names.
-func Install(units []Unit, logDir string) ([]string, error) {
+//
+// startNow (Linux): also start a unit that is not running. The caller passes false when this machine's server is
+// already running outside systemd (a `just run` before the unit existed, or `just build` mid-render): starting the
+// unit then would launch a second server that fails on its port and crash-loops every RestartSec. Enabled is enough:
+// the next boot (linger) or `just run` starts it through systemd.
+func Install(units []Unit, logDir string, startNow bool) ([]string, error) {
 	var did []string
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return nil, err
@@ -172,15 +177,43 @@ func Install(units []Unit, logDir string) ([]string, error) {
 				return did, err
 			}
 		case "linux":
-			if err := writeUnit(u); err != nil {
-				return did, err
+			// Idempotent like macOS, and never restarts a running unit: `just build` calls this on every build
+			// (the render server's auto-updater builds every few minutes), and a restart would cut a render.
+			// A changed unit file takes effect at the next `just stop` / `just run`.
+			unit := u.Name + ".service"
+			old, _ := os.ReadFile(u.Path)
+			enabled := run("systemctl", "--user", "is-enabled", "--quiet", unit) == nil
+			active := run("systemctl", "--user", "is-active", "--quiet", unit) == nil
+			if string(old) == u.Body && enabled && (active || !startNow) {
+				did = append(did, fmt.Sprintf("%s already installed and enabled (%s)", u.Name, u.Path))
+				continue
 			}
-			if err := run("systemctl", "--user", "daemon-reload"); err != nil {
-				return did, err
+			if string(old) != u.Body {
+				if err := writeUnit(u); err != nil {
+					return did, err
+				}
+				if err := run("systemctl", "--user", "daemon-reload"); err != nil {
+					return did, fmt.Errorf("systemctl --user daemon-reload: %w (no user session bus? log in, or run `loginctl enable-linger $USER`)", err)
+				}
 			}
-			if err := run("systemctl", "--user", "enable", "--now", u.Name+".service"); err != nil {
-				return did, err
+			if !enabled {
+				if err := run("systemctl", "--user", "enable", unit); err != nil {
+					return did, err
+				}
 			}
+			if startNow && !active {
+				if err := run("systemctl", "--user", "start", unit); err != nil {
+					return did, err
+				}
+				did = append(did, fmt.Sprintf("installed and started %s (%s)", u.Name, strings.Join(u.Argv, " ")))
+				continue
+			}
+			if active && string(old) != u.Body {
+				did = append(did, fmt.Sprintf("updated %s (%s); the running copy is older: takes effect after just stop / just run", u.Name, u.Path))
+				continue
+			}
+			did = append(did, fmt.Sprintf("installed %s (%s): starts at boot; `just run` starts it now", u.Name, strings.Join(u.Argv, " ")))
+			continue
 		case "windows":
 			// From XML: the schtasks command line cannot set a restart on failure, and leaves Windows' default
 			// 72 h execution limit, which would stop the server after three days.

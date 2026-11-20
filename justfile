@@ -85,9 +85,14 @@ run: _binary
     mkdir -p data/git_ignore/logs
     # Installed as a LaunchAgent (just install-service): launchd starts it, so it is the only copy and restarts on a crash.
     plist="$HOME/Library/LaunchAgents/ai.act3.processing_server.plist"
+    unit="$HOME/.config/systemd/user/act3-processing-server.service"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     if [ "$(uname)" = "Darwin" ] && [ -f "$plist" ]; then
       launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl kickstart "gui/$(id -u)/ai.act3.processing_server"
       pid=launchd
+    elif [ "$(uname)" = "Linux" ] && [ -f "$unit" ] && systemctl --user start act3-processing-server.service 2>/dev/null; then
+      # Installed as a systemd user unit (just build / just install-service): systemd owns it, restarts it on a crash
+      pid=systemd
     else
       nohup ./{{bin}} run > data/git_ignore/logs/server.stdout.log 2>&1 &
       pid=$!
@@ -100,7 +105,7 @@ run: _binary
         echo "logs: just logs (~/_act3_logs/processing_server.info, .err) · stdout: data/git_ignore/logs/server.stdout.log"
         exit 0
       fi
-      if [ "$pid" != launchd ] && ! kill -0 "$pid" 2>/dev/null; then
+      if [ "$pid" != launchd ] && [ "$pid" != systemd ] && ! kill -0 "$pid" 2>/dev/null; then
         echo "server exited during start:"; tail -n 30 data/git_ignore/logs/server.stdout.log; exit 1
       fi
       sleep 0.25
@@ -126,6 +131,9 @@ stop mode="": _binary
     @./{{bin}} stop {{ if mode == "force" { "--force" } else { "" } }}
     @# unload the LaunchAgent so launchd does not restart it (a killed server is not a clean exit); `just run` reloads it
     -@[ "`uname`" = Darwin ] && launchctl bootout "gui/`id -u`/ai.act3.processing_server" 2>/dev/null || true
+    @# Linux: the same for the systemd user unit (after a drained exit it is already inactive; after `stop force` it
+    @# would restart in RestartSec). Still enabled, so the next boot starts it; `just run` starts it again.
+    -@[ "`uname`" = Linux ] && XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/`id -u`}" systemctl --user stop act3-processing-server.service 2>/dev/null || true
 
 [windows]
 stop mode="": _binary
@@ -307,7 +315,15 @@ broker-stop:
 _service-ensure:
     #!/usr/bin/env bash
     if [ -n "${APS_NO_SERVICE:-}" ]; then echo "service: skipped (APS_NO_SERVICE set)"; exit 0; fi
-    if [ "$(uname)" != "Darwin" ]; then echo "service: not automated on $(uname) yet (systemd unit: pm/TO_DO.md)"; exit 0; fi
+    case "$(uname)" in
+      Darwin) ;;
+      Linux)
+        # systemd --user units (act3-processing-server[, -broker]); enabled for boot, never restarted here
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        if ! systemctl --user show-environment >/dev/null 2>&1; then echo "service: skipped: no systemd user session (log in, or run: sudo loginctl enable-linger $(id -un))"; exit 0; fi
+        [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = yes ] || echo "warning: linger is off: the server starts at login, not at boot. Run once: sudo loginctl enable-linger $(id -un)" ;;
+      *) echo "service: not automated on $(uname) yet (pm/TO_DO.md)"; exit 0 ;;
+    esac
     ./{{bin}} service ensure || { echo "warning: service: the OS services were not installed (error above); the server still runs with just run"; }
 
 [windows]
