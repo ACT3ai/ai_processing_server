@@ -127,6 +127,9 @@ var engineProbes = []engineProbe{
 	// the third render task, the join of picture and sound (mode join); optional: the whole-shot job joins by itself
 	{name: "act3_motion_join", binaries: []string{"act3-motion-join"}, args: []string{"--version"}, optIn: true,
 		candidates: func() []string { return MotionBinCandidates("act3-motion-join") }},
+	// the output check (mode verify, motion.mdx §74); optional like the join
+	{name: "act3_motion_verify", binaries: []string{"act3-motion-verify"}, args: []string{"--version"}, optIn: true,
+		candidates: func() []string { return MotionBinCandidates("act3-motion-verify") }},
 	{name: "node", binaries: []string{"node"}, args: []string{"--version"}, extra: map[string][]string{
 		"darwin": {"/opt/homebrew/bin/node", "/usr/local/bin/node"},
 		"linux":  {"/usr/local/bin/node", "/usr/bin/node"},

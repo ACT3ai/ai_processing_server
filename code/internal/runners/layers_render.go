@@ -78,6 +78,7 @@ type layersTask struct {
 	LayersPlan      json.RawMessage `json:"layersPlan"`
 	Assets          []LayersAsset   `json:"assets"`
 	HTMLLayers      *int            `json:"htmlLayers"`
+	Expect          json.RawMessage `json:"expect"`
 }
 
 type layersParams struct {
@@ -98,9 +99,12 @@ const (
 	ModePicture = "picture" // act3-motion-video combine: html → combine, no sound → picture.mp4 / .mov (output "video")
 	ModeAudio   = "audio"   // act3-motion-audio mix: the audio_mix step → audio.wav (output "audio")
 	ModeJoin    = "join"    // act3-motion-join join: inputs `picture` + `audio` (optional) → final.mp4 (output "video")
+	// ModeVerify is the output check (motion.mdx §74): act3-motion-verify check, input `video` (+ optional `reference`),
+	// params.expect → verify.json (output "verify"). A FAIL is a finished task whose JSON says FAIL, never a retry.
+	ModeVerify = "verify"
 )
 
-var layersModes = []string{ModeShot, ModePicture, ModeAudio, ModeJoin}
+var layersModes = []string{ModeShot, ModePicture, ModeAudio, ModeJoin, ModeVerify}
 
 // layersJob is the job's params, resolved.
 type layersJob struct {
@@ -112,6 +116,8 @@ type layersJob struct {
 	Assets          []LayersAsset
 	HTMLLayers      int
 	DurationSeconds float64
+	// Expect is mode verify's params.expect (a JSON object, motion.mdx §74.2); nil = no expectation.
+	Expect map[string]any
 }
 
 var assetIDRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
@@ -148,6 +154,9 @@ func parseLayersParams(job *jobs.Job) (layersJob, error) {
 		if rt.ShotID == "" {
 			rt.ShotID = t.ShotID
 		}
+		if len(rt.Expect) == 0 {
+			rt.Expect = t.Expect
+		}
 		t = *rt
 	}
 	mode := strings.ToLower(strings.TrimSpace(t.Mode))
@@ -168,6 +177,22 @@ func parseLayersParams(job *jobs.Job) (layersJob, error) {
 		return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "params.join.audioBitrate %q is not like 256k", jo.AudioBitrate)
 	}
 	raw := firstRaw(t.Plan, t.LayersPlan)
+	if mode == ModeVerify {
+		// the check needs no plan: its input is the finished file, its expectation params.expect
+		lj := layersJob{Mode: mode, RenderID: t.RenderID, ShotID: t.ShotID, DurationSeconds: t.DurationSeconds}
+		if e := firstRaw(t.Expect); e != nil {
+			if err := json.Unmarshal(e, &lj.Expect); err != nil || lj.Expect == nil {
+				return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "params.expect must be a JSON object (motion.mdx §74.2)")
+			}
+			if s, ok := lj.Expect["seconds"].(float64); ok && lj.DurationSeconds <= 0 {
+				lj.DurationSeconds = s
+			}
+			if f, ok := lj.Expect["lengthFlicks"].(float64); ok && f > 0 && lj.DurationSeconds <= 0 {
+				lj.DurationSeconds = f / FlicksPerSecond
+			}
+		}
+		return lj, nil
+	}
 	if mode == ModeJoin {
 		// the join needs no plan: its two inputs are files; the plan, when sent, only gives the shot's length
 		lj := layersJob{Mode: mode, Join: jo, RenderID: t.RenderID, ShotID: t.ShotID, DurationSeconds: t.DurationSeconds}
@@ -270,6 +295,8 @@ func layersOutput(lj layersJob) (name, file, contentType string) {
 	switch lj.Mode {
 	case ModeAudio:
 		return "audio", "audio.wav", "audio/wav"
+	case ModeVerify:
+		return "verify", "verify.json", "application/json"
 	case ModePicture:
 		if planCodec(lj.Plan) == "prores4444" {
 			return "video", "picture.mov", "video/quicktime"
@@ -486,6 +513,7 @@ func LayersTimeLimit(durationSeconds float64, htmlLayers int) time.Duration {
 type LayersBins struct {
 	Video, Audio string // act3-motion-video, act3-motion-audio
 	Join         string // act3-motion-join (mode join)
+	Verify       string // act3-motion-verify (mode verify)
 	FFmpeg       string
 	FFprobe      string
 	Node         string
@@ -658,13 +686,16 @@ func expandTilde(p string) string {
 }
 
 // layersEnginesFor is what a mode runs: the video job needs both Rust binaries (it starts the audio job itself) and Node
-// for the HTML runner; the audio job only act3-motion-audio; the join only act3-motion-join. FFmpeg and ffprobe always.
+// for the HTML runner; the audio job only act3-motion-audio; the join only act3-motion-join; the check only
+// act3-motion-verify. FFmpeg and ffprobe always.
 func layersEnginesFor(mode string) []string {
 	switch mode {
 	case ModeAudio:
 		return []string{"act3_motion_audio", "ffmpeg", "ffprobe"}
 	case ModeJoin:
 		return []string{"act3_motion_join", "ffmpeg", "ffprobe"}
+	case ModeVerify:
+		return []string{"act3_motion_verify", "ffmpeg", "ffprobe"}
 	default:
 		return []string{"act3_motion_video", "act3_motion_audio", "ffmpeg", "ffprobe", "node"}
 	}
@@ -699,6 +730,15 @@ func (LayersRender) Check(_ context.Context, job *jobs.Job, env Env) error {
 		}
 		if !names["picture"] {
 			return jobs.Errf(jobs.KindInvalidInput, "mode join needs an input named picture (and usually one named audio)")
+		}
+	}
+	if lj.Mode == ModeVerify {
+		names := map[string]bool{}
+		for _, in := range job.Payload.Inputs {
+			names[in.Name] = true
+		}
+		if !names["video"] {
+			return jobs.Errf(jobs.KindInvalidInput, "mode verify needs an input named video (and optionally one named reference)")
 		}
 	}
 	if len(lj.Assets) > 0 {
@@ -775,8 +815,9 @@ func freezeLayersTools(env Env, jobDir, cache, mode string) (LayersBins, []strin
 	if c := env.Engines["chromium"]; c != nil {
 		b.Chrome = c.Path
 	}
-	bins := map[string]*string{"act3_motion_video": &b.Video, "act3_motion_audio": &b.Audio, "act3_motion_join": &b.Join}
-	names := map[string]string{"act3_motion_video": "act3-motion-video", "act3_motion_audio": "act3-motion-audio", "act3_motion_join": "act3-motion-join"}
+	bins := map[string]*string{"act3_motion_video": &b.Video, "act3_motion_audio": &b.Audio, "act3_motion_join": &b.Join, "act3_motion_verify": &b.Verify}
+	names := map[string]string{"act3_motion_video": "act3-motion-video", "act3_motion_audio": "act3-motion-audio", "act3_motion_join": "act3-motion-join",
+		"act3_motion_verify": "act3-motion-verify"}
 	from := ""
 	for _, eng := range layersEnginesFor(mode) {
 		dst, ok := bins[eng]
@@ -842,6 +883,54 @@ func LayersJoinCommand(b LayersBins, picture, audio, outPath string, o LayersJoi
 	return args
 }
 
+// LayersVerifyCommand is act3-motion-verify's argument list for mode verify (motion.mdx §74).
+func LayersVerifyCommand(b LayersBins, video, reference, expectPath, outPath string) []string {
+	args := []string{"check", "--in", video, "--out", outPath, "--ffmpeg", b.FFmpeg, "--ffprobe", b.FFprobe}
+	if expectPath != "" {
+		args = append(args, "--expect", expectPath)
+	}
+	if reference != "" {
+		args = append(args, "--reference", reference)
+	}
+	return args
+}
+
+// VerifyExpectFor is params.expect with its file references made local: `pictureFrom` and each `soundWindows[].source`
+// that names one of the job's inputs (e.g. "reference", "voice") becomes that input's path on this server. Any other
+// value is left as sent (the check reports a source it cannot read).
+func VerifyExpectFor(expect map[string]any, inputs map[string]string) map[string]any {
+	if expect == nil {
+		return nil
+	}
+	out := make(map[string]any, len(expect))
+	for k, v := range expect {
+		out[k] = v
+	}
+	if s, ok := out["pictureFrom"].(string); ok && inputs[s] != "" {
+		out["pictureFrom"] = inputs[s]
+	}
+	if ws, ok := out["soundWindows"].([]any); ok {
+		copied := make([]any, len(ws))
+		for i, w := range ws {
+			m, ok := w.(map[string]any)
+			if !ok {
+				copied[i] = w
+				continue
+			}
+			c := make(map[string]any, len(m))
+			for k, v := range m {
+				c[k] = v
+			}
+			if s, ok := c["source"].(string); ok && inputs[s] != "" {
+				c["source"] = inputs[s]
+			}
+			copied[i] = c
+		}
+		out["soundWindows"] = copied
+	}
+	return out
+}
+
 var errLayersLimit = errors.New("layers render over its time limit")
 
 // layersLimitFor is LayersTimeLimit; tests shorten it.
@@ -887,6 +976,23 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 			return nil, jobs.Errf(jobs.KindInvalidInput, "mode join needs an input named picture")
 		}
 		prog, args = []string{bins.Join}, LayersJoinCommand(bins, picture, audio, outPath, lj.Join)
+	case ModeVerify:
+		video := env.Inputs["video"]
+		if video == "" {
+			return nil, jobs.Errf(jobs.KindInvalidInput, "mode verify needs an input named video")
+		}
+		expectPath := ""
+		if e := VerifyExpectFor(lj.Expect, env.Inputs); e != nil {
+			expectPath = filepath.Join(jobDir, "expect.json")
+			b, err := json.MarshalIndent(e, "", "  ")
+			if err != nil {
+				return nil, jobs.Wrap(jobs.KindInternal, err, "encode expect.json")
+			}
+			if err := os.WriteFile(expectPath, b, 0o600); err != nil {
+				return nil, jobs.Wrap(jobs.KindInfra, err, "write expect.json")
+			}
+		}
+		prog, args = []string{bins.Verify}, LayersVerifyCommand(bins, video, env.Inputs["reference"], expectPath, outPath)
 	default:
 		paths, err := PlaceLayersAssets(lj.Assets, env.Inputs, filepath.Join(jobDir, "assets"))
 		if err != nil {
@@ -962,6 +1068,10 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 	})
 	runtimeMS := time.Since(t0).Milliseconds()
 	summary := lastJSONObject(stdout)
+	if err != nil && lj.Mode == ModeVerify && LayersExitCode(err) == 3 && fileAtLeast(outPath, 2) && summary["result"] == "FAIL" {
+		// the check ran and found errors: that is its answer (verify.json says FAIL), not a failed task to retry
+		err = nil
+	}
 	if err != nil {
 		if errors.Is(context.Cause(runCtx), errLayersLimit) && ctx.Err() == nil {
 			return nil, jobs.Errf(jobs.KindTimeout, "layers render (mode %s) stopped at its time limit (%s for %.1f s with %d HTML layers); last output: %s", lj.Mode, limit, lj.DurationSeconds, lj.HTMLLayers, strings.Join(tail, " | "))
@@ -972,7 +1082,11 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 		return nil, layersFailure(err, summary, tail, job.ID, tool)
 	}
 	// act3-motion-video and act3-motion-join print {"ok": true, …}; act3-motion-audio prints its mix summary
-	if ok, has := summary["ok"].(bool); summary == nil || (has && !ok) || (!has && lj.Mode != ModeAudio) {
+	if lj.Mode == ModeVerify {
+		if r, _ := summary["result"].(string); r != "PASS" && r != "WARN" && r != "FAIL" {
+			return nil, layersFailure(fmt.Errorf("%s exited without a PASS / WARN / FAIL summary", tool), summary, tail, job.ID, tool)
+		}
+	} else if ok, has := summary["ok"].(bool); summary == nil || (has && !ok) || (!has && lj.Mode != ModeAudio) {
 		return nil, layersFailure(fmt.Errorf("%s exited 0 without an ok summary", tool), summary, tail, job.ID, tool)
 	}
 	if !fileAtLeast(outPath, 1) {
@@ -981,6 +1095,15 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 	meta := map[string]any{"runtime_ms": runtimeMS, "html_layers": lj.HTMLLayers, "duration_s": lj.DurationSeconds, "mode": lj.Mode}
 	rep.Progress(1, fmt.Sprintf("%s: %.1f s of output in %.1f s", lj.Mode, lj.DurationSeconds, float64(runtimeMS)/1000))
 	data := map[string]any{"summary": summary, "runtime_ms": runtimeMS, "render_id": lj.RenderID, "shot_id": lj.ShotID, "mode": lj.Mode}
+	if lj.Mode == ModeVerify {
+		// the whole verify.json rides on the result too (small), so the caller needs no second download
+		var v map[string]any
+		if b, err := os.ReadFile(outPath); err == nil && json.Unmarshal(b, &v) == nil {
+			data["verify"] = v
+		}
+		data["result"] = summary["result"]
+		meta["result"] = summary["result"]
+	}
 	return &Result{Outputs: []jobs.Output{{Name: outName, Path: outPath, ContentType: outType, Meta: meta}}, Data: data}, nil
 }
 

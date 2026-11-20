@@ -645,11 +645,13 @@ hands the job to this server like every other render.
   | `picture` | `act3-motion-video combine`: HTML layers → combine, no sound | the plan with a combine step | `video` `picture.mp4` / `picture.mov` (ProRes 4444 keeps alpha) |
   | `audio` | `act3-motion-audio mix --plan` | the plan with an audio_mix step; never starts Chromium | `audio` `audio.wav` (audio/wav) |
   | `join` | `act3-motion-join join --picture --audio [--length-flicks] [--audio-bitrate]` | inputs named `picture` (required) and `audio`; `params.join.{lengthFlicks, audioBitrate}` (or the plan's `output.lengthFlicks`); no plan needed | `video` `final.mp4` |
+  | `verify` | `act3-motion-verify check --in --expect --reference --out` (the output check, motion.mdx §74) | input named `video` (required), optional `reference` (its picture must be byte-identical; the sound windows are measured against its sound); `params.expect` (motion.mdx §74.2, a JSON object; `pictureFrom` / `soundWindows[].source` that name an input become its local path); no plan needed | `verify` `verify.json` (application/json); `result.verify` = the whole JSON, `result.result` = PASS / WARN / FAIL |
 
-  Only the binaries a mode runs are frozen into the job (`layersEnginesFor`); `act3_motion_join` is probed like the
+  Only the binaries a mode runs are frozen into the job (`layersEnginesFor`); `act3_motion_join` and `act3_motion_verify` are probed like the
   other two and checked per job, so a server without it still offers the other modes. `output.codec: png` is refused
   (a folder cannot be one output). A Chromium that is not a pinned headless shell is logged as a WARNING (motion.mdx
-  §43.2). The Mac Studio self-test sends all four through the queue:
+  §43.2). Mode `verify` answers FAIL as a FINISHED task (exit 3 with its verify.json written): the check's answer is
+  never retried; exit 3 without a verify.json is a failed task. The Mac Studio self-test sends the first four through the queue:
   ~/BGit/all/film/test/unit_test/motion_graphics/p_mac_studio_self_test.md.
 * Errors: exit 2 (bad command line or plan) → `invalid_input`; a tool that cannot start → `infra`; exit 3 or anything else
   → `transient`. The message is the summary's `error` plus the last stderr lines; each failure is also a WARN in
