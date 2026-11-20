@@ -623,7 +623,7 @@ hands the job to this server like every other render.
 * Every string `asset:<id>` anywhere in the plan (layers' `source.url` / `source.path`, `bundle.files[].url` — their
   relative `path` is kept —, audio_mix `plan.inputs[].source.url`, `join.picture.url`) becomes the absolute local path.
   An id the job did not send is `invalid_input`, naming each one. Prose such as "asset: the map" is not a reference.
-* Frozen tools (house rule: a git pull or a rebuild never changes a running job): both binaries are copied into
+* Frozen tools (house rule: a git pull or a rebuild never changes a running job): the binaries the mode runs are copied into
   `<job>/bin/`, and render_tasks' `motion_video/templates` + `html_runner/render.mjs` (found beside the binaries, or at
   `$ACT3_MOTION_SRC_DIR`) into `<job>/motion_video/`, passed as `--templates` / `--runner`.
 * Command: `<job>/bin/act3-motion-video run --plan <job>/plan.json --out <out>/final.mp4 --work <job>/work --cache
@@ -635,7 +635,22 @@ hands the job to this server like every other render.
   rising fraction (HTML layers 0.05-0.35, combine to 0.90, join to 0.98), reported at most about once a second (a
   finished step always). Other stderr lines go to the job log.
 * Output `video` (video/mp4, `final.mp4`); the job's `result` is `{summary: <act3-motion-video's stdout JSON>, runtime_ms,
-  render_id, shot_id}` — the engine sends `summary` as `complete.body.summary`.
+  render_id, shot_id, mode}` — the engine sends `summary` as `complete.body.summary`.
+* Modes (`params.mode` or `renderTask.mode`, added 2026-11-19; motion.mdx §39, §49): the same work as one task or as
+  separate render tasks.
+
+  | mode | Runs | Needs | Output |
+  | --- | --- | --- | --- |
+  | `shot` (default) | `act3-motion-video run`: HTML layers → combine ‖ audio job → join | the plan | `video` `final.mp4` (`final.mov` for prores4444) |
+  | `picture` | `act3-motion-video combine`: HTML layers → combine, no sound | the plan with a combine step | `video` `picture.mp4` / `picture.mov` (ProRes 4444 keeps alpha) |
+  | `audio` | `act3-motion-audio mix --plan` | the plan with an audio_mix step; never starts Chromium | `audio` `audio.wav` (audio/wav) |
+  | `join` | `act3-motion-join join --picture --audio [--length-flicks] [--audio-bitrate]` | inputs named `picture` (required) and `audio`; `params.join.{lengthFlicks, audioBitrate}` (or the plan's `output.lengthFlicks`); no plan needed | `video` `final.mp4` |
+
+  Only the binaries a mode runs are frozen into the job (`layersEnginesFor`); `act3_motion_join` is probed like the
+  other two and checked per job, so a server without it still offers the other modes. `output.codec: png` is refused
+  (a folder cannot be one output). A Chromium that is not a pinned headless shell is logged as a WARNING (motion.mdx
+  §43.2). The Mac Studio self-test sends all four through the queue:
+  ~/BGit/all/film/test/unit_test/motion_graphics/p_mac_studio_self_test.md.
 * Errors: exit 2 (bad command line or plan) → `invalid_input`; a tool that cannot start → `infra`; exit 3 or anything else
   → `transient`. The message is the summary's `error` plus the last stderr lines; each failure is also a WARN in
   error.err (`internal/errlog`).

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,6 +69,8 @@ type LayersAsset struct {
 }
 
 type layersTask struct {
+	Mode            string          `json:"mode"`
+	Join            *LayersJoinOpts `json:"join"`
 	RenderID        string          `json:"renderId"`
 	ShotID          string          `json:"shotId"`
 	DurationSeconds float64         `json:"durationSeconds"`
@@ -82,8 +85,27 @@ type layersParams struct {
 	RenderTask *layersTask `json:"renderTask"`
 }
 
+// LayersJoinOpts are the join task's options (mode join): the shot's length (else the picture's own) and the AAC rate.
+type LayersJoinOpts struct {
+	LengthFlicks *int64 `json:"lengthFlicks"`
+	AudioBitrate string `json:"audioBitrate"`
+}
+
+// The four kinds of layers task (motion.mdx §39, §49). A whole shot is one task (shot); the same work can also go as
+// separate tasks: the picture (html_render + combine, no sound), the sound (the audio job's WAV), and the join of the two.
+const (
+	ModeShot    = "shot"    // act3-motion-video run: html → combine ‖ audio → join → final.mp4 (output "video")
+	ModePicture = "picture" // act3-motion-video combine: html → combine, no sound → picture.mp4 / .mov (output "video")
+	ModeAudio   = "audio"   // act3-motion-audio mix: the audio_mix step → audio.wav (output "audio")
+	ModeJoin    = "join"    // act3-motion-join join: inputs `picture` + `audio` (optional) → final.mp4 (output "video")
+)
+
+var layersModes = []string{ModeShot, ModePicture, ModeAudio, ModeJoin}
+
 // layersJob is the job's params, resolved.
 type layersJob struct {
+	Mode            string
+	Join            LayersJoinOpts
 	RenderID        string
 	ShotID          string
 	Plan            map[string]any
@@ -102,6 +124,12 @@ func parseLayersParams(job *jobs.Job) (layersJob, error) {
 	t := p.layersTask
 	if rt := p.RenderTask; rt != nil {
 		// the job's own renderTask wins; flat fields fill its gaps
+		if rt.Mode == "" {
+			rt.Mode = t.Mode
+		}
+		if rt.Join == nil {
+			rt.Join = t.Join
+		}
 		if len(rt.Plan) == 0 {
 			rt.Plan = firstRaw(rt.LayersPlan, t.Plan, t.LayersPlan)
 		}
@@ -122,7 +150,45 @@ func parseLayersParams(job *jobs.Job) (layersJob, error) {
 		}
 		t = *rt
 	}
+	mode := strings.ToLower(strings.TrimSpace(t.Mode))
+	if mode == "" {
+		mode = ModeShot
+	}
+	if !slices.Contains(layersModes, mode) {
+		return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "params.mode %q is not one of %s", t.Mode, strings.Join(layersModes, ", "))
+	}
+	var jo LayersJoinOpts
+	if t.Join != nil {
+		jo = *t.Join
+	}
+	if jo.LengthFlicks != nil && (*jo.LengthFlicks <= 0 || *jo.LengthFlicks > 3600*FlicksPerSecond) {
+		return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "params.join.lengthFlicks %d is not 1 flick .. 1 hour", *jo.LengthFlicks)
+	}
+	if jo.AudioBitrate != "" && !bitrateRe.MatchString(jo.AudioBitrate) {
+		return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "params.join.audioBitrate %q is not like 256k", jo.AudioBitrate)
+	}
 	raw := firstRaw(t.Plan, t.LayersPlan)
+	if mode == ModeJoin {
+		// the join needs no plan: its two inputs are files; the plan, when sent, only gives the shot's length
+		lj := layersJob{Mode: mode, Join: jo, RenderID: t.RenderID, ShotID: t.ShotID, DurationSeconds: t.DurationSeconds}
+		if len(raw) > 0 && string(raw) != "null" {
+			var plan map[string]any
+			if json.Unmarshal(raw, &plan) == nil {
+				if jo.LengthFlicks == nil {
+					if out, ok := plan["output"].(map[string]any); ok {
+						if f, ok := out["lengthFlicks"].(float64); ok && f > 0 {
+							n := int64(f)
+							lj.Join.LengthFlicks = &n
+						}
+					}
+				}
+			}
+		}
+		if lj.DurationSeconds <= 0 && lj.Join.LengthFlicks != nil {
+			lj.DurationSeconds = float64(*lj.Join.LengthFlicks) / FlicksPerSecond
+		}
+		return lj, nil
+	}
 	if len(raw) == 0 || string(raw) == "null" {
 		return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "a layers render needs its plan (params.renderTask.plan)")
 	}
@@ -143,10 +209,24 @@ func parseLayersParams(job *jobs.Job) (layersJob, error) {
 		}
 		seen[a.ID] = true
 	}
-	lj := layersJob{RenderID: t.RenderID, ShotID: t.ShotID, Plan: plan, Assets: t.Assets, DurationSeconds: t.DurationSeconds}
-	if t.HTMLLayers != nil {
+	if mode == ModeAudio {
+		if !planHasStep(plan, "audio_mix") {
+			return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "mode audio needs an audio_mix step in the plan")
+		}
+	}
+	if mode == ModePicture && !planHasStep(plan, "combine") {
+		return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "mode picture needs a combine step in the plan")
+	}
+	if codec := planCodec(plan); codec == "png" {
+		return layersJob{}, jobs.Errf(jobs.KindInvalidInput, "output.codec png (a folder of frames) cannot be sent back as one output: use h264 or prores4444")
+	}
+	lj := layersJob{Mode: mode, Join: jo, RenderID: t.RenderID, ShotID: t.ShotID, Plan: plan, Assets: t.Assets, DurationSeconds: t.DurationSeconds}
+	switch {
+	case mode == ModeAudio:
+		lj.HTMLLayers = 0 // the audio job never starts Chromium
+	case t.HTMLLayers != nil:
 		lj.HTMLLayers = max(*t.HTMLLayers, 0)
-	} else {
+	default:
 		lj.HTMLLayers = countHTMLSteps(plan)
 	}
 	if lj.DurationSeconds <= 0 {
@@ -162,6 +242,45 @@ func firstRaw(rs ...json.RawMessage) json.RawMessage {
 		}
 	}
 	return nil
+}
+
+var bitrateRe = regexp.MustCompile(`^[1-9][0-9]{1,3}k$`)
+
+func planHasStep(plan map[string]any, kind string) bool {
+	steps, _ := plan["steps"].([]any)
+	for _, st := range steps {
+		if m, ok := st.(map[string]any); ok && m["kind"] == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// planCodec is output.codec ("h264" when the plan does not say).
+func planCodec(plan map[string]any) string {
+	out, _ := plan["output"].(map[string]any)
+	if c, ok := out["codec"].(string); ok && c != "" {
+		return strings.ToLower(c)
+	}
+	return "h264"
+}
+
+// layersOutput is the output file of a mode: its name, file name and content type.
+func layersOutput(lj layersJob) (name, file, contentType string) {
+	switch lj.Mode {
+	case ModeAudio:
+		return "audio", "audio.wav", "audio/wav"
+	case ModePicture:
+		if planCodec(lj.Plan) == "prores4444" {
+			return "video", "picture.mov", "video/quicktime"
+		}
+		return "video", "picture.mp4", "video/mp4"
+	default:
+		if lj.Plan != nil && planCodec(lj.Plan) == "prores4444" {
+			return "video", "final.mov", "video/quicktime"
+		}
+		return "video", "final.mp4", "video/mp4"
+	}
 }
 
 func countHTMLSteps(plan map[string]any) int {
@@ -353,6 +472,7 @@ func LayersTimeLimit(durationSeconds float64, htmlLayers int) time.Duration {
 // LayersBins is what one layers render runs, all copied into the job directory.
 type LayersBins struct {
 	Video, Audio string // act3-motion-video, act3-motion-audio
+	Join         string // act3-motion-join (mode join)
 	FFmpeg       string
 	FFprobe      string
 	Node         string
@@ -524,9 +644,26 @@ func expandTilde(p string) string {
 	return p
 }
 
-func engineMissing(env Env, html int) []string {
+// layersEnginesFor is what a mode runs: the video job needs both Rust binaries (it starts the audio job itself) and Node
+// for the HTML runner; the audio job only act3-motion-audio; the join only act3-motion-join. FFmpeg and ffprobe always.
+func layersEnginesFor(mode string) []string {
+	switch mode {
+	case ModeAudio:
+		return []string{"act3_motion_audio", "ffmpeg", "ffprobe"}
+	case ModeJoin:
+		return []string{"act3_motion_join", "ffmpeg", "ffprobe"}
+	default:
+		return []string{"act3_motion_video", "act3_motion_audio", "ffmpeg", "ffprobe", "node"}
+	}
+}
+
+func engineMissing(env Env, html int, mode ...string) []string {
 	var miss []string
-	for _, n := range []string{"act3_motion_video", "act3_motion_audio", "ffmpeg", "ffprobe", "node"} {
+	m := ModeShot
+	if len(mode) > 0 && mode[0] != "" {
+		m = mode[0]
+	}
+	for _, n := range layersEnginesFor(m) {
 		if env.Engines[n] == nil || env.Engines[n].Path == "" {
 			miss = append(miss, n)
 		}
@@ -541,6 +678,15 @@ func (LayersRender) Check(_ context.Context, job *jobs.Job, env Env) error {
 	lj, err := parseLayersParams(job)
 	if err != nil {
 		return err
+	}
+	if lj.Mode == ModeJoin {
+		names := map[string]bool{}
+		for _, in := range job.Payload.Inputs {
+			names[in.Name] = true
+		}
+		if !names["picture"] {
+			return jobs.Errf(jobs.KindInvalidInput, "mode join needs an input named picture (and usually one named audio)")
+		}
 	}
 	if len(lj.Assets) > 0 {
 		known := map[string]string{}
@@ -560,8 +706,8 @@ func (LayersRender) Check(_ context.Context, job *jobs.Job, env Env) error {
 			return jobs.Errf(jobs.KindInvalidInput, "the plan lists %d assets but the job sends %d inputs", len(lj.Assets), n)
 		}
 	}
-	if miss := engineMissing(env, lj.HTMLLayers); len(miss) > 0 {
-		return jobs.Errf(jobs.KindInfra, "layers_render is not installed on this server: missing %s (build ~/BGit/all/film/code/render_tasks with `cargo build --release --workspace`, set ACT3_MOTION_BIN_DIR, install node and Playwright's chromium-headless-shell)", strings.Join(miss, ", "))
+	if miss := engineMissing(env, lj.HTMLLayers, lj.Mode); len(miss) > 0 {
+		return jobs.Errf(jobs.KindInfra, "layers_render (mode %s) is not installed on this server: missing %s (build ~/BGit/all/film/code/render_tasks with `cargo build --release --workspace`, set ACT3_MOTION_BIN_DIR, install node and Playwright's chromium-headless-shell)", lj.Mode, strings.Join(miss, ", "))
 	}
 	return nil
 }
@@ -601,27 +747,45 @@ func copyTree(src, dst string) error {
 	})
 }
 
-// freezeLayersTools copies what the job runs into jobDir/bin and jobDir/motion_video.
-func freezeLayersTools(env Env, jobDir, cache string) (LayersBins, []string, error) {
+// freezeLayersTools copies what the job runs into jobDir/bin (and, for the video job, jobDir/motion_video): only the
+// binaries its mode runs (layersEnginesFor), so a rebuild or a git pull mid-job never changes them.
+func freezeLayersTools(env Env, jobDir, cache, mode string) (LayersBins, []string, error) {
 	var notes []string
 	exe := ""
 	if runtime.GOOS == "windows" {
 		exe = ".exe"
 	}
-	b := LayersBins{
-		Video: filepath.Join(jobDir, "bin", "act3-motion-video"+exe), Audio: filepath.Join(jobDir, "bin", "act3-motion-audio"+exe),
-		FFmpeg: env.Engines["ffmpeg"].Path, FFprobe: env.Engines["ffprobe"].Path, Node: env.Engines["node"].Path,
+	b := LayersBins{FFmpeg: env.Engines["ffmpeg"].Path, FFprobe: env.Engines["ffprobe"].Path}
+	if n := env.Engines["node"]; n != nil {
+		b.Node = n.Path
 	}
 	if c := env.Engines["chromium"]; c != nil {
 		b.Chrome = c.Path
 	}
-	srcVideo := env.Engines["act3_motion_video"].Path
-	for _, c := range [][2]string{{srcVideo, b.Video}, {env.Engines["act3_motion_audio"].Path, b.Audio}} {
-		if err := copyExecutable(c[0], c[1]); err != nil {
-			return b, notes, jobs.Wrap(jobs.KindInfra, err, "copy "+filepath.Base(c[0])+" into the job")
+	bins := map[string]*string{"act3_motion_video": &b.Video, "act3_motion_audio": &b.Audio, "act3_motion_join": &b.Join}
+	names := map[string]string{"act3_motion_video": "act3-motion-video", "act3_motion_audio": "act3-motion-audio", "act3_motion_join": "act3-motion-join"}
+	from := ""
+	for _, eng := range layersEnginesFor(mode) {
+		dst, ok := bins[eng]
+		if !ok {
+			continue
 		}
+		src := env.Engines[eng].Path
+		*dst = filepath.Join(jobDir, "bin", names[eng]+exe)
+		if err := copyExecutable(src, *dst); err != nil {
+			return b, notes, jobs.Wrap(jobs.KindInfra, err, "copy "+filepath.Base(src)+" into the job")
+		}
+		from = filepath.Dir(src)
 	}
-	notes = append(notes, "binaries frozen from "+filepath.Dir(srcVideo))
+	notes = append(notes, "binaries frozen from "+from)
+	if mode != ModeShot && mode != ModePicture {
+		return b, notes, nil
+	}
+	if b.Chrome != "" && !strings.Contains(b.Chrome, "headless") {
+		// motion.mdx §43.2: a pinned headless shell, never the machine owner's own Chrome (it updates itself under a job)
+		notes = append(notes, "WARNING Chromium is "+b.Chrome+", not a pinned headless shell: install it (npx playwright install chromium-headless-shell) or set ACT3_CHROMIUM")
+	}
+	srcVideo := env.Engines["act3_motion_video"].Path
 	if src := motionSourceDir(srcVideo); src != "" {
 		mv := filepath.Join(jobDir, "motion_video")
 		if err := copyTree(filepath.Join(src, "templates"), filepath.Join(mv, "templates")); err != nil {
@@ -645,6 +809,26 @@ func freezeLayersTools(env Env, jobDir, cache string) (LayersBins, []string, err
 	return b, notes, nil
 }
 
+// LayersAudioCommand is act3-motion-audio's argument list for mode audio.
+func LayersAudioCommand(b LayersBins, jobDir, outPath string) []string {
+	return []string{"mix", "--plan", filepath.Join(jobDir, "plan.json"), "--out", outPath, "--ffmpeg", b.FFmpeg}
+}
+
+// LayersJoinCommand is act3-motion-join's argument list for mode join.
+func LayersJoinCommand(b LayersBins, picture, audio, outPath string, o LayersJoinOpts) []string {
+	args := []string{"join", "--picture", picture, "--out", outPath, "--ffmpeg", b.FFmpeg, "--ffprobe", b.FFprobe}
+	if audio != "" {
+		args = append(args, "--audio", audio)
+	}
+	if o.LengthFlicks != nil {
+		args = append(args, "--length-flicks", strconv.FormatInt(*o.LengthFlicks, 10))
+	}
+	if o.AudioBitrate != "" {
+		args = append(args, "--audio-bitrate", o.AudioBitrate)
+	}
+	return args
+}
+
 var errLayersLimit = errors.New("layers render over its time limit")
 
 // layersLimitFor is LayersTimeLimit; tests shorten it.
@@ -655,8 +839,8 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 	if err != nil {
 		return nil, err
 	}
-	if miss := engineMissing(env, lj.HTMLLayers); len(miss) > 0 {
-		return nil, jobs.Errf(jobs.KindInfra, "layers_render is not installed on this server: missing %s", strings.Join(miss, ", "))
+	if miss := engineMissing(env, lj.HTMLLayers, lj.Mode); len(miss) > 0 {
+		return nil, jobs.Errf(jobs.KindInfra, "layers_render (mode %s) is not installed on this server: missing %s", lj.Mode, strings.Join(miss, ", "))
 	}
 	jobDir, err := filepath.Abs(filepath.Join(env.WorkDir, "layers"))
 	if err != nil {
@@ -670,38 +854,59 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 	}
 
 	rep.Stage("prepare")
-	bins, notes, err := freezeLayersTools(env, jobDir, cache)
+	bins, notes, err := freezeLayersTools(env, jobDir, cache, lj.Mode)
 	for _, n := range notes {
 		rep.Log("layers_render: " + n)
 	}
 	if err != nil {
 		return nil, err
 	}
-	paths, err := PlaceLayersAssets(lj.Assets, env.Inputs, filepath.Join(jobDir, "assets"))
-	if err != nil {
-		return nil, err
-	}
-	if err := RewriteAssetRefs(lj.Plan, paths); err != nil {
-		return nil, err
-	}
-	planBytes, err := json.MarshalIndent(lj.Plan, "", "  ")
-	if err != nil {
-		return nil, jobs.Wrap(jobs.KindInternal, err, "encode plan.json")
-	}
-	if err := os.WriteFile(filepath.Join(jobDir, "plan.json"), planBytes, 0o600); err != nil {
-		return nil, jobs.Wrap(jobs.KindInfra, err, "write plan.json")
-	}
-	if err := os.MkdirAll(filepath.Join(jobDir, "work"), 0o700); err != nil {
-		return nil, jobs.Wrap(jobs.KindInfra, err, "create the render work folder")
-	}
-	outPath, err := filepath.Abs(filepath.Join(env.OutDir, "final.mp4"))
+	outName, outFile, outType := layersOutput(lj)
+	outPath, err := filepath.Abs(filepath.Join(env.OutDir, outFile))
 	if err != nil {
 		return nil, jobs.Wrap(jobs.KindInternal, err, "output path")
 	}
-	args := LayersCommand(bins, jobDir, outPath, cache)
+	var prog, args []string
+	switch lj.Mode {
+	case ModeJoin:
+		picture, audio := env.Inputs["picture"], env.Inputs["audio"]
+		if picture == "" {
+			return nil, jobs.Errf(jobs.KindInvalidInput, "mode join needs an input named picture")
+		}
+		prog, args = []string{bins.Join}, LayersJoinCommand(bins, picture, audio, outPath, lj.Join)
+	default:
+		paths, err := PlaceLayersAssets(lj.Assets, env.Inputs, filepath.Join(jobDir, "assets"))
+		if err != nil {
+			return nil, err
+		}
+		if err := RewriteAssetRefs(lj.Plan, paths); err != nil {
+			return nil, err
+		}
+		planBytes, err := json.MarshalIndent(lj.Plan, "", "  ")
+		if err != nil {
+			return nil, jobs.Wrap(jobs.KindInternal, err, "encode plan.json")
+		}
+		if err := os.WriteFile(filepath.Join(jobDir, "plan.json"), planBytes, 0o600); err != nil {
+			return nil, jobs.Wrap(jobs.KindInfra, err, "write plan.json")
+		}
+		if err := os.MkdirAll(filepath.Join(jobDir, "work"), 0o700); err != nil {
+			return nil, jobs.Wrap(jobs.KindInfra, err, "create the render work folder")
+		}
+		rep.Log(fmt.Sprintf("layers_render: %d assets", len(paths)))
+		if lj.Mode == ModeAudio {
+			prog, args = []string{bins.Audio}, LayersAudioCommand(bins, jobDir, outPath)
+		} else {
+			args = LayersCommand(bins, jobDir, outPath, cache)
+			if lj.Mode == ModePicture {
+				args[0] = "combine" // picture only: no audio job, no join
+			}
+			prog = []string{bins.Video}
+		}
+	}
 	limit := layersLimitFor(lj.DurationSeconds, lj.HTMLLayers)
-	rep.Log(fmt.Sprintf("layers_render: %d assets, %d HTML layers, %.2f s of output, time limit %s", len(paths), lj.HTMLLayers, lj.DurationSeconds, limit))
-	rep.Log("layers_render: " + bins.Video + " " + strings.Join(args, " "))
+	rep.Log(fmt.Sprintf("layers_render: mode %s, %d HTML layers, %.2f s of output, time limit %s", lj.Mode, lj.HTMLLayers, lj.DurationSeconds, limit))
+	rep.Log("layers_render: " + prog[0] + " " + strings.Join(args, " "))
+	tool := filepath.Base(prog[0])
 
 	runCtx, stop := context.WithTimeoutCause(ctx, limit, errLayersLimit)
 	defer stop()
@@ -710,16 +915,19 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 		extra = append(extra, "ACT3_CHROMIUM="+bins.Chrome)
 	}
 	// Node and FFmpeg on PATH too, for anything the runner starts by name
-	pathDirs := []string{filepath.Dir(bins.Node), filepath.Dir(bins.FFmpeg)}
+	pathDirs := []string{filepath.Dir(bins.FFmpeg)}
+	if bins.Node != "" {
+		pathDirs = append(pathDirs, filepath.Dir(bins.Node))
+	}
 	extra = append(extra, "PATH="+strings.Join(pathDirs, string(os.PathListSeparator))+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	rep.Stage("render")
-	rep.Progress(0.05, "starting act3-motion-video")
-	prog := newLayersProgress(lj.HTMLLayers)
+	rep.Progress(0.05, "starting "+tool)
+	prog2 := newLayersProgress(lj.HTMLLayers)
 	var stdout, tail []string
 	t0 := time.Now()
 	err = procs.Run(runCtx, procs.Spec{
-		Name: bins.Video, Args: args, Dir: jobDir, Grace: ProfileLayers.Grace, Env: extra, StdinNil: true,
+		Name: prog[0], Args: args, Dir: jobDir, Grace: ProfileLayers.Grace, Env: extra, StdinNil: true,
 		Stdout: func(line string) {
 			if strings.TrimSpace(line) != "" {
 				stdout = appendTail(stdout, line, 5)
@@ -727,15 +935,15 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 		},
 		Stderr: func(line string) {
 			if e, ok := ParseMotionEvent(line); ok {
-				if f, note, now := prog.Update(e); now {
+				if f, note, now := prog2.Update(e); now {
 					rep.Progress(f, note)
 				}
 				if e.Event == "step" {
-					rep.Log("act3-motion-video: " + line)
+					rep.Log(tool + ": " + line)
 				}
 				return
 			}
-			rep.Log("act3-motion-video: " + line)
+			rep.Log(tool + ": " + line)
 			tail = appendTail(tail, line, 12)
 		},
 	})
@@ -743,23 +951,24 @@ func (LayersRender) Run(ctx context.Context, job *jobs.Job, env Env, rep Reporte
 	summary := lastJSONObject(stdout)
 	if err != nil {
 		if errors.Is(context.Cause(runCtx), errLayersLimit) && ctx.Err() == nil {
-			return nil, jobs.Errf(jobs.KindTimeout, "layers render stopped at its time limit (%s for %.1f s with %d HTML layers); last output: %s", limit, lj.DurationSeconds, lj.HTMLLayers, strings.Join(tail, " | "))
+			return nil, jobs.Errf(jobs.KindTimeout, "layers render (mode %s) stopped at its time limit (%s for %.1f s with %d HTML layers); last output: %s", lj.Mode, limit, lj.DurationSeconds, lj.HTMLLayers, strings.Join(tail, " | "))
 		}
 		if ctx.Err() != nil {
 			return nil, context.Cause(ctx)
 		}
-		return nil, layersFailure(err, summary, tail, job.ID)
+		return nil, layersFailure(err, summary, tail, job.ID, tool)
 	}
-	if ok, _ := summary["ok"].(bool); !ok {
-		return nil, layersFailure(errors.New("act3-motion-video exited 0 without an ok summary"), summary, tail, job.ID)
+	// act3-motion-video and act3-motion-join print {"ok": true, …}; act3-motion-audio prints its mix summary
+	if ok, has := summary["ok"].(bool); summary == nil || (has && !ok) || (!has && lj.Mode != ModeAudio) {
+		return nil, layersFailure(fmt.Errorf("%s exited 0 without an ok summary", tool), summary, tail, job.ID, tool)
 	}
 	if !fileAtLeast(outPath, 1) {
-		return nil, jobs.Errf(jobs.KindInternal, "act3-motion-video reported ok but wrote no %s", outPath)
+		return nil, jobs.Errf(jobs.KindInternal, "%s reported ok but wrote no %s", tool, outPath)
 	}
-	meta := map[string]any{"runtime_ms": runtimeMS, "html_layers": lj.HTMLLayers, "duration_s": lj.DurationSeconds}
-	rep.Progress(1, fmt.Sprintf("rendered %.1f s in %.1f s", lj.DurationSeconds, float64(runtimeMS)/1000))
-	data := map[string]any{"summary": summary, "runtime_ms": runtimeMS, "render_id": lj.RenderID, "shot_id": lj.ShotID}
-	return &Result{Outputs: []jobs.Output{{Name: "video", Path: outPath, ContentType: "video/mp4", Meta: meta}}, Data: data}, nil
+	meta := map[string]any{"runtime_ms": runtimeMS, "html_layers": lj.HTMLLayers, "duration_s": lj.DurationSeconds, "mode": lj.Mode}
+	rep.Progress(1, fmt.Sprintf("%s: %.1f s of output in %.1f s", lj.Mode, lj.DurationSeconds, float64(runtimeMS)/1000))
+	data := map[string]any{"summary": summary, "runtime_ms": runtimeMS, "render_id": lj.RenderID, "shot_id": lj.ShotID, "mode": lj.Mode}
+	return &Result{Outputs: []jobs.Output{{Name: outName, Path: outPath, ContentType: outType, Meta: meta}}, Data: data}, nil
 }
 
 // lastJSONObject is the last stdout line that parses as a JSON object (nil when none does).
@@ -788,7 +997,7 @@ func LayersExitCode(err error) int {
 
 // layersFailure classifies a failed render: exit 2 (bad command line or plan) → invalid_input; a tool that could not
 // start → infra; anything else (exit 3) → transient. The message carries the summary's error and the last stderr lines.
-func layersFailure(err error, summary map[string]any, tail []string, jobID string) error {
+func layersFailure(err error, summary map[string]any, tail []string, jobID, tool string) error {
 	msg, _ := summary["error"].(string)
 	if msg == "" {
 		msg = err.Error()
@@ -804,6 +1013,6 @@ func layersFailure(err error, summary map[string]any, tail []string, jobID strin
 	case strings.HasPrefix(err.Error(), "start "), strings.Contains(msg, "could not start") || strings.Contains(msg, "No such file or directory") || strings.Contains(msg, "not installed"):
 		kind = jobs.KindInfra
 	}
-	elog.Warn("running act3-motion-video", fmt.Errorf("exit %d: %s", code, msg), "job_id", jobID, "kind", string(kind))
-	return jobs.Wrap(kind, err, "act3-motion-video failed: "+msg)
+	elog.Warn("running "+tool, fmt.Errorf("exit %d: %s", code, msg), "job_id", jobID, "kind", string(kind))
+	return jobs.Wrap(kind, err, tool+" failed: "+msg)
 }
