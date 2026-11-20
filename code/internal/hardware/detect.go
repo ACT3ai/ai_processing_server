@@ -118,12 +118,15 @@ var engineProbes = []engineProbe{
 		"linux":  {"~/.local/bin/whisper", "/usr/local/bin/whisper"},
 	}},
 	// act3.layers_render (runners/layers_render.go): the two Rust render tasks from ~/BGit/all/film/code/render_tasks
-	// (cargo build --release --workspace), Node for its HTML runner, and a headless Chromium. The motion binaries run
+	// (cargo build --release --workspace; act3-motion-join too), Node for its HTML runner, and a headless Chromium. The motion binaries run
 	// `--version` only when act3.layers_render is enabled (opt-in); Chromium is never started by a probe.
 	{name: "act3_motion_video", binaries: []string{"act3-motion-video"}, args: []string{"--version"}, optIn: true,
 		candidates: func() []string { return MotionBinCandidates("act3-motion-video") }},
 	{name: "act3_motion_audio", binaries: []string{"act3-motion-audio"}, args: []string{"--version"}, optIn: true,
 		candidates: func() []string { return MotionBinCandidates("act3-motion-audio") }},
+	// the third render task, the join of picture and sound (mode join); optional: the whole-shot job joins by itself
+	{name: "act3_motion_join", binaries: []string{"act3-motion-join"}, args: []string{"--version"}, optIn: true,
+		candidates: func() []string { return MotionBinCandidates("act3-motion-join") }},
 	{name: "node", binaries: []string{"node"}, args: []string{"--version"}, extra: map[string][]string{
 		"darwin": {"/opt/homebrew/bin/node", "/usr/local/bin/node"},
 		"linux":  {"/usr/local/bin/node", "/usr/bin/node"},

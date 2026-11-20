@@ -299,7 +299,7 @@ func runOptIn(ts *config.ThisServer) map[string]bool {
 	}
 	// the AI Video Layers render tasks print their version only on a server that runs act3.layers_render (BMS)
 	if s := ts.Service("act3.layers_render"); s != nil && s.Enabled {
-		m["act3_motion_video"], m["act3_motion_audio"] = true, true
+		m["act3_motion_video"], m["act3_motion_audio"], m["act3_motion_join"] = true, true, true
 	}
 	if len(m) == 0 {
 		return nil
