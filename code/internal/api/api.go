@@ -177,6 +177,9 @@ func (h *handler) listJobs(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n >= 0 && n < len(list) {
 		list = list[:n]
 	}
+	if list == nil {
+		list = []*jobs.Job{} // an empty list is [], never null: callers iterate it
+	}
 	writeJSON(w, 200, map[string]any{"jobs": list, "count": len(list)})
 }
 
@@ -245,6 +248,9 @@ func (h *handler) queueList(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeQueueErr(w, err)
 		return
+	}
+	if items == nil {
+		items = []scheduler.QueueItem{} // an empty list is [], never null: callers iterate it
 	}
 	writeJSON(w, 200, map[string]any{"jobs": items})
 }
