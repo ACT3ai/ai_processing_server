@@ -1341,7 +1341,19 @@ Engine setup (ComfyUI, Blender, Python environments, model downloads) is documen
 ### 19.3 Updates
 
 `git pull` then `just build` then `just stop` and `just run`. `stop` drains first, so a deploy never kills a render.
-Automated fleet updates (a deployer like job_runner's) are phase 4.
+
+Automated fleet updates (since 2026-11-20, Bryan: "Please get ANSIBLE to get all servers to update with the
+ai_processing_server repo"): every render server runs `act3-render-update` every 2 minutes, installed by Ansible.
+A pass pulls this repo and the all repo, runs `just build` when the binary is not from HEAD, builds
+`film/code/render_tasks` (cargo, release) when its tree changed on a server that runs `act3.layers_render`, then
+`POST /v1/drain`, waits until no job that a restart would cut is active (task-host jobs are re-adopted, §9.5, so only
+in-process jobs are waited for; 60 min cap, then resume and retry 30 min later), and runs `just stop` + `just run`.
+A drain set by a person or the platform is never undone. Status: `~/.act3_render_update/status.json`.
+
+When a render server updates itself — implemented in:
+~/BGit/all/film/devops/deploy/ansible/roles/act3_render_update/files/act3-render-update · `build_aps`,
+`build_render_tasks`, `restart_aps`, `blocking_jobs` (install: `playbooks/render_servers.yml`; check:
+`playbooks/check_render.yml`; runbook: ~/BGit/all/film/devops/deploy/ansible/README.md "Render servers").
 
 ### 19.4 Signals
 
