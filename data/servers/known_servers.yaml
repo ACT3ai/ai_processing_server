@@ -85,7 +85,7 @@ servers:
   # once the machine's disk encryption and server key are verified at enrollment (security.mdx, D-020).
   - key: NPL1
     display_name: "Nepal 1"
-    match: { hostname: ["NPL1", "nepal-1"] }                     # placeholder
+    match: { hostname: ["pc-01", "NPL1", "nepal-1"] }            # pc-01: detected 2026-11-20 (Arun: pc-01 is NPL1)
     profile: generic
     family: office
     site: nepal_office
